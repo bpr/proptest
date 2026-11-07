@@ -1,7 +1,6 @@
 # proptest
 
-Property-based testing for Mojo: a port of
-[Hypothesis](https://hypothesis.works/) to Mojo 1.3.
+Property-based testing for Mojo, inspired by [Hypothesis](https://hypothesis.works/)
 
 You state a property your code should have and say which inputs it should
 hold for. proptest generates many inputs, looking for one that breaks the
