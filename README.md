@@ -43,7 +43,9 @@ pixi run examples    # the examples in examples/
 
 To use it from another project, put this directory on the include path
 (`mojo run -I path/to/proptest-repo ...`), or build a package with
-`pixi run package` (writes `build/proptest.mojoc`).
+`pixi run package` (writes `build/proptest.mojoc`). There is also a conda
+recipe (`conda.recipe/`); proptest will go on the modular-community
+channel once Mojo 1.3 is released (see `docs/publishing.md`).
 
 ## Writing tests
 
@@ -359,7 +361,8 @@ tests/              the test suite: pixi run test
 examples/           pixi run examples
 extras/             proptest_numojo (NuMojo array strategies): pixi run test-numojo
 tools/              generators for charmap_data.mojo and strategies/types.mojo
-docs/               differences-from-hypothesis.md
+docs/               differences-from-hypothesis.md, publishing.md
+conda.recipe/       conda package recipe (rattler-build) and its smoke test
 ```
 
 ### NuMojo arrays

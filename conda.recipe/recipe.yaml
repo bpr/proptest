@@ -1,0 +1,69 @@
+# rattler-build recipe for proptest. See docs/publishing.md.
+#
+# Local build (from the repository root; builds the working tree):
+#
+#   rattler-build build --recipe conda.recipe/recipe.yaml \
+#     -c conda-forge -c https://conda.modular.com/max-nightly
+#
+# The copy submitted to modular-community (recipes/proptest/recipe.yaml)
+# replaces `source` with the GitHub repository at a full commit SHA, and
+# pins a stable `mojo_version` (modular-community builds only against the
+# stable https://conda.modular.com/max channel).
+
+context:
+  version: "0.1.0"
+  # A precompiled .mojoc only loads in the compiler that built it, so the
+  # compiler is pinned exactly.
+  mojo_version: "1.3.0.dev2026110705"
+
+package:
+  name: proptest
+  version: ${{ version }}
+
+source:
+  - path: ..
+    use_gitignore: true
+
+build:
+  number: 0
+  script:
+    - mkdir -p ${{ PREFIX }}/lib/mojo
+    - mojo precompile proptest -o ${{ PREFIX }}/lib/mojo/proptest.mojoc
+
+requirements:
+  build:
+    - mojo-compiler ==${{ mojo_version }}
+  host:
+    - mojo-compiler ==${{ mojo_version }}
+  run:
+    - mojo-compiler ==${{ mojo_version }}
+
+tests:
+  - script:
+      - if: unix
+        then:
+          - mojo run test_package.mojo
+    files:
+      recipe:
+        - test_package.mojo
+  - package_contents:
+      files:
+        - lib/mojo/proptest.mojoc
+
+about:
+  homepage: https://github.com/bpr/proptest
+  repository: https://github.com/bpr/proptest
+  documentation: https://github.com/bpr/proptest#readme
+  license: MIT
+  license_file: LICENSE
+  summary: Property-based testing for Mojo, a port of Python's Hypothesis
+  description: |
+    proptest generates test inputs from strategies, runs a property against
+    them, and shrinks any failing input to a minimal example. It ports
+    Hypothesis's Conjecture engine: choice-sequence generation and
+    shrinking, an example database, targeting, stateful (rule-based)
+    testing, from_type, and from_regex.
+
+extra:
+  maintainers:
+    - bpr
