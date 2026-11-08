@@ -1,0 +1,20 @@
+[book]
+authors = ["Brian Rogoff"]
+language = "en"
+src = "src"
+title = "proptest for Mojo"
+description = "Property-based testing for Mojo, inspired by Hypothesis"
+
+[build]
+build-dir = "build"
+
+[output.html]
+git-repository-url = "https://github.com/bpr/proptest"
+edit-url-template = "https://github.com/bpr/proptest/edit/master/book/{path}"
+additional-js = ["theme/mojo-highlight.js"]
+
+# Lines starting with `~` in a mojo block are hidden (the reader can show
+# them): the imports and `main` that make a short snippet a complete
+# program, which check-examples.sh runs.
+[output.html.code.hidelines]
+mojo = "~"

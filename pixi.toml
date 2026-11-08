@@ -13,6 +13,11 @@ package = "mkdir -p build && mojo precompile proptest -o build/proptest.mojoc"
 format = "mojo format proptest tests examples extras tools"
 # NuMojo strategies (extras/proptest_numojo); see extras/run_tests.sh
 test-numojo = "bash extras/run_tests.sh"
+# The book (book/), built with mdbook (not a pixi dependency: install it
+# with `cargo install mdbook`). book-test runs the book's complete examples.
+book = "mdbook build book"
+book-serve = "mdbook serve book --open"
+book-test = "bash book/check-examples.sh"
 
 # Regenerate the Unicode tables in proptest/internal/ (see tools/gen_unicode.mojo)
 [tasks.gen-unicode]

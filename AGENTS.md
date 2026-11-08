@@ -4,7 +4,10 @@ Project context for AI coding assistants working in this repository.
 
 ## Overview
 
-proptest is a port of Hypothesis (Python property-based testing) to Mojo 1.3.
+proptest is a property-based testing framework for Mojo 1.3, inspired by
+Hypothesis. Its engine is a port of Hypothesis's Conjecture; much of the
+typed API comes from Rust's proptest and quickcheck, Haskell's QuickCheck,
+and RapidCheck (see `docs/ideas.md`).
 
 - Hypothesis source (reference for porting): `~/src/python/hypothesis/hypothesis/src/hypothesis`
 - `README.md`: user-facing API, the proptest <-> Hypothesis file map, and the list of deliberate differences.
@@ -31,6 +34,7 @@ proptest is a port of Hypothesis (Python property-based testing) to Mojo 1.3.
 | `extras/` | NuMojo integration and its tests |
 | `tools/` | The Unicode table generator (Mojo) |
 | `docs/` | Design notes, including the differences doc |
+| `book/` | The mdbook user guide (`book/src/`); `book/check-examples.sh` runs its complete examples |
 
 ## Architecture
 
@@ -116,3 +120,16 @@ proptest is a port of Hypothesis (Python property-based testing) to Mojo 1.3.
 - No negative list indexing.
 - No `len(String)`.
 - `Float64.MAX` is infinity; use `MAX_FINITE`.
+
+## The book
+
+- `book/src/` follows Hypothesis's documentation: tutorial, how-to,
+  explanation, reference. Keep it in step with API changes.
+- Every ```` ```mojo ```` block must be a complete program, which
+  `pixi run book-test` compiles and runs. Hide the imports and `main` that
+  a short snippet needs with a leading `~` (mdbook's hidden lines, set in
+  `book/book.toml`). Signatures in the reference go in
+  ```` ```mojo-sig ```` blocks; the check imports the names they declare.
+  Show real output in ```` ```text ```` blocks, taken from running the
+  example.
+

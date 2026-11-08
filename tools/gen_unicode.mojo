@@ -1,6 +1,6 @@
 # ===----------------------------------------------------------------------=== #
 # proptest: property-based testing for Mojo.
-# A port of Hypothesis (https://github.com/HypothesisWorks/hypothesis). MIT License; see LICENSE.
+# Inspired by Hypothesis (https://github.com/HypothesisWorks/hypothesis). MIT License; see LICENSE.
 # ===----------------------------------------------------------------------=== #
 """Generate proptest's Unicode tables from the Unicode Character Database.
 
@@ -42,7 +42,7 @@ comptime HANGUL_N_COUNT = 588  # V count (21) * T count
 comptime HEADER = (
     "# ===----------------------------------------------------------------------=== #\n"
     "# proptest: property-based testing for Mojo.\n"
-    "# A port of Hypothesis (https://github.com/HypothesisWorks/hypothesis)."
+    "# Inspired by Hypothesis (https://github.com/HypothesisWorks/hypothesis)."
     " MIT License; see LICENSE.\n"
     "# ===----------------------------------------------------------------------=== #\n"
 )

@@ -1,8 +1,8 @@
 # ===----------------------------------------------------------------------=== #
 # proptest: property-based testing for Mojo.
-# A port of Hypothesis (https://github.com/HypothesisWorks/hypothesis). MIT License; see LICENSE.
+# Inspired by Hypothesis (https://github.com/HypothesisWorks/hypothesis). MIT License; see LICENSE.
 # ===----------------------------------------------------------------------=== #
-"""Property-based testing for Mojo, ported from Hypothesis.
+"""Property-based testing for Mojo, inspired by Hypothesis.
 
 Write a property, say which inputs it should hold for, and proptest checks
 it against many generated inputs, shrinking any failure to a minimal

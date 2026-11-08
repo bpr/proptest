@@ -1,6 +1,6 @@
 # ===----------------------------------------------------------------------=== #
 # proptest: property-based testing for Mojo.
-# A port of Hypothesis (https://github.com/HypothesisWorks/hypothesis). MIT License; see LICENSE.
+# Inspired by Hypothesis (https://github.com/HypothesisWorks/hypothesis). MIT License; see LICENSE.
 # ===----------------------------------------------------------------------=== #
 """The `Strategy` trait and the machinery shared by all strategies.
 

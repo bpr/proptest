@@ -5,3 +5,5 @@
 build/
 # rattler-build output
 output/
+# the built book
+book/build/

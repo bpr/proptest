@@ -1,6 +1,6 @@
 # ===----------------------------------------------------------------------=== #
 # proptest: property-based testing for Mojo.
-# A port of Hypothesis (https://github.com/HypothesisWorks/hypothesis). MIT License; see LICENSE.
+# Inspired by Hypothesis (https://github.com/HypothesisWorks/hypothesis). MIT License; see LICENSE.
 # ===----------------------------------------------------------------------=== #
 """Model-based testing with commands, after RapidCheck's `rc::state` (and
 Erlang QuickCheck's `eqc_statem`).

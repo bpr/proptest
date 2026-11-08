@@ -56,13 +56,16 @@ about:
   documentation: https://github.com/bpr/proptest#readme
   license: MIT
   license_file: LICENSE
-  summary: Property-based testing for Mojo, a port of Python's Hypothesis
+  summary: Property-based testing for Mojo, inspired by Python's Hypothesis
   description: |
-    proptest generates test inputs from strategies, runs a property against
-    them, and shrinks any failing input to a minimal example. It ports
-    Hypothesis's Conjecture engine: choice-sequence generation and
-    shrinking, an example database, targeting, stateful (rule-based)
-    testing, from_type, and from_regex.
+    proptest is a property testing framework (the QuickCheck family)
+    inspired by Python's Hypothesis, with ideas from Rust's proptest and
+    quickcheck, Haskell's QuickCheck, and C++'s RapidCheck. It generates
+    test inputs from strategies or from types, runs a property against them,
+    and shrinks any failing input to a minimal example, using Hypothesis's
+    Conjecture engine (choice-sequence generation and shrinking). It also
+    has an example database, targeting, stateful and model-based testing,
+    constraint types, coverage checking, and from_regex.
 
 extra:
   maintainers:

@@ -1,6 +1,12 @@
 # proptest
 
-Property-based testing for Mojo, inspired by [Hypothesis](https://hypothesis.works/)
+proptest is a property testing framework for Mojo (i.e., the QuickCheck
+family) inspired by the [Hypothesis](https://hypothesis.works/) framework
+for Python, with ideas from Rust's
+[proptest](https://github.com/proptest-rs/proptest) and
+[quickcheck](https://github.com/BurntSushi/quickcheck), Haskell's
+[QuickCheck](https://github.com/nick8325/quickcheck), and C++'s
+[RapidCheck](https://github.com/emil-e/rapidcheck).
 
 You state a property your code should have and say which inputs it should
 hold for. proptest generates many inputs, looking for one that breaks the
@@ -30,6 +36,29 @@ don't generate values directly but parse them from a sequence of recorded
 choices, and the shrinker simplifies that choice sequence. Shrinking
 therefore works for any strategy, including ones you write yourself, with
 no shrinking code of your own.
+
+The other libraries contributed most of the typed API:
+- **Rust's quickcheck:** `check(prop)`, with strategies inferred from the
+  property's parameter types.
+- **Haskell's QuickCheck:** constraint types such as `Positive[T]` and
+  `NonEmpty[T]`, coverage checking, `Outcome` results and the `PolyA`
+  test types.
+- **Rust's proptest:** typed state machines, `filter_map` and weighted
+  `one_of`.
+- **RapidCheck:** model-based testing with `Command` structs, `build` and
+  `apply`.
+
+What came from where is recorded in
+[docs/differences-from-hypothesis.md](docs/differences-from-hypothesis.md)
+and [docs/ideas.md](docs/ideas.md).
+
+## Documentation
+
+The [proptest book](book/) has a tutorial, how-to guides, explanations,
+and a reference, following the layout of Hypothesis's documentation. Build
+it with [mdbook](https://rust-lang.github.io/mdBook/): `pixi run book`
+(output in `book/build/`), or `pixi run book-serve` to read it in a
+browser. `pixi run book-test` compiles and runs every code example in it.
 
 ## Setup
 

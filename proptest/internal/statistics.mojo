@@ -1,6 +1,6 @@
 # ===----------------------------------------------------------------------=== #
 # proptest: property-based testing for Mojo.
-# A port of Hypothesis (https://github.com/HypothesisWorks/hypothesis). MIT License; see LICENSE.
+# Inspired by Hypothesis (https://github.com/HypothesisWorks/hypothesis). MIT License; see LICENSE.
 # ===----------------------------------------------------------------------=== #
 """Statistics of a test run: events, tables and coverage requirements.
 
