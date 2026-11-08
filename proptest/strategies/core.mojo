@@ -284,7 +284,7 @@ def floats32(
 # ===----------------------------------------------------------------------=== #
 
 
-struct Just[T: Drawable](Copyable, Strategy):
+struct Just[T: Copyable & Drawable](Copyable, Strategy):
     """Always the same value; see `just()`."""
 
     comptime Value = Self.T
@@ -297,32 +297,82 @@ struct Just[T: Drawable](Copyable, Strategy):
         return self.value.copy()
 
 
-def just[T: Drawable](var value: T) -> Just[T]:
+def just[T: Copyable & Drawable](var value: T) -> Just[T]:
     """Always `value` (no choices are made)."""
     return Just[T](value^)
 
 
-struct SampledFrom[T: Drawable](Copyable, Strategy):
+struct LazyJust[T: Drawable, F: def() raises -> T](
+    Copyable where conforms_to(F, Copyable), Strategy
+):
+    """A fresh `f()` on every draw; see `lazy_just()`."""
+
+    comptime Value = Self.T
+    var f: Self.F
+
+    def __init__(out self, var f: Self.F):
+        self.f = f^
+
+    def do_draw(self, mut data: ConjectureData) raises -> Self.T:
+        return self.f()
+
+
+def lazy_just[
+    T: Drawable, //, F: def() raises -> T
+](var f: F) -> LazyJust[T, F]:
+    """The value `f()`, made afresh for every test case (no choices are
+    made). Like `just`, for values that can't or shouldn't be copied, such
+    as unique handles (Rust proptest's `LazyJust`)."""
+    return LazyJust[T, F](f^)
+
+
+struct SampledFrom[T: Copyable & Drawable](Copyable, Strategy):
     """One of a fixed list of values; see `sampled_from()`."""
 
     comptime Value = Self.T
     var elements: List[Self.T]
+    var weights: Optional[ArcPointer[List[Float64]]]
 
-    def __init__(out self, var elements: List[Self.T]):
+    def __init__(
+        out self,
+        var elements: List[Self.T],
+        var weights: Optional[ArcPointer[List[Float64]]] = None,
+    ):
         self.elements = elements^
+        self.weights = weights^
 
     def do_draw(self, mut data: ConjectureData) raises -> Self.T:
-        var i = data.draw_integer(Int128(0), Int128(len(self.elements) - 1))
+        var i = data.draw_integer(
+            Int128(0), Int128(len(self.elements) - 1), weights=self.weights
+        )
         return self.elements[Int(i)].copy()
 
 
-def sampled_from[T: Drawable](var elements: List[T]) raises -> SampledFrom[T]:
+def sampled_from[
+    T: Copyable & Drawable
+](var elements: List[T]) raises -> SampledFrom[T]:
     """One of `elements`, shrinking towards the first."""
     if len(elements) == 0:
         raise Error(
             "InvalidArgument: sampled_from() needs at least one element"
         )
     return SampledFrom[T](elements^)
+
+
+def sampled_from[
+    T: Copyable & Drawable
+](var elements: List[T], *, weights: List[Int]) raises -> SampledFrom[T]:
+    """One of `elements`, each chosen in proportion to its (positive)
+    weight (RapidCheck's `weightedElement`). Still shrinks towards the
+    first element."""
+    if len(elements) == 0:
+        raise Error(
+            "InvalidArgument: sampled_from() needs at least one element"
+        )
+    var ws = _normalize_weights(
+        weights, len(elements), "sampled_from", "elements"
+    )
+    return SampledFrom[T](elements^, ws^)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -397,14 +447,213 @@ def boxed[S: Strategy & Copyable](var strategy: S) -> BoxedStrategy[S.Value]:
 # ===----------------------------------------------------------------------=== #
 
 
+def _normalize_weights(
+    weights: List[Int],
+    n: Int,
+    name: String = "one_of",
+    what: String = "strategies",
+) raises -> ArcPointer[List[Float64]]:
+    """`weights` as probabilities, checking there is one positive weight for
+    each of `n` alternatives (`name` and `what` are for the messages)."""
+    if len(weights) != n:
+        raise Error(
+            String(
+                "InvalidArgument: ",
+                name,
+                "() got ",
+                len(weights),
+                " weights for ",
+                n,
+                " ",
+                what,
+            )
+        )
+    var total = 0
+    for w in weights:
+        if w <= 0:
+            raise Error(
+                String("InvalidArgument: ", name, "() weights must be positive")
+            )
+        total += w
+    var p = List[Float64](capacity=n)
+    for w in weights:
+        p.append(Float64(w) / Float64(total))
+    return ArcPointer(p^)
+
+
+struct Alternatives[*Ss: Strategy](
+    Copyable where Ss.all_conforms_to[Copyable](), Strategy
+):
+    """A choice between a fixed number of strategies, stored unboxed; see
+    `one_of()`. Every alternative must produce the same type."""
+
+    comptime Value = Self.Ss[0].Value
+    var strategies: Tuple[*Self.Ss]
+    var weights: Optional[ArcPointer[List[Float64]]]
+
+    def __init__(
+        out self,
+        var strategies: Tuple[*Self.Ss],
+        var weights: Optional[ArcPointer[List[Float64]]] = None,
+    ):
+        comptime for i in range(len(Self.Ss)):
+            comptime assert (
+                Self.Ss[i].Value == Self.Ss[0].Value
+            ), "one_of: every strategy must produce the same type"
+        self.strategies = strategies^
+        self.weights = weights^
+
+    def label(self) -> UInt64:
+        var l = ONE_OF_LABEL
+        comptime for i in range(len(Self.Ss)):
+            l = combine_labels(l, self.strategies[i].label())
+        return l
+
+    def do_draw(self, mut data: ConjectureData) raises -> Self.Value:
+        comptime n = len(Self.Ss)
+        var k = Int(
+            data.draw_integer(Int128(0), Int128(n - 1), weights=self.weights)
+        )
+        comptime for i in range(n):
+            if i == k:
+                return rebind_var[Self.Value](draw(data, self.strategies[i]))
+        raise Error("unreachable")
+
+
+def one_of[
+    S1: Strategy, S2: Strategy
+](var s1: S1, var s2: S2) -> Alternatives[S1, S2]:
+    """A value from `s1` or `s2` (which must produce the same type),
+    shrinking towards `s1`. Takes two to six strategies; a list of
+    `BoxedStrategy` takes any number."""
+    return Alternatives[S1, S2](Tuple(s1^, s2^))
+
+
+def one_of[
+    S1: Strategy, S2: Strategy
+](var s1: S1, var s2: S2, *, weights: List[Int]) raises -> Alternatives[S1, S2]:
+    """Like `one_of(s1, s2)`, choosing each strategy in proportion to its
+    (positive) weight. Still shrinks towards `s1`."""
+    return Alternatives[S1, S2](Tuple(s1^, s2^), _normalize_weights(weights, 2))
+
+
+def one_of[
+    S1: Strategy, S2: Strategy, S3: Strategy
+](var s1: S1, var s2: S2, var s3: S3) -> Alternatives[S1, S2, S3]:
+    """A value from one of three strategies, shrinking towards the first."""
+    return Alternatives[S1, S2, S3](Tuple(s1^, s2^, s3^))
+
+
+def one_of[
+    S1: Strategy, S2: Strategy, S3: Strategy
+](
+    var s1: S1, var s2: S2, var s3: S3, *, weights: List[Int]
+) raises -> Alternatives[S1, S2, S3]:
+    """Weighted `one_of` of three strategies."""
+    return Alternatives[S1, S2, S3](
+        Tuple(s1^, s2^, s3^), _normalize_weights(weights, 3)
+    )
+
+
+def one_of[
+    S1: Strategy, S2: Strategy, S3: Strategy, S4: Strategy
+](var s1: S1, var s2: S2, var s3: S3, var s4: S4) -> Alternatives[
+    S1, S2, S3, S4
+]:
+    """A value from one of four strategies, shrinking towards the first."""
+    return Alternatives[S1, S2, S3, S4](Tuple(s1^, s2^, s3^, s4^))
+
+
+def one_of[
+    S1: Strategy, S2: Strategy, S3: Strategy, S4: Strategy
+](
+    var s1: S1, var s2: S2, var s3: S3, var s4: S4, *, weights: List[Int]
+) raises -> Alternatives[S1, S2, S3, S4]:
+    """Weighted `one_of` of four strategies."""
+    return Alternatives[S1, S2, S3, S4](
+        Tuple(s1^, s2^, s3^, s4^), _normalize_weights(weights, 4)
+    )
+
+
+def one_of[
+    S1: Strategy, S2: Strategy, S3: Strategy, S4: Strategy, S5: Strategy
+](var s1: S1, var s2: S2, var s3: S3, var s4: S4, var s5: S5) -> Alternatives[
+    S1, S2, S3, S4, S5
+]:
+    """A value from one of five strategies, shrinking towards the first."""
+    return Alternatives[S1, S2, S3, S4, S5](Tuple(s1^, s2^, s3^, s4^, s5^))
+
+
+def one_of[
+    S1: Strategy, S2: Strategy, S3: Strategy, S4: Strategy, S5: Strategy
+](
+    var s1: S1,
+    var s2: S2,
+    var s3: S3,
+    var s4: S4,
+    var s5: S5,
+    *,
+    weights: List[Int],
+) raises -> Alternatives[S1, S2, S3, S4, S5]:
+    """Weighted `one_of` of five strategies."""
+    return Alternatives[S1, S2, S3, S4, S5](
+        Tuple(s1^, s2^, s3^, s4^, s5^), _normalize_weights(weights, 5)
+    )
+
+
+def one_of[
+    S1: Strategy,
+    S2: Strategy,
+    S3: Strategy,
+    S4: Strategy,
+    S5: Strategy,
+    S6: Strategy,
+](
+    var s1: S1, var s2: S2, var s3: S3, var s4: S4, var s5: S5, var s6: S6
+) -> Alternatives[S1, S2, S3, S4, S5, S6]:
+    """A value from one of six strategies, shrinking towards the first."""
+    return Alternatives[S1, S2, S3, S4, S5, S6](
+        Tuple(s1^, s2^, s3^, s4^, s5^, s6^)
+    )
+
+
+def one_of[
+    S1: Strategy,
+    S2: Strategy,
+    S3: Strategy,
+    S4: Strategy,
+    S5: Strategy,
+    S6: Strategy,
+](
+    var s1: S1,
+    var s2: S2,
+    var s3: S3,
+    var s4: S4,
+    var s5: S5,
+    var s6: S6,
+    *,
+    weights: List[Int],
+) raises -> Alternatives[S1, S2, S3, S4, S5, S6]:
+    """Weighted `one_of` of six strategies."""
+    return Alternatives[S1, S2, S3, S4, S5, S6](
+        Tuple(s1^, s2^, s3^, s4^, s5^, s6^), _normalize_weights(weights, 6)
+    )
+
+
 struct OneOf[T: Drawable](Copyable, Strategy):
-    """A choice between strategies; see `one_of()`."""
+    """A choice between any number of boxed strategies; see `one_of()`."""
 
     comptime Value = Self.T
     var strategies: List[BoxedStrategy[Self.T]]
+    var weights: Optional[ArcPointer[List[Float64]]]
 
-    def __init__(out self, var strategies: List[BoxedStrategy[Self.T]]):
+    def __init__(
+        out self,
+        var strategies: List[BoxedStrategy[Self.T]],
+        var weights: Optional[ArcPointer[List[Float64]]] = None,
+    ):
         self.strategies = strategies^
+        self.weights = weights^
 
     def label(self) -> UInt64:
         var l = ONE_OF_LABEL
@@ -413,45 +662,10 @@ struct OneOf[T: Drawable](Copyable, Strategy):
         return l
 
     def do_draw(self, mut data: ConjectureData) raises -> Self.T:
-        var i = data.draw_integer(Int128(0), Int128(len(self.strategies) - 1))
+        var i = data.draw_integer(
+            Int128(0), Int128(len(self.strategies) - 1), weights=self.weights
+        )
         return draw(data, self.strategies[Int(i)])
-
-
-def one_of[
-    S1: Strategy & Copyable, S2: Strategy & Copyable
-](var s1: S1, var s2: S2) -> OneOf[S1.Value]:
-    """A value from `s1` or `s2` (which must produce the same type),
-    shrinking towards `s1`."""
-    var l = List[BoxedStrategy[S1.Value]]()
-    l.append(BoxedStrategy[S1.Value](s1^))
-    l.append(BoxedStrategy[S1.Value](s2^))
-    return OneOf[S1.Value](l^)
-
-
-def one_of[
-    S1: Strategy & Copyable, S2: Strategy & Copyable, S3: Strategy & Copyable
-](var s1: S1, var s2: S2, var s3: S3) -> OneOf[S1.Value]:
-    """A value from one of three strategies, shrinking towards the first."""
-    var l = List[BoxedStrategy[S1.Value]]()
-    l.append(BoxedStrategy[S1.Value](s1^))
-    l.append(BoxedStrategy[S1.Value](s2^))
-    l.append(BoxedStrategy[S1.Value](s3^))
-    return OneOf[S1.Value](l^)
-
-
-def one_of[
-    S1: Strategy & Copyable,
-    S2: Strategy & Copyable,
-    S3: Strategy & Copyable,
-    S4: Strategy & Copyable,
-](var s1: S1, var s2: S2, var s3: S3, var s4: S4) -> OneOf[S1.Value]:
-    """A value from one of four strategies, shrinking towards the first."""
-    var l = List[BoxedStrategy[S1.Value]]()
-    l.append(BoxedStrategy[S1.Value](s1^))
-    l.append(BoxedStrategy[S1.Value](s2^))
-    l.append(BoxedStrategy[S1.Value](s3^))
-    l.append(BoxedStrategy[S1.Value](s4^))
-    return OneOf[S1.Value](l^)
 
 
 def one_of[
@@ -461,6 +675,19 @@ def one_of[
     if len(strategies) == 0:
         raise Error("InvalidArgument: one_of() needs at least one strategy")
     return OneOf[T](strategies^)
+
+
+def one_of[
+    T: Drawable
+](
+    var strategies: List[BoxedStrategy[T]], *, weights: List[Int]
+) raises -> OneOf[T]:
+    """Like `one_of(strategies)`, choosing each strategy in proportion to
+    its (positive) weight."""
+    if len(strategies) == 0:
+        raise Error("InvalidArgument: one_of() needs at least one strategy")
+    var w = _normalize_weights(weights, len(strategies))
+    return OneOf[T](strategies^, w^)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -497,6 +724,404 @@ def map[
     return Mapped[S, R, F](strategy^, f^)
 
 
+# ===----------------------------------------------------------------------=== #
+# apply(s1, ..., sN, f): a function of N arguments over N strategies
+# ===----------------------------------------------------------------------=== #
+
+
+struct Applied2[
+    S1: Strategy,
+    S2: Strategy,
+    R: Drawable,
+    F: def(S1.Value, S2.Value) raises -> R,
+](
+    Copyable where (
+        conforms_to(S1, Copyable)
+        and conforms_to(S2, Copyable)
+        and conforms_to(F, Copyable)
+    ),
+    Strategy,
+):
+    """`f(a1, ...)` with each argument drawn from its strategy; see
+    `apply()`."""
+
+    comptime Value = Self.R
+    var s1: Self.S1
+    var s2: Self.S2
+    var f: Self.F
+
+    def __init__(out self, var f: Self.F, var s1: Self.S1, var s2: Self.S2):
+        self.f = f^
+        self.s1 = s1^
+        self.s2 = s2^
+
+    def label(self) -> UInt64:
+        return combine_labels(
+            calc_label_from_name("apply"),
+            combine_labels(self.s1.label(), self.s2.label()),
+        )
+
+    def do_draw(self, mut data: ConjectureData) raises -> Self.R:
+        var a1 = draw(data, self.s1)
+        var a2 = draw(data, self.s2)
+        return self.f(a1, a2)
+
+
+def apply[
+    S1: Strategy,
+    S2: Strategy,
+    R: Drawable,
+    //,
+    F: def(S1.Value, S2.Value) raises -> R,
+](var s1: S1, var s2: S2, var f: F) -> Applied2[S1, S2, R, F]:
+    """Values `f(a, b)` with `a` from `s1` and `b` from `s2` (RapidCheck's
+    `gen::apply`; Hypothesis's `builds` with a function). Shrinking
+    happens on the arguments."""
+    return Applied2[S1, S2, R, F](f^, s1^, s2^)
+
+
+struct Applied3[
+    S1: Strategy,
+    S2: Strategy,
+    S3: Strategy,
+    R: Drawable,
+    F: def(S1.Value, S2.Value, S3.Value) raises -> R,
+](
+    Copyable where (
+        conforms_to(S1, Copyable)
+        and conforms_to(S2, Copyable)
+        and conforms_to(S3, Copyable)
+        and conforms_to(F, Copyable)
+    ),
+    Strategy,
+):
+    """`f(a1, ...)` with each argument drawn from its strategy; see
+    `apply()`."""
+
+    comptime Value = Self.R
+    var s1: Self.S1
+    var s2: Self.S2
+    var s3: Self.S3
+    var f: Self.F
+
+    def __init__(
+        out self,
+        var f: Self.F,
+        var s1: Self.S1,
+        var s2: Self.S2,
+        var s3: Self.S3,
+    ):
+        self.f = f^
+        self.s1 = s1^
+        self.s2 = s2^
+        self.s3 = s3^
+
+    def label(self) -> UInt64:
+        return combine_labels(
+            calc_label_from_name("apply"),
+            combine_labels(
+                combine_labels(self.s1.label(), self.s2.label()),
+                self.s3.label(),
+            ),
+        )
+
+    def do_draw(self, mut data: ConjectureData) raises -> Self.R:
+        var a1 = draw(data, self.s1)
+        var a2 = draw(data, self.s2)
+        var a3 = draw(data, self.s3)
+        return self.f(a1, a2, a3)
+
+
+def apply[
+    S1: Strategy,
+    S2: Strategy,
+    S3: Strategy,
+    R: Drawable,
+    //,
+    F: def(S1.Value, S2.Value, S3.Value) raises -> R,
+](var s1: S1, var s2: S2, var s3: S3, var f: F) -> Applied3[S1, S2, S3, R, F]:
+    """`f` applied to values drawn from three strategies (RapidCheck's
+    `gen::apply`; Hypothesis's `builds` with a function). Shrinking
+    happens on the arguments."""
+    return Applied3[S1, S2, S3, R, F](f^, s1^, s2^, s3^)
+
+
+struct Applied4[
+    S1: Strategy,
+    S2: Strategy,
+    S3: Strategy,
+    S4: Strategy,
+    R: Drawable,
+    F: def(S1.Value, S2.Value, S3.Value, S4.Value) raises -> R,
+](
+    Copyable where (
+        conforms_to(S1, Copyable)
+        and conforms_to(S2, Copyable)
+        and conforms_to(S3, Copyable)
+        and conforms_to(S4, Copyable)
+        and conforms_to(F, Copyable)
+    ),
+    Strategy,
+):
+    """`f(a1, ...)` with each argument drawn from its strategy; see
+    `apply()`."""
+
+    comptime Value = Self.R
+    var s1: Self.S1
+    var s2: Self.S2
+    var s3: Self.S3
+    var s4: Self.S4
+    var f: Self.F
+
+    def __init__(
+        out self,
+        var f: Self.F,
+        var s1: Self.S1,
+        var s2: Self.S2,
+        var s3: Self.S3,
+        var s4: Self.S4,
+    ):
+        self.f = f^
+        self.s1 = s1^
+        self.s2 = s2^
+        self.s3 = s3^
+        self.s4 = s4^
+
+    def label(self) -> UInt64:
+        return combine_labels(
+            calc_label_from_name("apply"),
+            combine_labels(
+                combine_labels(
+                    combine_labels(self.s1.label(), self.s2.label()),
+                    self.s3.label(),
+                ),
+                self.s4.label(),
+            ),
+        )
+
+    def do_draw(self, mut data: ConjectureData) raises -> Self.R:
+        var a1 = draw(data, self.s1)
+        var a2 = draw(data, self.s2)
+        var a3 = draw(data, self.s3)
+        var a4 = draw(data, self.s4)
+        return self.f(a1, a2, a3, a4)
+
+
+def apply[
+    S1: Strategy,
+    S2: Strategy,
+    S3: Strategy,
+    S4: Strategy,
+    R: Drawable,
+    //,
+    F: def(S1.Value, S2.Value, S3.Value, S4.Value) raises -> R,
+](var s1: S1, var s2: S2, var s3: S3, var s4: S4, var f: F) -> Applied4[
+    S1, S2, S3, S4, R, F
+]:
+    """`f` applied to values drawn from four strategies (RapidCheck's
+    `gen::apply`; Hypothesis's `builds` with a function). Shrinking
+    happens on the arguments."""
+    return Applied4[S1, S2, S3, S4, R, F](f^, s1^, s2^, s3^, s4^)
+
+
+struct Applied5[
+    S1: Strategy,
+    S2: Strategy,
+    S3: Strategy,
+    S4: Strategy,
+    S5: Strategy,
+    R: Drawable,
+    F: def(S1.Value, S2.Value, S3.Value, S4.Value, S5.Value) raises -> R,
+](
+    Copyable where (
+        conforms_to(S1, Copyable)
+        and conforms_to(S2, Copyable)
+        and conforms_to(S3, Copyable)
+        and conforms_to(S4, Copyable)
+        and conforms_to(S5, Copyable)
+        and conforms_to(F, Copyable)
+    ),
+    Strategy,
+):
+    """`f(a1, ...)` with each argument drawn from its strategy; see
+    `apply()`."""
+
+    comptime Value = Self.R
+    var s1: Self.S1
+    var s2: Self.S2
+    var s3: Self.S3
+    var s4: Self.S4
+    var s5: Self.S5
+    var f: Self.F
+
+    def __init__(
+        out self,
+        var f: Self.F,
+        var s1: Self.S1,
+        var s2: Self.S2,
+        var s3: Self.S3,
+        var s4: Self.S4,
+        var s5: Self.S5,
+    ):
+        self.f = f^
+        self.s1 = s1^
+        self.s2 = s2^
+        self.s3 = s3^
+        self.s4 = s4^
+        self.s5 = s5^
+
+    def label(self) -> UInt64:
+        return combine_labels(
+            calc_label_from_name("apply"),
+            combine_labels(
+                combine_labels(
+                    combine_labels(
+                        combine_labels(self.s1.label(), self.s2.label()),
+                        self.s3.label(),
+                    ),
+                    self.s4.label(),
+                ),
+                self.s5.label(),
+            ),
+        )
+
+    def do_draw(self, mut data: ConjectureData) raises -> Self.R:
+        var a1 = draw(data, self.s1)
+        var a2 = draw(data, self.s2)
+        var a3 = draw(data, self.s3)
+        var a4 = draw(data, self.s4)
+        var a5 = draw(data, self.s5)
+        return self.f(a1, a2, a3, a4, a5)
+
+
+def apply[
+    S1: Strategy,
+    S2: Strategy,
+    S3: Strategy,
+    S4: Strategy,
+    S5: Strategy,
+    R: Drawable,
+    //,
+    F: def(S1.Value, S2.Value, S3.Value, S4.Value, S5.Value) raises -> R,
+](
+    var s1: S1, var s2: S2, var s3: S3, var s4: S4, var s5: S5, var f: F
+) -> Applied5[S1, S2, S3, S4, S5, R, F]:
+    """`f` applied to values drawn from five strategies (RapidCheck's
+    `gen::apply`; Hypothesis's `builds` with a function). Shrinking
+    happens on the arguments."""
+    return Applied5[S1, S2, S3, S4, S5, R, F](f^, s1^, s2^, s3^, s4^, s5^)
+
+
+struct Applied6[
+    S1: Strategy,
+    S2: Strategy,
+    S3: Strategy,
+    S4: Strategy,
+    S5: Strategy,
+    S6: Strategy,
+    R: Drawable,
+    F: def(
+        S1.Value, S2.Value, S3.Value, S4.Value, S5.Value, S6.Value
+    ) raises -> R,
+](
+    Copyable where (
+        conforms_to(S1, Copyable)
+        and conforms_to(S2, Copyable)
+        and conforms_to(S3, Copyable)
+        and conforms_to(S4, Copyable)
+        and conforms_to(S5, Copyable)
+        and conforms_to(S6, Copyable)
+        and conforms_to(F, Copyable)
+    ),
+    Strategy,
+):
+    """`f(a1, ...)` with each argument drawn from its strategy; see
+    `apply()`."""
+
+    comptime Value = Self.R
+    var s1: Self.S1
+    var s2: Self.S2
+    var s3: Self.S3
+    var s4: Self.S4
+    var s5: Self.S5
+    var s6: Self.S6
+    var f: Self.F
+
+    def __init__(
+        out self,
+        var f: Self.F,
+        var s1: Self.S1,
+        var s2: Self.S2,
+        var s3: Self.S3,
+        var s4: Self.S4,
+        var s5: Self.S5,
+        var s6: Self.S6,
+    ):
+        self.f = f^
+        self.s1 = s1^
+        self.s2 = s2^
+        self.s3 = s3^
+        self.s4 = s4^
+        self.s5 = s5^
+        self.s6 = s6^
+
+    def label(self) -> UInt64:
+        return combine_labels(
+            calc_label_from_name("apply"),
+            combine_labels(
+                combine_labels(
+                    combine_labels(
+                        combine_labels(
+                            combine_labels(self.s1.label(), self.s2.label()),
+                            self.s3.label(),
+                        ),
+                        self.s4.label(),
+                    ),
+                    self.s5.label(),
+                ),
+                self.s6.label(),
+            ),
+        )
+
+    def do_draw(self, mut data: ConjectureData) raises -> Self.R:
+        var a1 = draw(data, self.s1)
+        var a2 = draw(data, self.s2)
+        var a3 = draw(data, self.s3)
+        var a4 = draw(data, self.s4)
+        var a5 = draw(data, self.s5)
+        var a6 = draw(data, self.s6)
+        return self.f(a1, a2, a3, a4, a5, a6)
+
+
+def apply[
+    S1: Strategy,
+    S2: Strategy,
+    S3: Strategy,
+    S4: Strategy,
+    S5: Strategy,
+    S6: Strategy,
+    R: Drawable,
+    //,
+    F: def(
+        S1.Value, S2.Value, S3.Value, S4.Value, S5.Value, S6.Value
+    ) raises -> R,
+](
+    var s1: S1,
+    var s2: S2,
+    var s3: S3,
+    var s4: S4,
+    var s5: S5,
+    var s6: S6,
+    var f: F,
+) -> Applied6[S1, S2, S3, S4, S5, S6, R, F]:
+    """`f` applied to values drawn from six strategies (RapidCheck's
+    `gen::apply`; Hypothesis's `builds` with a function). Shrinking
+    happens on the arguments."""
+    return Applied6[S1, S2, S3, S4, S5, S6, R, F](
+        f^, s1^, s2^, s3^, s4^, s5^, s6^
+    )
+
+
 struct Filtered[S: Strategy, F: def(S.Value) raises -> Bool](
     Copyable where conforms_to(S, Copyable) and conforms_to(F, Copyable),
     Strategy,
@@ -506,10 +1131,14 @@ struct Filtered[S: Strategy, F: def(S.Value) raises -> Bool](
     comptime Value = Self.S.Value
     var inner: Self.S
     var predicate: Self.F
+    var reason: String
 
-    def __init__(out self, var inner: Self.S, var predicate: Self.F):
+    def __init__(
+        out self, var inner: Self.S, var predicate: Self.F, reason: String = ""
+    ):
         self.inner = inner^
         self.predicate = predicate^
+        self.reason = reason
 
     def label(self) -> UInt64:
         return combine_labels(FILTER_LABEL, self.inner.label())
@@ -522,17 +1151,149 @@ struct Filtered[S: Strategy, F: def(S.Value) raises -> Bool](
                 data.stop_span()
                 return v^
             data.stop_span(discard=True)
-        data.mark_invalid("filter rejected three draws")
+        data.mark_invalid(
+            self.reason if self.reason.byte_length()
+            > 0 else "filter rejected three draws"
+        )
         raise Error("unreachable")
 
 
 def filter[
     S: Strategy, //, F: def(S.Value) raises -> Bool
-](var strategy: S, var predicate: F) -> Filtered[S, F]:
+](var strategy: S, var predicate: F, *, reason: String = "") -> Filtered[S, F]:
     """Values from `strategy` for which `predicate` holds (Hypothesis's
     `strategy.filter(predicate)`). Prefer constructing values that satisfy
-    the condition: each test case gives up after three rejections."""
-    return Filtered[S, F](strategy^, predicate^)
+    the condition: each test case gives up after three rejections.
+
+    `reason` names the condition in the `filter_too_much` health check and
+    in run statistics (Rust proptest's `prop_filter(whence, f)`)."""
+    return Filtered[S, F](strategy^, predicate^, reason)
+
+
+struct FilterMapped[
+    S: Strategy, R: Drawable, F: def(S.Value) raises -> Optional[R]
+](
+    Copyable where conforms_to(S, Copyable) and conforms_to(F, Copyable),
+    Strategy,
+):
+    """Values from a strategy, transformed where possible; see
+    `filter_map()`."""
+
+    comptime Value = Self.R
+    var inner: Self.S
+    var f: Self.F
+    var reason: String
+
+    def __init__(out self, var inner: Self.S, var f: Self.F, reason: String):
+        self.inner = inner^
+        self.f = f^
+        self.reason = reason
+
+    def label(self) -> UInt64:
+        return combine_labels(FILTER_LABEL, self.inner.label())
+
+    def do_draw(self, mut data: ConjectureData) raises -> Self.R:
+        for _ in range(3):
+            data.start_span(FILTER_LABEL)
+            var v = draw(data, self.inner)
+            var r = self.f(v)
+            if r:
+                data.stop_span()
+                return r.take()
+            data.stop_span(discard=True)
+        data.mark_invalid(
+            self.reason if self.reason.byte_length()
+            > 0 else "filter_map rejected three draws"
+        )
+        raise Error("unreachable")
+
+
+def filter_map[
+    S: Strategy, R: Drawable, //, F: def(S.Value) raises -> Optional[R]
+](var strategy: S, var f: F, *, reason: String = "") -> FilterMapped[S, R, F]:
+    """`f(x)` for values `x` from `strategy`, skipping those where `f`
+    returns `None` (Rust proptest's `prop_filter_map`): a `filter` and a
+    `map` in one step, for when checking and converting are the same work.
+    Each test case gives up after three rejections."""
+    return FilterMapped[S, R, F](strategy^, f^, reason)
+
+
+struct Covered[S: Strategy, F: def(S.Value) raises -> Bool](
+    Copyable where conforms_to(S, Copyable) and conforms_to(F, Copyable),
+    Strategy,
+):
+    """Values from a strategy, with a coverage requirement; see `cover()`."""
+
+    comptime Value = Self.S.Value
+    var inner: Self.S
+    var percent: Float64
+    var label_: String
+    var condition: Self.F
+
+    def __init__(
+        out self,
+        var inner: Self.S,
+        percent: Float64,
+        label: String,
+        var condition: Self.F,
+    ):
+        self.inner = inner^
+        self.percent = percent
+        self.label_ = label
+        self.condition = condition^
+
+    def label(self) -> UInt64:
+        return self.inner.label()
+
+    def do_draw(self, mut data: ConjectureData) raises -> Self.S.Value:
+        var v = self.inner.do_draw(data)
+        data.cover(self.percent, self.condition(v), self.label_)
+        return v^
+
+
+def cover[
+    S: Strategy, //, F: def(S.Value) raises -> Bool
+](
+    var strategy: S, percent: Float64, label: String, var condition: F
+) -> Covered[S, F]:
+    """Values from `strategy`, requiring that `condition` holds for at
+    least `percent`% of passing test cases (QuickCheck's `cover`, attached
+    to a strategy so that `given` and `check` tests can use it). See
+    `ConjectureData.cover` for what happens when it doesn't."""
+    return Covered[S, F](strategy^, percent, label, condition^)
+
+
+struct Tabulated[S: Strategy, F: def(S.Value) raises -> String](
+    Copyable where conforms_to(S, Copyable) and conforms_to(F, Copyable),
+    Strategy,
+):
+    """Values from a strategy, tabulated; see `tabulate()`."""
+
+    comptime Value = Self.S.Value
+    var inner: Self.S
+    var table: String
+    var key: Self.F
+
+    def __init__(out self, var inner: Self.S, table: String, var key: Self.F):
+        self.inner = inner^
+        self.table = table
+        self.key = key^
+
+    def label(self) -> UInt64:
+        return self.inner.label()
+
+    def do_draw(self, mut data: ConjectureData) raises -> Self.S.Value:
+        var v = self.inner.do_draw(data)
+        data.tabulate(self.table, self.key(v))
+        return v^
+
+
+def tabulate[
+    S: Strategy, //, F: def(S.Value) raises -> String
+](var strategy: S, table: String, var key: F) -> Tabulated[S, F]:
+    """Values from `strategy`, recording `key(value)` in the table `table`
+    of the run's statistics (QuickCheck's `tabulate`)."""
+    return Tabulated[S, F](strategy^, table, key^)
 
 
 struct FlatMapped[S: Strategy, S2: Strategy, F: def(S.Value) raises -> S2](
@@ -721,7 +1482,7 @@ def unique_lists_by[
 
 struct UniqueValues[S: Strategy](
     Copyable where conforms_to(S, Copyable), Strategy
-) where conforms_to(S.Value, KeyElement):
+) where conforms_to(S.Value, KeyElement & Copyable):
     """Lists of distinct values; see `unique_lists()`."""
 
     comptime Value = List[Self.S.Value]
@@ -755,7 +1516,7 @@ def unique_lists[
     S: Strategy
 ](
     var elements: S, *, min_size: Int = 0, max_size: Optional[Int] = None
-) raises -> UniqueValues[S] where conforms_to(S.Value, KeyElement):
+) raises -> UniqueValues[S] where conforms_to(S.Value, KeyElement & Copyable):
     """Lists of distinct values from `elements` (Hypothesis's
     `lists(elements, unique=True)`)."""
     var hi = _check_sizes(min_size, max_size)
@@ -764,7 +1525,7 @@ def unique_lists[
 
 struct Sets[S: Strategy](
     Copyable where conforms_to(S, Copyable), Strategy
-) where conforms_to(S.Value, KeyElement):
+) where conforms_to(S.Value, KeyElement & Copyable):
     """Sets of values from a strategy; see `sets()`."""
 
     comptime Value = Set[Self.S.Value]
@@ -788,7 +1549,7 @@ def sets[
     S: Strategy
 ](
     var elements: S, *, min_size: Int = 0, max_size: Optional[Int] = None
-) raises -> Sets[S] where conforms_to(S.Value, KeyElement):
+) raises -> Sets[S] where conforms_to(S.Value, KeyElement & Copyable):
     """Sets of values drawn from `elements`."""
     return Sets[S](
         unique_lists(elements^, min_size=min_size, max_size=max_size)
@@ -798,7 +1559,7 @@ def sets[
 struct Dictionaries[KS: Strategy, VS: Strategy](
     Copyable where conforms_to(KS, Copyable) and conforms_to(VS, Copyable),
     Strategy,
-) where conforms_to(KS.Value, KeyElement):
+) where conforms_to(KS.Value, KeyElement & Copyable):
     """Dictionaries; see `dictionaries()`."""
 
     comptime Value = Dict[Self.KS.Value, Self.VS.Value]
@@ -846,7 +1607,9 @@ def dictionaries[
     *,
     min_size: Int = 0,
     max_size: Optional[Int] = None,
-) raises -> Dictionaries[KS, VS] where conforms_to(KS.Value, KeyElement):
+) raises -> Dictionaries[KS, VS] where conforms_to(
+    KS.Value, KeyElement & Copyable
+):
     """Dictionaries with keys from `keys` and values from `values`."""
     var hi = _check_sizes(min_size, max_size)
     return Dictionaries[KS, VS](keys^, values^, min_size, hi)
@@ -881,7 +1644,7 @@ def optionals[S: Strategy](var strategy: S) -> Optionals[S]:
     return Optionals[S](strategy^)
 
 
-struct Permutations[T: Drawable](Copyable, Strategy):
+struct Permutations[T: Copyable & Drawable](Copyable, Strategy):
     """Permutations of a list; see `permutations()`."""
 
     comptime Value = List[Self.T]
@@ -901,9 +1664,60 @@ struct Permutations[T: Drawable](Copyable, Strategy):
         return result^
 
 
-def permutations[T: Drawable](var values: List[T]) -> Permutations[T]:
+def permutations[
+    T: Copyable & Drawable
+](var values: List[T]) -> Permutations[T]:
     """Orderings of `values`, shrinking towards the given order."""
     return Permutations[T](values^)
+
+
+struct Subsequences[T: Copyable & Drawable](Copyable, Strategy):
+    """Order-preserving sublists of a list; see `subsequence()`."""
+
+    comptime Value = List[Self.T]
+    var values: List[Self.T]
+    var min_size: Int
+    var max_size: Int
+
+    def __init__(
+        out self, var values: List[Self.T], min_size: Int, max_size: Int
+    ):
+        self.values = values^
+        self.min_size = min_size
+        self.max_size = max_size
+
+    def label(self) -> UInt64:
+        return calc_label_from_name("subsequence")
+
+    def do_draw(self, mut data: ConjectureData) raises -> Self.Value:
+        var result = Self.Value()
+        var n = len(self.values)
+        for i in range(n):
+            var forced: Optional[Bool] = None
+            if len(result) == self.max_size:
+                forced = False
+            elif n - i <= self.min_size - len(result):
+                forced = True
+            if data.draw_boolean(0.5, forced=forced):
+                result.append(self.values[i].copy())
+        return result^
+
+
+def subsequence[
+    T: Copyable & Drawable
+](
+    var values: List[T], *, min_size: Int = 0, max_size: Optional[Int] = None
+) raises -> Subsequences[T]:
+    """Sublists of `values` that keep their order, with length in
+    `[min_size, max_size]` (Rust proptest's `sample::subsequence`).
+    Shrinks by dropping elements, towards the first `min_size` values."""
+    var hi = max_size.value() if max_size else len(values)
+    if min_size < 0 or min_size > hi or min_size > len(values):
+        raise Error(
+            "InvalidArgument: subsequence() needs 0 <= min_size <= max_size"
+            " and min_size <= len(values)"
+        )
+    return Subsequences[T](values^, min_size, hi)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1218,7 +2032,9 @@ def tuples[
 # ===----------------------------------------------------------------------=== #
 
 
-struct Shared[S: Strategy](Copyable where conforms_to(S, Copyable), Strategy):
+struct Shared[S: Strategy](
+    Copyable where conforms_to(S, Copyable), Strategy
+) where conforms_to(S.Value, Copyable):
     """One value per test case, shared by every draw with the same key;
     see `shared()`."""
 
@@ -1249,7 +2065,7 @@ def shared[
     key: Optional[String] = None,
     *,
     location: Optional[SourceLocation] = None,
-) -> Shared[S]:
+) -> Shared[S] where conforms_to(S.Value, Copyable):
     """A strategy that draws a single value from `base` per test case: every
     draw from a `shared` strategy with the same key returns that value.
 

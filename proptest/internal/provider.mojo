@@ -392,6 +392,14 @@ struct Provider(Movable):
         return permitted[Int(self.random.below(UInt64(len(permitted))))]
 
     def draw_integer(mut self, c: Constraints) -> Int128:
+        if c.weights:
+            ref w = c.weights.value()[]
+            var r = self.random.random()
+            for i in range(len(w) - 1):
+                r -= w[i]
+                if r < 0:
+                    return c.min_value + Int128(i)
+            return c.min_value + Int128(len(w) - 1)
         var ci = self._maybe_constant_index(c, 0.05)
         if ci >= 0:
             return self.constants[].integers[ci]

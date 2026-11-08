@@ -50,8 +50,7 @@ can be submitted once `mojo-compiler 1.3.0` is on the stable `max` channel.
 5. Open a pull request.
 
 proptest is pure Mojo, so the CodeQL requirement for packages that contain
-Python or other languages doesn't apply. The generators in `tools/` aren't
-part of the package.
+Python or other languages doesn't apply.
 
 ### Releasing a new version
 

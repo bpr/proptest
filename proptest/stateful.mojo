@@ -48,7 +48,7 @@ state.push(x=0)
 state.pop()
 ```
 
-Rule arguments are the labelled draws a rule makes. `Bundle[T]` holds
+Rule arguments are the labeled draws a rule makes. `Bundle[T]` holds
 values produced by earlier steps for later steps to use (Hypothesis's
 `Bundle`); `initialize_count`/`run_initialize` give rules that run exactly
 once, first, in a random order (`@initialize`).
@@ -122,7 +122,95 @@ trait StateMachine(Deinitable, Movable):
         return
 
 
-struct Bundle[T: Drawable](Copyable, Sized):
+trait TypedStateMachine(Deinitable, Movable):
+    """A state machine whose steps are values of a `Transition` type
+    (Rust proptest-state-machine's `ReferenceStateMachine` and
+    `StateMachineTest` in one).
+
+    Instead of numbered rules, each step draws a transition value from the
+    current state and applies it. A `Variant` of one struct per operation
+    works well, and so does a plain struct with a kind field:
+
+    ```mojo
+    @fieldwise_init
+    struct Push(Copyable, Writable):
+        var x: Int
+
+    @fieldwise_init
+    struct Pop(Copyable, Writable):
+        pass
+
+    struct StackMachine(TypedStateMachine):
+        comptime Transition = Variant[Push, Pop]
+        var model: List[Int]
+        var stack: MyStack
+
+        def __init__(out self):
+            self.model = []
+            self.stack = MyStack()
+
+        def transition(self, mut data: ConjectureData) raises -> Self.Transition:
+            if len(self.model) == 0 or data.draw(booleans()):
+                return Push(data.draw(integers()))
+            return Pop()
+
+        def apply(mut self, t: Self.Transition) raises:
+            if t.isa[Push]():
+                self.model.append(t[Push].x)
+                self.stack.push(t[Push].x)
+            else:
+                assert_equal(self.stack.pop(), self.model.pop())
+
+    run_typed_state_machine_as_test[StackMachine]()
+    ```
+
+    A failure is reported as the transitions applied, each printed through
+    `Writable`:
+
+    ```
+    state = StackMachine()
+    state.apply(Push(x=0))
+    state.apply(Pop())
+    ```
+
+    Draw only transitions that are valid in the current state. When the
+    shrinker deletes a step, later steps are drawn again from the same
+    choices in the new state, so they stay valid without the replay checks
+    Rust's runner needs. `precondition` is for the rare transition that is
+    easier to reject than to avoid. After three rejections in a row the
+    program ends at that step (it isn't discarded).
+    """
+
+    comptime Transition: Drawable
+    """The type of a step."""
+
+    def __init__(out self):
+        """A fresh machine, in its initial state."""
+        ...
+
+    def transition(self, mut data: ConjectureData) raises -> Self.Transition:
+        """Draw the next step, given the current state."""
+        ...
+
+    def precondition(self, t: Self.Transition) -> Bool:
+        """Whether `t` may be applied in the current state."""
+        return True
+
+    def apply(mut self, t: Self.Transition) raises:
+        """Apply one step to the system and the model, and check its
+        result."""
+        ...
+
+    def check_invariants(self) raises:
+        """Checked at the start and after every step."""
+        return
+
+    def teardown(mut self) raises:
+        """Called at the end of every run, even a failing one."""
+        return
+
+
+struct Bundle[T: Copyable & Drawable](Copyable, Sized):
     """A named collection of values produced by earlier steps, for later
     steps to use (Hypothesis's `Bundle`). Keep bundles as fields of the
     state machine."""
@@ -377,6 +465,99 @@ def run_state_machine_as_test[
 
     def run_one(mut data: ConjectureData) raises {max_steps, deadline}:
         run_state_machine[M](data, max_steps, deadline)
+
+    var report = run_test(run_one, s, String(loc))
+    _raise_failures(report, String(loc), s)
+
+
+comptime TRANSITION_LABEL: UInt64 = 0x7472616E736974696F6E
+
+
+def run_typed_state_machine[
+    M: TypedStateMachine
+](mut data: ConjectureData, max_steps: Int, deadline_ns: Int = -1) raises:
+    """Run one random sequence of transitions against a fresh `M`. With
+    `deadline_ns >= 0`, each step (applying the transition and checking the
+    invariants, not drawing it) must finish within the deadline."""
+    var machine = M()
+    if data.is_final:
+        data.notes.append(String("state = ", reflect[M].base_name(), "()"))
+    var failure: Optional[Error] = None
+    try:
+        machine.check_invariants()
+        var steps = 0
+        while True:
+            data.start_span(STATE_MACHINE_RUN_LABEL)
+            var must_stop: Optional[Bool] = None
+            if steps >= max_steps:
+                must_stop = True
+            elif steps < 1:
+                must_stop = False
+            elif data.length > (BUFFER_SIZE * 8) // 10:
+                must_stop = True
+            if data.draw_boolean(_NEVER_STOP_P, forced=must_stop):
+                data.stop_span()
+                break
+            steps += 1
+            # transition(...).filter(precondition), as Hypothesis's rules
+            var chosen: Optional[M.Transition] = None
+            for _ in range(3):
+                data.start_span(FILTER_LABEL)
+                data.start_span(TRANSITION_LABEL)
+                var t = machine.transition(data)
+                data.stop_span()
+                if machine.precondition(t):
+                    data.stop_span()
+                    chosen = t^
+                    break
+                data.stop_span(discard=True)
+            if not chosen:
+                # end the program here rather than discard the steps so far
+                data.stop_span()
+                break
+            var t = chosen.take()
+            if data.is_final:
+                data.notes.append(String("state.apply(", format_value(t), ")"))
+            var step_start = perf_counter_ns()
+            var drawn_before = data.draw_time_ns
+            machine.apply(t)
+            machine.check_invariants()
+            _check_deadline(
+                data,
+                step_start + (data.draw_time_ns - drawn_before),
+                deadline_ns,
+            )
+            data.stop_span()
+    except e:
+        failure = e^
+    if data.is_final:
+        data.notes.append("state.teardown()")
+    machine.teardown()
+    if failure:
+        raise failure.take()
+
+
+@always_inline
+def run_typed_state_machine_as_test[
+    M: TypedStateMachine
+](
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """Run random sequences of up to `settings.stateful_step_count`
+    transitions against `M`, raising with the shrunk failing sequence if
+    one fails."""
+    var loc = location.value() if location else call_location()
+    var s = _resolve_settings(settings, loc)
+    s.suppress_health_check.append(HealthCheck.data_too_large)
+    s.suppress_health_check.append(HealthCheck.large_base_example)
+    s.phases.explain = False
+    var max_steps = s.stateful_step_count
+    var deadline = s.deadline_ns()
+
+    def run_one(mut data: ConjectureData) raises {max_steps, deadline}:
+        run_typed_state_machine[M](data, max_steps, deadline)
 
     var report = run_test(run_one, s, String(loc))
     _raise_failures(report, String(loc), s)

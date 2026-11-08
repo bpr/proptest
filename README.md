@@ -117,9 +117,9 @@ strategies.
 | `floats(min, max, allow_nan=, allow_infinity=, allow_subnormal=, exclude_min=, exclude_max=)` | `floats()` | `Float64` |
 | `floats32(...)` | `floats(width=32)` | `Float32` |
 | `booleans()` | `booleans()` | `Bool` |
-| `just(x)` | `just()` | always `x` |
-| `sampled_from([a, b, c])` | `sampled_from()` | one of the elements |
-| `one_of(s1, s2, ...)` | `one_of()`, `s1 \| s2` | a value from any of them (same type) |
+| `just(x)`, `lazy_just(f)` | `just()` | always `x`; a fresh `f()` per test case |
+| `sampled_from([a, b, c])` | `sampled_from()` | one of the elements; `weights=[...]` biases the choice |
+| `one_of(s1, ..., s6, weights=)`, `one_of(list_of_boxed, weights=)` | `one_of()`, `s1 \| s2` | a value from any of them (same type), chosen in proportion to the optional integer `weights`; shrinks towards the first |
 | `lists(s, min_size=, max_size=)` | `lists()` | `List[T]` |
 | `unique_lists(s, ...)`, `unique_lists_by(s, key, ...)` | `lists(unique=True)`, `lists(unique_by=)` | `List[T]` |
 | `sets(s, ...)` | `sets()` | `Set[T]` |
@@ -130,11 +130,15 @@ strategies.
 | `text(alphabet, min_size=, max_size=)` | `text()` | `String` (any codepoint but surrogates by default) |
 | `characters(min_codepoint=, max_codepoint=, categories=, exclude_categories=, include_characters=, exclude_characters=, codec=)` | `characters()` | one-character `String` (categories are Unicode general categories, e.g. `["Lu", "Nd"]` or `["L"]`) |
 | `from_regex(pattern, fullmatch=)` | `from_regex()` | `String` matching (or, by default, containing a match of) a regex |
-| `from_type[T]()` | `from_type()`, `builds()` | `T`: scalars, `String`, `List`/`Optional`/`Set`/`Dict[String, _]` of them (nested one level), common pairs and triples, any `Arbitrary` type, and structs built field by field |
+| `from_type[T]()` | `from_type()`, `builds()` | `T`: scalars, `String`, `List`/`Optional`/`Set`/`Dict` and tuples nested to any depth, any `Arbitrary` type (including the constraint types), and structs built field by field |
 | `binary(min_size=, max_size=)` | `binary()` | `List[UInt8]` |
 | `permutations(list)` | `permutations()` | `List[T]` |
+| `subsequence(list, min_size=, max_size=)` | — (Rust `sample::subsequence`) | order-preserving sublists |
+| `functions[A](returns)` | `functions()` | memoized `Function[A, R]`, printed as `{x->y, ...}` |
 | `map(s, f)` | `s.map(f)` | `f(x)` |
-| `filter(s, pred)` | `s.filter(pred)` | `x` with `pred(x)` |
+| `apply(s1, ..., sN, f)` | `builds(f, s1, ...)` | `f(a1, ..., aN)`, two to six arguments (RapidCheck's `gen::apply`) |
+| `filter(s, pred, reason=)` | `s.filter(pred)` | `x` with `pred(x)`; `reason` names the condition in health checks |
+| `filter_map(s, f)` | — (Rust `prop_filter_map`) | `f(x)` where it isn't `None` |
 | `flatmap(s, f)` | `s.flatmap(f)` | a value from `f(x)` |
 | `composite(f)` | `@composite` | `f(data)` where `f` draws with `data.draw(...)` |
 | `recursive(base, extend, max_leaves=)` | `recursive()` | recursive data |
@@ -165,14 +169,22 @@ struct Points(Strategy, Copyable):
         return Point(data.draw(integers(0, 100)), data.draw(integers(0, 100)))
 ```
 
-Values must be `Copyable` and `Writable` (so failures can be printed).
+Values must be `Movable` and `Writable` (so failures can be printed), but
+need not be `Copyable`: the engine rebuilds values from choices rather
+than copying them, so move-only types such as unique handles work, and
+`lazy_just(f)` makes a fresh one per test case. `just`, `sampled_from`,
+`permutations`, `shared`, set elements and dictionary keys need
+`Copyable` values.
 `composite(f)` does the same for a plain function.
 
 ### Strategies from types
 
-`from_type[T]()` picks a strategy at compile time. A type can provide its own
-by implementing `Arbitrary` (Hypothesis's `register_type_strategy`); other
-structs are built field by field using Mojo's reflection, recursively:
+`from_type[T]()` picks a strategy at compile time. Scalars, `Bool`,
+`String`, `List`, `Optional`, `Set`, `Dict` and tuples (up to six
+elements) are supported, nested to any depth. A type can provide its own
+strategy by implementing `Arbitrary` (Hypothesis's
+`register_type_strategy`); other structs are built field by field using
+Mojo's reflection, recursively:
 
 ```mojo
 @fieldwise_init
@@ -203,6 +215,94 @@ given(from_type[Sprite](), prop)
 Building from fields bypasses `__init__`, so give types with invariants an
 `Arbitrary` implementation.
 
+`build[T](field["name"](strategy), ...)` builds a struct the same way, but
+draws the named fields from the given strategies (RapidCheck's
+`gen::build`). Field names and the strategies' value types are checked at
+compile time:
+
+```mojo
+build[Sprite](field["layer"](just(Optional[Int8](0))), field["tags"](lists(text(), max_size=3)))
+```
+
+### Type-directed tests
+
+`check(prop)` draws each of the property's arguments with `from_type`, so
+the parameter types are the whole specification (quickcheck's
+`quickcheck(prop)`). The property can raise, like a `given` test, or return
+`Bool`:
+
+```mojo
+from proptest import check
+
+def test_sprites() raises:
+    def prop(s: Sprite, scale: UInt8) raises:
+        assert_true(s.extent.lo <= s.extent.hi)
+    check(prop)
+
+def test_addition_commutes() raises:
+    def prop(a: Int, b: Int) raises -> Bool:
+        return a + b == b + a
+    check(prop, Settings(max_examples=1000))
+```
+
+It takes one to six arguments and reports failures like `given`.
+
+A property can also return an `Outcome` (`Outcome.passed()`,
+`Outcome.discard()`, `Outcome.fail("why")` or `Outcome.of(cond, "why")`),
+which can reject inputs as well as fail on them (quickcheck's
+`TestResult`).
+
+For generic code, `PolyA`, `PolyB` and `PolyC` are opaque stand-in types
+that support only equality, ordering, hashing and printing (QuickCheck's
+`Poly`): `check` a property over `List[PolyA]` rather than `List[Int]`,
+and it can't pass because of something particular to `Int`. `Index` is a
+position drawn before the collection it indexes is known:
+`i.get(len(xs))`.
+
+### Constraint types
+
+When the plain types don't say enough, wrap them (QuickCheck's modifiers).
+Each wrapper implements `Arbitrary`, so it works with `check`, `from_type`
+and struct fields alike, and shrinking never breaks the constraint. The
+value is `.value`, and reports print it without the wrapper:
+
+```mojo
+def prop(xs: NonEmpty[List[Int]], i: NonNegative[Int]) -> Bool:
+    return xs.value[i.value % len(xs.value)] in xs.value
+check(prop)
+```
+
+| Type | Values |
+|---|---|
+| `Bounded[lo, hi]`, `Bounded[lo, hi, UInt8]` | `lo <= value <= hi` (default type `Int`) |
+| `Positive[T]`, `NonNegative[T]`, `NonZero[T]` | integer scalars, `Float64`, `Float32` (floats finite) |
+| `NonEmpty[T]` | a `List`, `String`, `Set` or `Dict` with at least one element |
+| `Sorted[List[T]]` | an ascending list of `Comparable` elements |
+| `Blind[T]` | any `T`, printed as `<hidden>` |
+| `Via[f]` | the value `f(data)` draws, for any `def f(mut data: ConjectureData) raises -> T` |
+
+`Via` names any strategy in a type:
+
+```mojo
+def digits(mut data: ConjectureData) raises -> List[Int]:
+    return data.draw(lists(integers(0, 9), max_size=4))
+
+def prop(xs: Via[digits], n: Positive[UInt8]) -> Bool: ...
+```
+
+Use `given` with explicit strategies when strategies depend on each other
+or on run-time values.
+
+### Results and negative tests
+
+`run_property(strategy, test)` runs a property like `given` but returns a
+`PropertyResult` instead of raising. It holds whether it passed, the typed
+shrunk `counterexample`, the report `message`, a reproduce `blob`, and the
+`RunReport` with counts and statistics. `expect_failure(f)` runs a test
+function that should fail (a negative control: does this property, with
+these generators, find the bug?) and returns the failure report, raising if
+the test passes.
+
 ### Settings
 
 ```mojo
@@ -232,6 +332,12 @@ To reproduce this example, run the test with Settings(reproduce="proptest1:aToxM
 and running the test with that setting replays exactly that example, with
 no search (Hypothesis's `@reproduce_failure`).
 
+To debug the shrunk failure itself, set a breakpoint on
+`before_minimal_test_case`, which is called just before the final replay
+(RapidCheck's `rc::beforeMinimalTestCase`). In `mojo debug` or
+`mojo-lldb`: `breakpoint set -r before_minimal_test_case`. Its argument is
+the test's location, for a conditional breakpoint.
+
 Settings left at their defaults can be set from the environment, like a
 Hypothesis profile: `PROPTEST_MAX_EXAMPLES`, `PROPTEST_SEED`,
 `PROPTEST_VERBOSITY` (`quiet`/`normal`/`verbose`/`debug`) and
@@ -240,6 +346,45 @@ Hypothesis profile: `PROPTEST_MAX_EXAMPLES`, `PROPTEST_SEED`,
 Failing examples are saved in the example database (`.proptest/examples`,
 one directory per test, keyed by the test's source location) and replayed
 first on the next run, so a failure keeps failing until it is fixed.
+
+### Statistics and coverage
+
+`Settings(show_statistics=True)` (or verbose output) prints what the
+generate phase saw. It counts three things:
+- events recorded with `data.event(...)`, as a share of test cases
+  (Hypothesis's `--hypothesis-show-statistics`);
+- values recorded with `data.tabulate(table, value)` (QuickCheck);
+- coverage requirements declared with `data.cover(percent, condition, label)`
+  (QuickCheck).
+
+The strategy wrappers `cover(s, percent, label, pred)` and
+`tabulate(s, table, key)` do the same for `given` and `check` tests, which
+have no `data`:
+
+```mojo
+var xs = cover(lists(integers()), 20, "long", lambda (xs: List[Int]) -> Bool: len(xs) >= 5)
+given(xs, prop, Settings(check_coverage=Confidence()))
+```
+
+```
+proptest statistics for tests/test_x.mojo:12:5:
+  - 100 passing, 0 invalid and 0 overrun examples (generate phase)
+  - Coverage:
+    * 41.00% long (required 20.0%)
+```
+
+An unmet requirement prints a warning. With
+`check_coverage=Confidence(certainty=1e9, tolerance=0.9)` it is checked
+statistically instead, as QuickCheck's `checkCoverage` does:
+- Generation continues past `max_examples`, checking at 1×, 2×, 4×, ...
+  until every requirement is known to hold (to within `tolerance`) or
+  one is known to fail.
+- Each conclusion is wrong with probability about `1 / certainty`.
+- A failure raises `Insufficient coverage`.
+
+This catches generators that quietly stop producing the interesting
+cases. The statistics are also in the `RunReport` that `run_test`
+returns (`report.statistics`).
 
 ### Stateful testing
 
@@ -292,6 +437,118 @@ arguments with `data.draw(strategy, "name")` (printed in the steps),
 test case disables a random subset of the rules ("swarm testing"), which
 makes runs that hammer a few operations much more likely.
 
+#### Typed state machines
+
+A `TypedStateMachine` replaces rule numbers with a `Transition` type
+(Rust's proptest-state-machine). Each step draws a transition from the
+current state, then applies it; failures print the transitions through
+`Writable`. A `Variant` with one struct per operation works well:
+
+```mojo
+from std.utils import Variant
+from proptest import TypedStateMachine, run_typed_state_machine_as_test
+
+@fieldwise_init
+struct Push(Copyable, Writable):
+    var x: Int
+
+@fieldwise_init
+struct Pop(Copyable, Writable):
+    pass
+
+struct StackMachine(TypedStateMachine):
+    comptime Transition = Variant[Push, Pop]
+    var model: List[Int]
+    var stack: MyStack
+
+    def __init__(out self): ...
+
+    def transition(self, mut data: ConjectureData) raises -> Self.Transition:
+        if len(self.model) == 0 or data.draw(booleans()):
+            return Push(data.draw(integers()))
+        return Pop()                      # only when there is something to pop
+
+    def apply(mut self, t: Self.Transition) raises:
+        if t.isa[Push]():
+            self.model.append(t[Push].x)
+            self.stack.push(t[Push].x)
+        else:
+            assert_equal(self.stack.pop(), self.model.pop())
+
+run_typed_state_machine_as_test[StackMachine]()
+```
+
+```
+state = StackMachine()
+state.apply(Push(x=0))
+state.apply(Pop())
+state.teardown()
+```
+
+Draw only valid transitions: when the shrinker deletes a step, the later
+ones are drawn again in the new state, so they stay valid. An optional
+`precondition(t)` rejects a transition instead; after three rejections in
+a row the program ends there. `check_invariants` and `teardown` work as
+for `StateMachine`. There is no swarm testing, because the runner can't
+tell kinds of transition apart.
+
+#### Model-based testing with commands
+
+`Command` (from RapidCheck's `rc::state` and Erlang QuickCheck) keeps the
+model apart from the system under test. Each operation is a struct naming
+the `Model` and `Sut` types. It generates itself from the model, and has
+an optional `precondition(model)`, `next_state(mut model)`, and
+`run(model, mut sut)`, which acts on the system and checks the result
+against the model's state before the step:
+
+```mojo
+@fieldwise_init
+struct Put(Command):
+    comptime Model = Dict[Int, Int]
+    comptime Sut = KvStore
+    var key: Int
+    var value: Int
+
+    @staticmethod
+    def generate(model: Self.Model, mut data: ConjectureData) raises -> Self:
+        return Self(data.draw(integers(0, 9)), data.draw(integers()))
+
+    def next_state(self, mut model: Self.Model) raises:
+        model[self.key] = self.value
+
+    def run(self, model: Self.Model, mut sut: Self.Sut) raises:
+        sut.put(self.key, self.value)
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("Put(", self.key, ", ", self.value, ")")
+
+# Get and Remove likewise; then, for a KvStore with a default constructor:
+check_commands[Put, Get, Remove](Dict[Int, Int]())
+```
+
+If the store forgets an overwritten value once it has held three keys,
+the failure is reported as the shrunk program:
+
+```
+given([Put(0, 0), Put(1, 0), Put(2, 0), Put(0, 1), Get(0)])
+```
+
+`commands[Put, Get, Remove](model)` is a strategy for whole programs
+(`Commands[Put, Get, Remove]`), generated from the model alone, so the
+system isn't needed to generate or validate them. A program runs inside an
+ordinary property with `program.run(model, sut)`. The property can
+generate the initial state, use a fixture, or run the same program on two
+implementations and compare them. `run_commands(model, sut, data)` draws
+and runs one inside `given_data`. `commands(..., weights=[...])` biases the
+choice of command type, and `max_commands` (default 50) bounds the length.
+
+Compared with `TypedStateMachine`, each operation's code lives in its own
+struct instead of an `isa` chain in `apply`, and the whole program is
+known before it runs. A command that picks a value out of the model, such
+as an existing key, shrinks less well, because deleting an earlier step
+changes which value the same choice picks. Draw directly with a
+`precondition` when rejections would be rare.
+
 ## How it works
 
 The engine is a port of Hypothesis's Conjecture
@@ -311,9 +568,11 @@ The engine is a port of Hypothesis's Conjecture
 | `internal/charmap.mojo` (+ generated `charmap_data.mojo`) | `charmap.py` | Unicode general categories |
 | `internal/pareto.mojo` | `pareto.py` | the Pareto front of targeted examples |
 | `strategies/regex.mojo` | `strategies/_internal/regex.py` | `from_regex` |
-| `strategies/types.mojo` (generated) | `strategies/_internal/types.py` | `from_type` |
+| `strategies/types.mojo` | `strategies/_internal/types.py` | `from_type` |
+| `strategies/constraints.mojo` | — (QuickCheck's `Modifiers.hs`) | constraint types (`Positive`, `NonEmpty`, `Via`, ...) |
 | `strategies/` | `strategies/_internal/` | strategies |
 | `core.mojo`, `settings.mojo`, `database.mojo`, `stateful.mojo` | `core.py`, `_settings.py`, `database.py`, `stateful.py` | the public API |
+| `commands.mojo` | (RapidCheck's `rc::state`) | model-based testing with `Command` structs |
 
 A test case is a sequence of choices (integers, floats, booleans, byte
 strings and strings), each drawn under constraints. Every choice type has
@@ -335,14 +594,15 @@ port next.
   `At file:line:col:` prefix that `std.testing` assertions and `fail()` put
   on error messages; errors without one count as one bug.
 - `@reproduce_failure` is the `reproduce=` setting.
-- `from_type` works at compile time, from field reflection, and can't
-  infer strategies from a test's parameter types; `from_regex` supports the
+- `from_type` works at compile time, from field reflection; `check(prop)`
+  infers strategies from the property's parameter types through overload
+  resolution, not signature reflection; `from_regex` supports the
   common subset of regex syntax (no backreferences, lookaround or word
   boundaries).
 - No alternative backends, observability, or the date/time, email and IP
   strategies; NumPy's counterpart is the separate `proptest_numojo` package
   (`extras/`).
-- The shrinker does not port `widen_to_span_with_recorded_value`. The Pareto optimisation of
+- The shrinker does not port `widen_to_span_with_recorded_value`. The Pareto optimization of
   targeted examples is limited to 10 × `max_examples` calls.
 - The `DataTree` is uncompressed.
 - When a replayed choice no longer fits (the test now draws under different
@@ -360,7 +620,7 @@ proptest/           the package (see "How it works")
 tests/              the test suite: pixi run test
 examples/           pixi run examples
 extras/             proptest_numojo (NuMojo array strategies): pixi run test-numojo
-tools/              generators for charmap_data.mojo and strategies/types.mojo
+tools/              generator for the Unicode tables (charmap_data.mojo, decomposition_data.mojo)
 docs/               differences-from-hypothesis.md, publishing.md
 conda.recipe/       conda package recipe (rattler-build) and its smoke test
 ```

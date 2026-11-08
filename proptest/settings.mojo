@@ -13,7 +13,8 @@ given(integers(), test, settings=Settings(max_examples=1000))
 
 Supported: `max_examples`, `seed`/`derandomize`, `database`, `phases`,
 `verbosity`, `report_multiple_bugs`, `suppress_health_check`,
-`stateful_step_count`, `max_shrinks`, `deadline`, `reproduce`. Not
+`stateful_step_count`, `max_shrinks`, `deadline`, `reproduce`,
+`show_statistics` and `check_coverage` (from QuickCheck). Not
 supported: `backend`. Settings left at their defaults can be changed through
 environment variables (like a Hypothesis settings profile):
 `PROPTEST_MAX_EXAMPLES`, `PROPTEST_SEED`, `PROPTEST_VERBOSITY`
@@ -133,6 +134,32 @@ struct HealthCheck(Copyable, Equatable, TrivialRegisterPassable, Writable):
             writer.write("too_slow")
 
 
+struct Confidence(Copyable, TrivialRegisterPassable, Writable):
+    """How sure a coverage check must be (QuickCheck's `Confidence`).
+
+    A requirement passes once proptest is confident it holds at least
+    `tolerance` times over, and fails once it is confident it doesn't hold;
+    each conclusion is wrong with probability about `1 / certainty`."""
+
+    var certainty: Float64
+    var tolerance: Float64
+
+    def __init__(
+        out self, *, certainty: Float64 = 1e9, tolerance: Float64 = 0.9
+    ):
+        self.certainty = certainty
+        self.tolerance = tolerance
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write(
+            "Confidence(certainty=",
+            self.certainty,
+            ", tolerance=",
+            self.tolerance,
+            ")",
+        )
+
+
 comptime DEFAULT_DATABASE = ".proptest/examples"
 
 
@@ -168,6 +195,14 @@ struct Settings(Copyable, Writable):
     var reproduce: Optional[String]
     """A blob printed with a failure: replay exactly that example instead of
     searching (Hypothesis's `@reproduce_failure`)."""
+    var show_statistics: Bool
+    """Print the run's statistics: events, tables and coverage
+    (Hypothesis's `--hypothesis-show-statistics`). Also printed at
+    verbose verbosity."""
+    var check_coverage: Optional[Confidence]
+    """Check `cover` requirements statistically: keep generating past
+    `max_examples` until each is known to hold or not, and fail if one
+    doesn't (QuickCheck's `checkCoverage`)."""
 
     def __init__(
         out self,
@@ -186,6 +221,8 @@ struct Settings(Copyable, Writable):
         print_blob: Bool = False,
         deadline: Optional[Float64] = 200.0,
         reproduce: Optional[String] = None,
+        show_statistics: Bool = False,
+        var check_coverage: Optional[Confidence] = None,
     ):
         self.max_examples = max_examples
         self.seed = seed
@@ -201,6 +238,8 @@ struct Settings(Copyable, Writable):
         self.print_blob = print_blob
         self.deadline = deadline
         self.reproduce = reproduce
+        self.show_statistics = show_statistics
+        self.check_coverage = check_coverage^
 
     def with_env_overrides(self) -> Self:
         """These settings, updated from `PROPTEST_*` environment variables.

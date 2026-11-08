@@ -866,8 +866,13 @@ struct Shrinker[F: def(mut ConjectureData) raises](Movable):
             return
         var children = self.target[].span_children(s)
         var done = Set[UInt64]()
-        for c in children:
-            if s >= len(self.target[].spans):
+        # by index: `children` is recomputed inside the loop, and iterating
+        # a list while replacing it reads freed memory
+        var i = 0
+        while i < len(children):
+            var c = children[i]
+            i += 1
+            if s >= len(self.target[].spans) or c >= len(self.target[].spans):
                 return
             var lbl = self.target[].spans[c].label
             if lbl in done:

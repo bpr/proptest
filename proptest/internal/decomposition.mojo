@@ -6,7 +6,7 @@
 
 Hypothesis uses `unicodedata.normalize("NFD"/"NFKD", c)` and `c.casefold()`;
 Mojo's standard library has neither, so the components are generated into
-`decomposition_data.mojo` by `tools/gen_charmap.py`, except for Hangul
+`decomposition_data.mojo` by `tools/gen_unicode.mojo`, except for Hangul
 syllables, which are decomposed with the algorithm from the Unicode
 standard (section 3.12) to keep the table small.
 """

@@ -239,7 +239,7 @@ def test_targeting_finds_rare_large_values() raises:
     assert_true("found a huge value" in msg, msg)
 
 
-def test_given_data_reports_labelled_draws() raises:
+def test_given_data_reports_labeled_draws() raises:
     def prop(mut data: ConjectureData) raises:
         var flag = data.draw(booleans(), "flag")
         var xs = data.draw(lists(integers(0, 100)), "xs")

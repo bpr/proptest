@@ -5,6 +5,8 @@ from std.time import sleep
 from std.testing import TestSuite, assert_equal, assert_true, assert_false
 
 from proptest import *
+from std.utils import Variant
+
 from proptest.stateful import StateMachine, Bundle, run_state_machine_as_test
 
 
@@ -227,6 +229,147 @@ struct Counter(StateMachine):
 
 def test_passing_machine_with_initialize_rules() raises:
     run_state_machine_as_test[Counter](Settings(database=None, max_examples=50))
+
+
+# --- Typed state machines ----------------------------------------------------
+
+
+@fieldwise_init
+struct Add(Copyable, Writable):
+    var x: Int
+
+
+@fieldwise_init
+struct Check(Copyable, Writable):
+    var i: Int
+
+
+struct TypedSetMachine(TypedStateMachine):
+    comptime Transition = Variant[Add, Check]
+    var real: BuggySet
+    var model: List[Int]
+
+    def __init__(out self):
+        self.real = BuggySet()
+        self.model = []
+
+    def transition(self, mut data: ConjectureData) raises -> Self.Transition:
+        # only valid transitions: Check needs an element to look up
+        if len(self.model) == 0 or data.draw(booleans()) == False:
+            return Add(data.draw(integers(0, 100)))
+        return Check(data.draw(integers(0, len(self.model) - 1)))
+
+    def apply(mut self, t: Self.Transition) raises:
+        if t.isa[Add]():
+            var x = t[Add].x
+            self.real.add(x)
+            if x not in self.model:
+                self.model.append(x)
+        else:
+            assert_true(
+                self.real.contains(self.model[t[Check].i]),
+                "element went missing",
+            )
+
+
+def test_typed_machine_shrinks_to_minimal_transitions() raises:
+    var msg = String()
+    try:
+        run_typed_state_machine_as_test[TypedSetMachine](
+            Settings(database=None)
+        )
+    except e:
+        msg = String(e)
+    assert_true("element went missing" in msg, msg)
+    assert_true("state = TypedSetMachine()" in msg, msg)
+    assert_true(
+        "state.apply(Add(x=0))\n"
+        + "    state.apply(Add(x=1))\n"
+        + "    state.apply(Add(x=11))\n"
+        + "    state.apply(Check(i=2))"
+        in msg,
+        msg,
+    )
+    assert_equal(msg.count("state.apply"), 4, msg)
+
+
+@fieldwise_init
+struct Jugs(Copyable, Writable):
+    """A plain struct as the transition type: one of six operations."""
+
+    var op: Int
+
+    def write_to(self, mut writer: Some[Writer]):
+        var names: List[String] = [
+            "fill_small",
+            "fill_big",
+            "empty_small",
+            "empty_big",
+            "pour_small_into_big",
+            "pour_big_into_small",
+        ]
+        writer.write(names[self.op])
+
+
+struct TypedDieHard(TypedStateMachine):
+    comptime Transition = Jugs
+    var small: Int
+    var big: Int
+
+    def __init__(out self):
+        self.small = 0
+        self.big = 0
+
+    def transition(self, mut data: ConjectureData) raises -> Jugs:
+        return Jugs(data.draw(integers(0, 5)))
+
+    def precondition(self, t: Jugs) -> Bool:
+        # pointless moves are rejected rather than avoided, to exercise
+        # preconditions: filling a full jug or emptying an empty one
+        return not (
+            (t.op == 0 and self.small == 3)
+            or (t.op == 1 and self.big == 5)
+            or (t.op == 2 and self.small == 0)
+            or (t.op == 3 and self.big == 0)
+        )
+
+    def apply(mut self, t: Jugs) raises:
+        if t.op == 0:
+            self.small = 3
+        elif t.op == 1:
+            self.big = 5
+        elif t.op == 2:
+            self.small = 0
+        elif t.op == 3:
+            self.big = 0
+        elif t.op == 4:
+            var old_big = self.big
+            self.big = min(5, self.big + self.small)
+            self.small = self.small - (self.big - old_big)
+        else:
+            var old_small = self.small
+            self.small = min(3, self.small + self.big)
+            self.big = self.big - (self.small - old_small)
+
+    def check_invariants(self) raises:
+        assert_true(0 <= self.small and self.small <= 3)
+        assert_true(0 <= self.big and self.big <= 5)
+        if self.big == 4:
+            fail("big jug holds 4 gallons")
+
+
+def test_typed_die_hard_with_preconditions() raises:
+    var msg = String()
+    try:
+        run_typed_state_machine_as_test[TypedDieHard](
+            Settings(database=None, max_examples=10000)
+        )
+    except e:
+        msg = String(e)
+    assert_true("big jug holds 4 gallons" in msg, msg)
+    assert_true("state.apply(fill_" in msg, msg)
+    var steps = msg.count("state.apply(")
+    assert_true(steps == 6 or steps == 8, msg)
 
 
 # --- deadlines apply to each step -----------------------------------------

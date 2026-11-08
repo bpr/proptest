@@ -520,7 +520,7 @@ struct _Regex(Movable):
 
     def check_anchors(self) raises:
         """Anchors other than at the start or end of the whole pattern would
-        need a regex engine to honour; reject them."""
+        need a regex engine to honor; reject them."""
         for i in range(len(self.nodes)):
             var k = self.nodes[i].kind
             if k != _BEGIN and k != _END:

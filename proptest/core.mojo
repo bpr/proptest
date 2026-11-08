@@ -24,6 +24,7 @@ If the property fails, `given` shrinks the failure and raises an `Error`
 describing the minimal falsifying example and the original error.
 """
 
+from std.benchmark import keep
 from std.reflection import call_location, SourceLocation
 
 from proptest.internal.data import (
@@ -33,6 +34,11 @@ from proptest.internal.data import (
     UNSATISFIED_ASSUMPTION,
 )
 from proptest.internal.engine import ConjectureRunner, RunReport
+from proptest.internal.statistics import (
+    Statistics,
+    COVERAGE_SUFFICIENT,
+    COVERAGE_INSUFFICIENT,
+)
 from proptest.internal.shrinker import Shrinker
 from proptest.internal.choice import ChoiceValue, sort_key_less
 from std.memory import ArcPointer
@@ -43,6 +49,7 @@ from std.time import perf_counter_ns
 from std.collections import Set
 from proptest.settings import Settings, Verbosity, HealthCheck
 from proptest.strategies.strategy import Strategy, Drawable, format_value
+from proptest.strategies.types import from_type
 
 
 # ===----------------------------------------------------------------------=== #
@@ -79,6 +86,17 @@ def _resolve_settings(settings: Settings, location: SourceLocation) -> Settings:
     return s^
 
 
+@inline(.never)
+def before_minimal_test_case(name: String):
+    """Called just before a shrunk failure is replayed for the last time
+    (RapidCheck's `rc::beforeMinimalTestCase`). It does nothing; set a
+    breakpoint on it to stop on the minimal failing example only, then
+    set the breakpoints you need in the test. `name` is the test's
+    location, for a conditional breakpoint. In LLDB (`mojo debug`):
+    `breakpoint set -r before_minimal_test_case`."""
+    keep(name)
+
+
 def run_test[
     F: def(mut ConjectureData) raises
 ](var test_fn: F, settings: Settings, name: String) raises -> RunReport:
@@ -94,6 +112,7 @@ def run_test[
         var n_choices = len(choices)
         var data = runner.new_data(choices^, max_choices=n_choices)
         data.is_final = True
+        before_minimal_test_case(name)
         var msg = runner.execute(data)
         if data.status != Status.INTERESTING:
             raise Error(
@@ -128,7 +147,7 @@ def run_test[
                 ")",
             )
         )
-    # Pareto optimisation (Hypothesis runs it at the end of the target
+    # Pareto optimization (Hypothesis runs it at the end of the target
     # phase): shrink each member of the front, from the most complex down,
     # keeping only shrinks that dominate it.
     if (
@@ -226,6 +245,7 @@ def run_test[
         data.is_final = True
         if origin in runner.arg_comments:
             data.arg_comments = runner.arg_comments[origin].copy()
+        before_minimal_test_case(name)
         var msg = runner.execute(data)
         if origin in runner.explain_notes:
             data.notes.append(String("# ", runner.explain_notes[origin]))
@@ -253,7 +273,47 @@ def run_test[
     report.overrun = runner.overrun_count
     report.calls = runner.call_count
     report.exit_reason = runner.exit_reason
+    _report_statistics(
+        report, runner.stats, runner.coverage_verdict, name, settings
+    )
     return report^
+
+
+def _report_statistics(
+    mut report: RunReport,
+    stats: Statistics,
+    verdict: Int,
+    name: String,
+    settings: Settings,
+) raises:
+    """Attach the statistics to the report, print them if asked, and
+    judge the coverage requirements."""
+    report.statistics = stats.copy()
+    if settings.show_statistics or settings.verbosity >= Verbosity.verbose:
+        print(String("proptest statistics for ", name, ":\n", stats), end="")
+    if len(stats.cover_order) == 0 or len(report.failures) > 0:
+        return
+    if settings.check_coverage:
+        var conf = settings.check_coverage.value()
+        var lines: List[String]
+        if verdict == COVERAGE_SUFFICIENT:
+            return
+        elif verdict == COVERAGE_INSUFFICIENT:
+            lines = stats.under_covered(1.0)
+        else:
+            # undecided after COVERAGE_MAX_EXAMPLES (or the search space
+            # ran out): the observed share decides
+            lines = stats.under_covered(conf.tolerance)
+        if len(lines) > 0:
+            report.coverage_error = String(
+                "Insufficient coverage (",
+                name,
+                "):\n    ",
+                "\n    ".join(lines),
+            )
+    elif settings.verbosity >= Verbosity.normal:
+        for line in stats.under_covered(1.0):
+            print(String("proptest: ", name, ": ", line))
 
 
 def _failure_message(
@@ -283,21 +343,37 @@ def _failure_message(
     return out^
 
 
-def _note_given(mut data: ConjectureData, var args: List[String]):
+def _note_given(
+    mut data: ConjectureData, var args: List[String], *, at: Int = -1
+):
     """Record the falsifying arguments of a `given` test, with any
-    explain-phase comments (Hypothesis's "or any other generated value")."""
+    explain-phase comments (Hypothesis's "or any other generated value").
+    With `at >= 0`, the lines go at that position in the notes (arguments
+    are formatted after the test runs, so that generated functions can
+    show the calls made, but are reported before the test's own notes)."""
+    var lines = List[String]()
     if len(data.arg_comments) == 0:
         var line = String("given(")
         for i in range(len(args)):
             if i > 0:
                 line += ", "
             line += args[i]
-        data.notes.append(line + ")")
+        lines.append(line + ")")
+    else:
+        lines.append("given(")
+        for i in range(len(args)):
+            lines.append(String("    ", args[i], ",", data.arg_comment(i)))
+        lines.append(")")
+    if at < 0 or at >= len(data.notes):
+        data.notes.extend(lines^)
         return
-    data.notes.append("given(")
-    for i in range(len(args)):
-        data.notes.append(String("    ", args[i], ",", data.arg_comment(i)))
-    data.notes.append(")")
+    var notes = List[String]()
+    for i in range(at):
+        notes.append(data.notes[i])
+    notes.extend(lines^)
+    for i in range(at, len(data.notes)):
+        notes.append(data.notes[i])
+    data.notes = notes^
 
 
 def _check_deadline(
@@ -326,6 +402,8 @@ def _check_deadline(
 def _raise_failures(report: RunReport, name: String, settings: Settings) raises:
     if len(report.failures) > 0:
         raise Error(_failure_message(report, name, settings))
+    if report.coverage_error.byte_length() > 0:
+        raise Error(report.coverage_error)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -353,10 +431,13 @@ def given[
 
     def run_one(mut data: ConjectureData) raises {s1, test, deadline}:
         var a = data.draw(s1)
-        if data.is_final:
-            _note_given(data, [format_value(a)])
+        var mark = len(data.notes)
         var start = perf_counter_ns()
-        test(a)
+        try:
+            test(a)
+        finally:
+            if data.is_final:
+                _note_given(data, [format_value(a)], at=mark)
         _check_deadline(data, start, deadline)
 
     var report = run_test(run_one, s, String(loc))
@@ -382,10 +463,13 @@ def given[
     def run_one(mut data: ConjectureData) raises {s1, s2, test, deadline}:
         var a = data.draw(s1)
         var b = data.draw(s2)
-        if data.is_final:
-            _note_given(data, [format_value(a), format_value(b)])
+        var mark = len(data.notes)
         var start = perf_counter_ns()
-        test(a, b)
+        try:
+            test(a, b)
+        finally:
+            if data.is_final:
+                _note_given(data, [format_value(a), format_value(b)], at=mark)
         _check_deadline(data, start, deadline)
 
     var report = run_test(run_one, s, String(loc))
@@ -417,12 +501,17 @@ def given[
         var a = data.draw(s1)
         var b = data.draw(s2)
         var c = data.draw(s3)
-        if data.is_final:
-            _note_given(
-                data, [format_value(a), format_value(b), format_value(c)]
-            )
+        var mark = len(data.notes)
         var start = perf_counter_ns()
-        test(a, b, c)
+        try:
+            test(a, b, c)
+        finally:
+            if data.is_final:
+                _note_given(
+                    data,
+                    [format_value(a), format_value(b), format_value(c)],
+                    at=mark,
+                )
         _check_deadline(data, start, deadline)
 
     var report = run_test(run_one, s, String(loc))
@@ -459,18 +548,22 @@ def given[
         var b = data.draw(s2)
         var c = data.draw(s3)
         var d = data.draw(s4)
-        if data.is_final:
-            _note_given(
-                data,
-                [
-                    format_value(a),
-                    format_value(b),
-                    format_value(c),
-                    format_value(d),
-                ],
-            )
+        var mark = len(data.notes)
         var start = perf_counter_ns()
-        test(a, b, c, d)
+        try:
+            test(a, b, c, d)
+        finally:
+            if data.is_final:
+                _note_given(
+                    data,
+                    [
+                        format_value(a),
+                        format_value(b),
+                        format_value(c),
+                        format_value(d),
+                    ],
+                    at=mark,
+                )
         _check_deadline(data, start, deadline)
 
     var report = run_test(run_one, s, String(loc))
@@ -510,19 +603,23 @@ def given[
         var a3 = data.draw(s3)
         var a4 = data.draw(s4)
         var a5 = data.draw(s5)
-        if data.is_final:
-            _note_given(
-                data,
-                [
-                    format_value(a1),
-                    format_value(a2),
-                    format_value(a3),
-                    format_value(a4),
-                    format_value(a5),
-                ],
-            )
+        var mark = len(data.notes)
         var start = perf_counter_ns()
-        test(a1, a2, a3, a4, a5)
+        try:
+            test(a1, a2, a3, a4, a5)
+        finally:
+            if data.is_final:
+                _note_given(
+                    data,
+                    [
+                        format_value(a1),
+                        format_value(a2),
+                        format_value(a3),
+                        format_value(a4),
+                        format_value(a5),
+                    ],
+                    at=mark,
+                )
         _check_deadline(data, start, deadline)
 
     var report = run_test(run_one, s, String(loc))
@@ -565,20 +662,24 @@ def given[
         var a4 = data.draw(s4)
         var a5 = data.draw(s5)
         var a6 = data.draw(s6)
-        if data.is_final:
-            _note_given(
-                data,
-                [
-                    format_value(a1),
-                    format_value(a2),
-                    format_value(a3),
-                    format_value(a4),
-                    format_value(a5),
-                    format_value(a6),
-                ],
-            )
+        var mark = len(data.notes)
         var start = perf_counter_ns()
-        test(a1, a2, a3, a4, a5, a6)
+        try:
+            test(a1, a2, a3, a4, a5, a6)
+        finally:
+            if data.is_final:
+                _note_given(
+                    data,
+                    [
+                        format_value(a1),
+                        format_value(a2),
+                        format_value(a3),
+                        format_value(a4),
+                        format_value(a5),
+                        format_value(a6),
+                    ],
+                    at=mark,
+                )
         _check_deadline(data, start, deadline)
 
     var report = run_test(run_one, s, String(loc))
@@ -655,10 +756,676 @@ def check_examples[
 
 
 # ===----------------------------------------------------------------------=== #
+# check: strategies from the property's parameter types
+# ===----------------------------------------------------------------------=== #
+
+comptime _RETURNED_FALSE = "check: the property returned False"
+
+
+trait Testable(Deinitable):
+    """A result type for properties passed to `check`, besides `Bool`
+    (quickcheck's `Testable`). `Outcome` implements it."""
+
+    def check_result(self) raises:
+        """Raise if this result is a failure, or reject the test case if
+        it is a discard."""
+        ...
+
+
+struct Outcome(Copyable, Testable, Writable):
+    """The result of a property that can also discard its input
+    (quickcheck's `TestResult`).
+
+    For example:
+
+    ```mojo
+    def prop(a: Int, b: Int) -> Outcome:
+        if b == 0:
+            return Outcome.discard()
+        if (a // b) * b + a % b != a:
+            return Outcome.fail("division identity")
+        return Outcome.passed()
+    check(prop)
+    ```
+    """
+
+    comptime _PASS = 0
+    comptime _DISCARD = 1
+    comptime _FAIL = 2
+    var kind: Int
+    var message: String
+
+    def __init__(out self, kind: Int, message: String):
+        self.kind = kind
+        self.message = message
+
+    @staticmethod
+    def passed() -> Self:
+        """The property held."""
+        return Self(Self._PASS, "")
+
+    @staticmethod
+    def discard() -> Self:
+        """The input doesn't count (like `assume(False)`)."""
+        return Self(Self._DISCARD, "")
+
+    @staticmethod
+    def fail(message: String) -> Self:
+        """The property failed; `message` goes in the report."""
+        return Self(Self._FAIL, message)
+
+    @staticmethod
+    def of(condition: Bool, message: String = "") -> Self:
+        """`passed()` if `condition` holds, otherwise `fail(message)`."""
+        return Self.passed() if condition else Self.fail(message)
+
+    def is_failure(self) -> Bool:
+        return self.kind == Self._FAIL
+
+    def check_result(self) raises:
+        if self.kind == Self._DISCARD:
+            assume(False)
+        elif self.kind == Self._FAIL:
+            raise Error(
+                String("check: ", self.message) if self.message.byte_length()
+                > 0 else _RETURNED_FALSE
+            )
+
+    def write_to(self, mut writer: Some[Writer]):
+        if self.kind == Self._PASS:
+            writer.write("Outcome.passed()")
+        elif self.kind == Self._DISCARD:
+            writer.write("Outcome.discard()")
+        else:
+            writer.write("Outcome.fail(", repr(self.message), ")")
+
+
+@always_inline
+def check[
+    A: Drawable, //, P: def(A) raises
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """Check that `f` passes for values of its parameter types.
+
+    Each argument is drawn with `from_type` (quickcheck's `Testable`):
+
+    ```mojo
+    def prop(xs: List[Int], n: UInt8) raises:
+        ...
+    check(prop)
+    ```
+    """
+    var loc = location.value() if location else call_location()
+    given(from_type[A](), f, settings, location=loc)
+
+
+@always_inline
+def check[
+    A: Drawable, //, P: def(A) raises -> Bool
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """`check` for a property that returns False on failure."""
+    var loc = location.value() if location else call_location()
+
+    def wrapped(x1: A) raises {f}:
+        if not f(x1):
+            raise Error(_RETURNED_FALSE)
+
+    given(from_type[A](), wrapped, settings, location=loc)
+
+
+@always_inline
+def check[
+    A: Drawable, R: Testable, //, P: def(A) raises -> R
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """`check` for a property that returns an `Outcome` (pass, discard,
+    or fail with a message)."""
+    var loc = location.value() if location else call_location()
+
+    def wrapped(x1: A) raises {f}:
+        f(x1).check_result()
+
+    given(from_type[A](), wrapped, settings, location=loc)
+
+
+@always_inline
+def check[
+    A: Drawable, B: Drawable, //, P: def(A, B) raises
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """`check` for a 2-argument property."""
+    var loc = location.value() if location else call_location()
+    given(from_type[A](), from_type[B](), f, settings, location=loc)
+
+
+@always_inline
+def check[
+    A: Drawable, B: Drawable, //, P: def(A, B) raises -> Bool
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """`check` for a 2-argument property returning `Bool`."""
+    var loc = location.value() if location else call_location()
+
+    def wrapped(x1: A, x2: B) raises {f}:
+        if not f(x1, x2):
+            raise Error(_RETURNED_FALSE)
+
+    given(from_type[A](), from_type[B](), wrapped, settings, location=loc)
+
+
+@always_inline
+def check[
+    A: Drawable, B: Drawable, R: Testable, //, P: def(A, B) raises -> R
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """`check` for a 2-argument property returning `Bool`."""
+    var loc = location.value() if location else call_location()
+
+    def wrapped(x1: A, x2: B) raises {f}:
+        f(x1, x2).check_result()
+
+    given(from_type[A](), from_type[B](), wrapped, settings, location=loc)
+
+
+@always_inline
+def check[
+    A: Drawable, B: Drawable, C: Drawable, //, P: def(A, B, C) raises
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """`check` for a 3-argument property."""
+    var loc = location.value() if location else call_location()
+    given(
+        from_type[A](),
+        from_type[B](),
+        from_type[C](),
+        f,
+        settings,
+        location=loc,
+    )
+
+
+@always_inline
+def check[
+    A: Drawable,
+    B: Drawable,
+    C: Drawable,
+    //,
+    P: def(A, B, C) raises -> Bool,
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """`check` for a 3-argument property returning `Bool`."""
+    var loc = location.value() if location else call_location()
+
+    def wrapped(x1: A, x2: B, x3: C) raises {f}:
+        if not f(x1, x2, x3):
+            raise Error(_RETURNED_FALSE)
+
+    given(
+        from_type[A](),
+        from_type[B](),
+        from_type[C](),
+        wrapped,
+        settings,
+        location=loc,
+    )
+
+
+@always_inline
+def check[
+    A: Drawable,
+    B: Drawable,
+    C: Drawable,
+    R: Testable,
+    //,
+    P: def(A, B, C) raises -> R,
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """`check` for a 3-argument property returning `Bool`."""
+    var loc = location.value() if location else call_location()
+
+    def wrapped(x1: A, x2: B, x3: C) raises {f}:
+        f(x1, x2, x3).check_result()
+
+    given(
+        from_type[A](),
+        from_type[B](),
+        from_type[C](),
+        wrapped,
+        settings,
+        location=loc,
+    )
+
+
+@always_inline
+def check[
+    A: Drawable,
+    B: Drawable,
+    C: Drawable,
+    D: Drawable,
+    //,
+    P: def(A, B, C, D) raises,
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """`check` for a 4-argument property."""
+    var loc = location.value() if location else call_location()
+    given(
+        from_type[A](),
+        from_type[B](),
+        from_type[C](),
+        from_type[D](),
+        f,
+        settings,
+        location=loc,
+    )
+
+
+@always_inline
+def check[
+    A: Drawable,
+    B: Drawable,
+    C: Drawable,
+    D: Drawable,
+    //,
+    P: def(A, B, C, D) raises -> Bool,
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """`check` for a 4-argument property returning `Bool`."""
+    var loc = location.value() if location else call_location()
+
+    def wrapped(x1: A, x2: B, x3: C, x4: D) raises {f}:
+        if not f(x1, x2, x3, x4):
+            raise Error(_RETURNED_FALSE)
+
+    given(
+        from_type[A](),
+        from_type[B](),
+        from_type[C](),
+        from_type[D](),
+        wrapped,
+        settings,
+        location=loc,
+    )
+
+
+@always_inline
+def check[
+    A: Drawable,
+    B: Drawable,
+    C: Drawable,
+    D: Drawable,
+    R: Testable,
+    //,
+    P: def(A, B, C, D) raises -> R,
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """`check` for a 4-argument property returning `Bool`."""
+    var loc = location.value() if location else call_location()
+
+    def wrapped(x1: A, x2: B, x3: C, x4: D) raises {f}:
+        f(x1, x2, x3, x4).check_result()
+
+    given(
+        from_type[A](),
+        from_type[B](),
+        from_type[C](),
+        from_type[D](),
+        wrapped,
+        settings,
+        location=loc,
+    )
+
+
+@always_inline
+def check[
+    A: Drawable,
+    B: Drawable,
+    C: Drawable,
+    D: Drawable,
+    E: Drawable,
+    //,
+    P: def(A, B, C, D, E) raises,
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """`check` for a 5-argument property."""
+    var loc = location.value() if location else call_location()
+    given(
+        from_type[A](),
+        from_type[B](),
+        from_type[C](),
+        from_type[D](),
+        from_type[E](),
+        f,
+        settings,
+        location=loc,
+    )
+
+
+@always_inline
+def check[
+    A: Drawable,
+    B: Drawable,
+    C: Drawable,
+    D: Drawable,
+    E: Drawable,
+    //,
+    P: def(A, B, C, D, E) raises -> Bool,
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """`check` for a 5-argument property returning `Bool`."""
+    var loc = location.value() if location else call_location()
+
+    def wrapped(x1: A, x2: B, x3: C, x4: D, x5: E) raises {f}:
+        if not f(x1, x2, x3, x4, x5):
+            raise Error(_RETURNED_FALSE)
+
+    given(
+        from_type[A](),
+        from_type[B](),
+        from_type[C](),
+        from_type[D](),
+        from_type[E](),
+        wrapped,
+        settings,
+        location=loc,
+    )
+
+
+@always_inline
+def check[
+    A: Drawable,
+    B: Drawable,
+    C: Drawable,
+    D: Drawable,
+    E: Drawable,
+    R: Testable,
+    //,
+    P: def(A, B, C, D, E) raises -> R,
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """`check` for a 5-argument property returning `Bool`."""
+    var loc = location.value() if location else call_location()
+
+    def wrapped(x1: A, x2: B, x3: C, x4: D, x5: E) raises {f}:
+        f(x1, x2, x3, x4, x5).check_result()
+
+    given(
+        from_type[A](),
+        from_type[B](),
+        from_type[C](),
+        from_type[D](),
+        from_type[E](),
+        wrapped,
+        settings,
+        location=loc,
+    )
+
+
+@always_inline
+def check[
+    A: Drawable,
+    B: Drawable,
+    C: Drawable,
+    D: Drawable,
+    E: Drawable,
+    F: Drawable,
+    //,
+    P: def(A, B, C, D, E, F) raises,
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """`check` for a 6-argument property."""
+    var loc = location.value() if location else call_location()
+    given(
+        from_type[A](),
+        from_type[B](),
+        from_type[C](),
+        from_type[D](),
+        from_type[E](),
+        from_type[F](),
+        f,
+        settings,
+        location=loc,
+    )
+
+
+@always_inline
+def check[
+    A: Drawable,
+    B: Drawable,
+    C: Drawable,
+    D: Drawable,
+    E: Drawable,
+    F: Drawable,
+    //,
+    P: def(A, B, C, D, E, F) raises -> Bool,
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """`check` for a 6-argument property returning `Bool`."""
+    var loc = location.value() if location else call_location()
+
+    def wrapped(x1: A, x2: B, x3: C, x4: D, x5: E, x6: F) raises {f}:
+        if not f(x1, x2, x3, x4, x5, x6):
+            raise Error(_RETURNED_FALSE)
+
+    given(
+        from_type[A](),
+        from_type[B](),
+        from_type[C](),
+        from_type[D](),
+        from_type[E](),
+        from_type[F](),
+        wrapped,
+        settings,
+        location=loc,
+    )
+
+
+@always_inline
+def check[
+    A: Drawable,
+    B: Drawable,
+    C: Drawable,
+    D: Drawable,
+    E: Drawable,
+    F: Drawable,
+    R: Testable,
+    //,
+    P: def(A, B, C, D, E, F) raises -> R,
+](
+    f: P,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises:
+    """`check` for a 6-argument property returning `Bool`."""
+    var loc = location.value() if location else call_location()
+
+    def wrapped(x1: A, x2: B, x3: C, x4: D, x5: E, x6: F) raises {f}:
+        f(x1, x2, x3, x4, x5, x6).check_result()
+
+    given(
+        from_type[A](),
+        from_type[B](),
+        from_type[C](),
+        from_type[D](),
+        from_type[E](),
+        from_type[F](),
+        wrapped,
+        settings,
+        location=loc,
+    )
+
+
+# ===----------------------------------------------------------------------=== #
 # find / example
 # ===----------------------------------------------------------------------=== #
 
 comptime _FOUND = "At proptest.find: Found"
+
+
+def expect_failure[F: def() raises](test: F) raises -> String:
+    """Run `test` (a `given`, `check` or state machine test, for example)
+    and return the report of the failure it should find; raise if it
+    passes (QuickCheck's `expectFailure`). For negative controls: checks
+    that a property, or the generators behind it, can find the bug they
+    are meant to.
+
+    ```mojo
+    def buggy(xs: List[Int]) -> Bool:
+        return len(xs) < 3
+    var report = expect_failure(lambda () raises {buggy}: check(buggy))
+    ```
+
+    Errors that aren't failures of the property (a failed health check,
+    an invalid argument) are re-raised."""
+    try:
+        test()
+    except e:
+        var msg = String(e)
+        if (
+            msg.startswith("Falsifying example")
+            or msg.startswith("proptest found ")
+            or msg.startswith("Insufficient coverage")
+        ):
+            return msg^
+        raise e^
+    raise Error("expect_failure: the property passed, but should have failed")
+
+
+struct PropertyResult[T: Drawable](Movable):
+    """The outcome of `run_property`: what `given` would have raised,
+    as data."""
+
+    var report: RunReport
+    """Counts, statistics and the raw failures of the run."""
+    var counterexample: Optional[Self.T]
+    """The shrunk failing value (of the first failure), if any."""
+    var message: String
+    """The report `given` would have raised (empty if the run passed)."""
+    var blob: String
+    """`Settings(reproduce=...)` replays the counterexample."""
+
+    def __init__(out self, var report: RunReport):
+        self.report = report^
+        self.counterexample = None
+        self.message = String()
+        self.blob = String()
+
+    def passed(self) -> Bool:
+        return self.message.byte_length() == 0
+
+
+@always_inline
+def run_property[
+    S: Strategy, //, T: def(S.Value) raises
+](
+    strategy: S,
+    test: T,
+    settings: Settings = Settings(),
+    *,
+    location: Optional[SourceLocation] = None,
+) raises -> PropertyResult[S.Value]:
+    """Run `given(strategy, test)` and return what happened instead of
+    raising (QuickCheck's `quickCheckResult`): pass or fail, the typed,
+    shrunk counterexample, the report and a reproduce blob, along with
+    the run's counts and statistics. Use `tuples(...)` for several
+    arguments."""
+    var loc = location.value() if location else call_location()
+    var s = _resolve_settings(settings, loc)
+    var deadline = s.deadline_ns()
+
+    def run_one(mut data: ConjectureData) raises {strategy, test, deadline}:
+        var a = data.draw(strategy)
+        var mark = len(data.notes)
+        var start = perf_counter_ns()
+        try:
+            test(a)
+        finally:
+            if data.is_final:
+                _note_given(data, [format_value(a)], at=mark)
+        _check_deadline(data, start, deadline)
+
+    var report = run_test(run_one, s, String(loc))
+    var result = PropertyResult[S.Value](report.copy())
+    if len(report.failures) > 0:
+        result.message = _failure_message(report, String(loc), s)
+        var choices = report.failures[0][].choices()
+        result.blob = encode_blob(choices)
+        var data = ConjectureData(
+            choices^, Provider(Random(0), ArcPointer(Constants()))
+        )
+        result.counterexample = data.draw(strategy)
+    elif report.coverage_error.byte_length() > 0:
+        result.message = report.coverage_error
+    return result^
 
 
 @always_inline

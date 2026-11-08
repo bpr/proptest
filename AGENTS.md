@@ -22,12 +22,14 @@ proptest is a port of Hypothesis (Python property-based testing) to Mojo 1.3.
 | Path | Contents |
 |---|---|
 | `strategies/` | Strategy structs and combinators |
-| `strategies/types.mojo` | `from_type`, **generated** by `tools/gen_from_type.py` |
+| `strategies/types.mojo` | `from_type`, `Arbitrary`, and extensions giving the standard types strategies |
+| `strategies/constraints.mojo` | Constraint types (`Positive`, `NonEmpty`, `Via`, ...) implementing `Arbitrary` |
+| `commands.mojo` | Model-based testing: `Command`, `Commands`, `commands()` (after RapidCheck) |
 | `internal/` | Engine internals (e.g. `pareto.mojo`) |
-| `internal/charmap_data.mojo` | **Generated** by `tools/gen_charmap.py` |
+| `internal/charmap_data.mojo`, `internal/decomposition_data.mojo` | **Generated** by `tools/gen_unicode.mojo` (`pixi run gen-unicode`) |
 | `tests/` | `test_*.mojo` suites and `run_all.sh` |
 | `extras/` | NuMojo integration and its tests |
-| `tools/` | Code generators (Python) |
+| `tools/` | The Unicode table generator (Mojo) |
 | `docs/` | Design notes, including the differences doc |
 
 ## Architecture
@@ -36,15 +38,25 @@ proptest is a port of Hypothesis (Python property-based testing) to Mojo 1.3.
 - Strategies are structs conforming to `Strategy`, with an associated
   `comptime Value` and `do_draw(self, mut data: ConjectureData)`.
 - Always draw through `data.draw(s)` / `draw(data, s)`, which wraps the draw in a
-  span labelled `s.label()`. The shrinker relies on spans.
+  span labeled `s.label()`. The shrinker relies on spans.
 - Combinators are free functions over closure type parameters, e.g.
   `map[S, R, //, F: def(S.Value) raises -> R](var s: S, var f: F)`.
   Trait default methods generic over closures of `Self.Value` hit a compiler bug.
 - Combinator structs are `Copyable where` their parts are.
 - `BoxedStrategy[T]` type-erases a strategy with a raw heap pointer and thin
   function pointers (draw/clone/free) built from nested non-capturing defs in its
-  generic `__init__` (pattern from `std/format/tstring.mojo`). Used by `one_of`
-  and `recursive`.
+  generic `__init__` (pattern from `std/format/tstring.mojo`). Used by
+  `one_of` over a list and by `recursive`; `one_of(s1, ..., s6)` returns the
+  unboxed, variadic `Alternatives[*Ss]` (a `Tuple` of strategies,
+  dispatched with `comptime for`).
+
+### Reporting `given` arguments
+- `given` formats its arguments after the test runs (in a `finally`) and
+  inserts them before the test's own notes (`_note_given(..., at=mark)`),
+  so that generated functions can print the calls made.
+- A `Function` from `functions()` points at its test case's
+  `ConjectureData`. `freeze()` and `__deinit__` revoke its liveness token
+  (`data.live_tokens`); never move a `ConjectureData` while a test runs.
 
 ### Control flow
 - `ConjectureData.mark_*` sets `status`, freezes, and raises `Error(STOP_TEST)`.
@@ -73,17 +85,20 @@ proptest is a port of Hypothesis (Python property-based testing) to Mojo 1.3.
 
 ### Targeting
 - Per-label hill climbing in the engine.
-- A Pareto front (`internal/pareto.mojo`, only with a database) optimised in
+- A Pareto front (`internal/pareto.mojo`, only with a database) optimized in
   `core.run_test` with `Shrinker(pareto=True)`, capped at 10 x `max_examples` calls.
 
 ### `from_type`
-- `strategies/types.mojo` is generated. Struct building writes fields at
-  `reflect[T].field_offset` into uninitialised memory.
+- Standard types (`List`, `Dict`, `Tuple`, scalars, ...) get strategies
+  from `__extension` blocks implementing the private `_StandardArbitrary`;
+  user types implement `Arbitrary`. Other structs are built by writing
+  fields at `reflect[T].field_offset` into uninitialized memory.
 
 ## Rules
 
-- **Generated files:** edit the generator in `tools/`, never `strategies/types.mojo`
-  or `internal/charmap_data.mojo` directly, then regenerate.
+- **Generated files:** edit the generator in `tools/`, never
+  `internal/charmap_data.mojo` or `internal/decomposition_data.mojo`
+  directly, then regenerate.
 - **Deviations from Hypothesis:** record each one, with the reason, in
   `docs/differences-from-hypothesis.md` when porting more.
 

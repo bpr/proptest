@@ -12,7 +12,7 @@ draws -- which the shrinker uses to make structural changes.
 
 Control flow: Hypothesis raises `StopTest` to abandon a test case; proptest
 raises an `Error` whose message is `STOP_TEST` after setting `status`, and
-the engine recognises it. `assume()` raises `UNSATISFIED_ASSUMPTION`.
+the engine recognizes it. `assume()` raises `UNSATISFIED_ASSUMPTION`.
 """
 
 from std.memory import ArcPointer
@@ -222,6 +222,9 @@ struct ConjectureResult(Copyable):
     var target_observations: Dict[String, Float64]
     var notes: List[String]
     var events: List[String]
+    var table_entries: List[Tuple[String, String]]
+    var covers: Dict[String, Float64]
+    var covered: Dict[String, Bool]
     var length: Int
     var misaligned: Bool
     var draw_time_ns: Int
@@ -243,6 +246,9 @@ struct ConjectureResult(Copyable):
         self.target_observations = Dict[String, Float64]()
         self.notes = List[String]()
         self.events = List[String]()
+        self.table_entries = List[Tuple[String, String]]()
+        self.covers = Dict[String, Float64]()
+        self.covered = Dict[String, Bool]()
         self.length = 0
         self.misaligned = False
         self.draw_time_ns = 0
@@ -303,6 +309,12 @@ struct ConjectureData(Movable):
     var misaligned: Bool
     var notes: List[String]
     var events: List[String]
+    var table_entries: List[Tuple[String, String]]
+    """Values recorded with `tabulate`, as (table, value)."""
+    var covers: Dict[String, Float64]
+    """Coverage requirements (percentages) declared with `cover`."""
+    var covered: Dict[String, Bool]
+    """Coverage labels whose condition held in this test case."""
     var target_observations: Dict[String, Float64]
     var provider: Provider
     var id: Int
@@ -328,6 +340,9 @@ struct ConjectureData(Movable):
     var explain_note: String
     var shared_values: Dict[String, ErasedValue]
     """Values drawn by `shared()` strategies, by key."""
+    var live_tokens: List[ArcPointer[Bool]]
+    """Set to False when the test case ends; generated functions
+    (`functions()`) check theirs before drawing."""
 
     def __init__(
         out self,
@@ -357,6 +372,9 @@ struct ConjectureData(Movable):
         self.misaligned = False
         self.notes = List[String]()
         self.events = List[String]()
+        self.table_entries = List[Tuple[String, String]]()
+        self.covers = Dict[String, Float64]()
+        self.covered = Dict[String, Bool]()
         self.target_observations = Dict[String, Float64]()
         self.provider = provider^
         self.id = id
@@ -373,6 +391,7 @@ struct ConjectureData(Movable):
         self.arg_comments = Dict[Int, String]()
         self.explain_note = String()
         self.shared_values = Dict[String, ErasedValue]()
+        self.live_tokens = List[ArcPointer[Bool]]()
         # the top span (depth 0)
         self.depth = 0
         self.span_stack.append(0)
@@ -445,13 +464,17 @@ struct ConjectureData(Movable):
         *,
         shrink_towards: Int128 = 0,
         forced: Optional[Int128] = None,
+        weights: Optional[ArcPointer[List[Float64]]] = None,
     ) raises -> Int128:
-        """Draw an integer in the (optionally bounded) range."""
+        """Draw an integer in the (optionally bounded) range. `weights`, if
+        given, are the probabilities of generating `min_value`,
+        `min_value + 1`, ..., `max_value`."""
         var f: Optional[ChoiceValue] = None
         if forced:
             f = ChoiceValue(integer=forced.value())
         var v = self._draw(
-            Constraints.integer(min_value, max_value, shrink_towards), f
+            Constraints.integer(min_value, max_value, shrink_towards, weights),
+            f,
         )
         return v.i
 
@@ -582,12 +605,20 @@ struct ConjectureData(Movable):
     # Concluding
     # ===------------------------------------------------------------------=== #
 
+    def __deinit__(deinit self):
+        # generated functions keep a pointer to this test case: make sure
+        # they stop using it, whether or not the test case was frozen
+        for t in self.live_tokens:
+            t[] = False
+
     def freeze(mut self):
         if self.frozen:
             return
         while len(self.span_stack) > 0:
             self.stop_span()
         self.frozen = True
+        for t in self.live_tokens:
+            t[] = False
 
     def conclude_test(mut self, status: Status, origin: String = "") raises:
         """Mark the test case finished with `status` and abandon it."""
@@ -609,7 +640,26 @@ struct ConjectureData(Movable):
         self.notes.append(msg)
 
     def event(mut self, msg: String):
+        """Record that something happened in this test case. Run statistics
+        (`Settings(show_statistics=True)`) give the share of test cases
+        that recorded each event (Hypothesis's `event`)."""
         self.events.append(msg)
+
+    def tabulate(mut self, table: String, value: String):
+        """Add `value` to the table `table`. Run statistics show how often
+        each value occurred (QuickCheck's `tabulate`)."""
+        self.table_entries.append((table, value))
+
+    def cover(mut self, percent: Float64, condition: Bool, label: String):
+        """Require that at least `percent`% of passing test cases satisfy
+        `condition` (QuickCheck's `cover`). A requirement that isn't met
+        is a warning, or with `Settings(check_coverage=Confidence())` a
+        statistically checked failure. Calling it several times in one
+        test case counts the case if any call's condition holds."""
+        if label not in self.covers:
+            self.covers[label] = percent
+        if condition:
+            self.covered[label] = True
 
     def target(mut self, score: Float64, label: String = ""):
         self.target_observations[label] = score
@@ -623,6 +673,9 @@ struct ConjectureData(Movable):
         r.target_observations = self.target_observations.copy()
         r.notes = self.notes.copy()
         r.events = self.events.copy()
+        r.table_entries = self.table_entries.copy()
+        r.covers = self.covers.copy()
+        r.covered = self.covered.copy()
         r.length = self.length
         r.misaligned = self.misaligned
         r.draw_time_ns = self.draw_time_ns

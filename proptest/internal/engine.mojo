@@ -11,7 +11,7 @@ of `optimiser.py`). A run proceeds in phases:
 2. **generate**: run the simplest example, then random ones, each followed
    by a few *mutations* that duplicate a span's choices elsewhere;
 3. **target**: hill-climb on scores reported with `data.target(...)`;
-4. **shrink**: minimise each distinct failure (see `shrinker.mojo`).
+4. **shrink**: minimize each distinct failure (see `shrinker.mojo`).
 
 Differences from Hypothesis: there is no `DataTree`, so novelty is
 approximated by the result cache (a run that repeats an already-seen
@@ -49,6 +49,12 @@ from proptest.settings import Settings, Verbosity, HealthCheck
 from proptest.database import ExampleDatabase
 from proptest.internal.datatree import DataTree
 from proptest.internal.pareto import ParetoFront
+from proptest.internal.statistics import (
+    Statistics,
+    COVERAGE_UNDECIDED,
+    COVERAGE_SUFFICIENT,
+    COVERAGE_INSUFFICIENT,
+)
 
 comptime CACHE_SIZE = 10000
 comptime MIN_TEST_CALLS = 10
@@ -79,6 +85,13 @@ def interesting_origin(msg: String) -> String:
     return "Error"
 
 
+comptime _INVALID_PREFIX = "invalid because: "
+
+comptime COVERAGE_MAX_EXAMPLES = 100_000
+"""Give up deciding coverage after this many valid examples; the observed
+share then decides."""
+
+
 struct RunReport(Copyable):
     """What a run found."""
 
@@ -93,6 +106,10 @@ struct RunReport(Copyable):
     var shrinks: Int
     var exit_reason: String
     var seed: UInt64
+    var statistics: Statistics
+    """Events, tables and coverage seen in the generate phase."""
+    var coverage_error: String
+    """Why the coverage requirements failed (empty if they didn't)."""
 
     def __init__(out self):
         self.failures = List[Result]()
@@ -104,10 +121,12 @@ struct RunReport(Copyable):
         self.shrinks = 0
         self.exit_reason = String()
         self.seed = 0
+        self.statistics = Statistics()
+        self.coverage_error = String()
 
 
 struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
-    """Runs a test function repeatedly, looking for and minimising failures."""
+    """Runs a test function repeatedly, looking for and minimizing failures."""
 
     var test_fn: Self.F
     var settings: Settings
@@ -152,6 +171,14 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
     var front: Optional[ParetoFront]
     """The Pareto front of targeted test cases (kept only with a
     database, as in Hypothesis)."""
+    var invalid_reasons: Dict[String, Int]
+    """How often each `mark_invalid` reason (filters, `filter(reason=)`)
+    rejected a test case."""
+    var stats: Statistics
+    var collecting_stats: Bool
+    """Count test cases into `stats` (only in the generate phase)."""
+    var coverage_next_check: Int
+    var coverage_verdict: Int
 
     def __init__(out self, var test_fn: Self.F, settings: Settings):
         self.test_fn = test_fn^
@@ -209,6 +236,11 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
         self.health_draw_ns = 0
         self.flaky_strategy = String()
         self.start_ns = perf_counter_ns()
+        self.invalid_reasons = Dict[String, Int]()
+        self.stats = Statistics()
+        self.collecting_stats = False
+        self.coverage_next_check = max(settings.max_examples, 100)
+        self.coverage_verdict = COVERAGE_UNDECIDED
 
     # ===------------------------------------------------------------------=== #
     # Running test cases
@@ -293,10 +325,21 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
         if len(self.cache) >= CACHE_SIZE:
             self.cache = Dict[List[ChoiceValue], Result]()
         self.cache[key^] = result
+        if self.collecting_stats:
+            try:
+                self.stats.record(r)
+            except:
+                pass
         if r.status == Status.VALID:
             self.valid_count += 1
         elif r.status == Status.INVALID:
             self.invalid_count += 1
+            for e in r.events:
+                if e.startswith(_INVALID_PREFIX):
+                    var why = String(e.removeprefix(_INVALID_PREFIX))
+                    self.invalid_reasons[why] = (
+                        self.invalid_reasons.get(why, 0) + 1
+                    )
         elif r.status == Status.OVERRUN:
             self.overrun_count += 1
         if r.status >= Status.VALID:
@@ -461,8 +504,11 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
                 if result[].status == Status.INTERESTING:
                     break
 
-    def should_generate_more(self) -> Bool:
-        if self.valid_count >= self.settings.max_examples:
+    def should_generate_more(mut self) -> Bool:
+        if (
+            self.valid_count >= self.settings.max_examples
+            and not self._coverage_wants_more()
+        ):
             return False
         if self.tree.is_exhausted():
             return False
@@ -485,6 +531,57 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
             self.first_bug_found_at + 1000, self.last_bug_found_at * 2
         )
 
+    def _top_invalid_reasons(self) -> String:
+        """The most common reasons test cases were rejected, for the
+        `filter_too_much` message."""
+        var keys = List[String]()
+        for item in self.invalid_reasons.items():
+            var j = len(keys)
+            try:
+                while j > 0 and self.invalid_reasons[keys[j - 1]] < item.value:
+                    j -= 1
+            except:
+                pass
+            keys.insert(j, item.key)
+        if len(keys) == 0:
+            return String()
+        var out = String(" Most rejections were by:")
+        for k in range(min(3, len(keys))):
+            out += String(
+                " ",
+                keys[k],
+                " (",
+                self.invalid_reasons.get(keys[k], 0),
+                ")",
+                ";" if k + 1 < min(3, len(keys)) else ".",
+            )
+        return out^
+
+    def _coverage_wants_more(mut self) -> Bool:
+        """With `check_coverage`, whether the coverage requirements are
+        still undecided, so generation should go on past `max_examples`.
+        Checked at doubling numbers of examples, as QuickCheck does."""
+        if (
+            not self.settings.check_coverage
+            or len(self.stats.cover_order) == 0
+            or self.coverage_verdict != COVERAGE_UNDECIDED
+            or len(self.interesting) > 0
+        ):
+            return False
+        if self.stats.valid < self.coverage_next_check:
+            return True
+        try:
+            var v = self.stats.coverage_verdict(
+                self.settings.check_coverage.value()
+            )
+            if v != COVERAGE_UNDECIDED:
+                self.coverage_verdict = v
+                return False
+        except:
+            return False
+        self.coverage_next_check *= 2
+        return self.stats.valid < COVERAGE_MAX_EXAMPLES
+
     def _health_check(mut self) raises:
         """Fail early if the strategy mostly produces invalid data."""
         if self.health_check_done:
@@ -504,8 +601,9 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
                     self.invalid_count,
                     " inputs were filtered out. Try to construct values that",
                     " satisfy the conditions directly instead of using",
-                    " filter() or assume(). (suppress with",
-                    " HealthCheck.filter_too_much)",
+                    " filter() or assume().",
+                    self._top_invalid_reasons(),
+                    " (suppress with HealthCheck.filter_too_much)",
                 )
             )
         if self.health_overruns >= 20 and not self.settings.suppressed(
@@ -561,12 +659,13 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
                 " inputs and to shrink failing ones. (suppress with"
                 " HealthCheck.large_base_example)"
             )
-        var next_optimise_at = max(self.settings.max_examples // 2, 10)
+        var next_optimize_at = max(self.settings.max_examples // 2, 10)
         # Hypothesis's "small examples first": early test cases are limited
         # to a few times the size of the simplest completion of their prefix,
         # so simple bugs are found with simple inputs.
         var small_cap = min(self.settings.max_examples // 10, 50)
         var consecutive_zero_extend_invalid = 0
+        self.collecting_stats = True
         while self.should_generate_more():
             self.check_flaky()
             self._health_check()
@@ -604,12 +703,16 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
                 self.settings.phases.target
                 and len(self.best_targets) > 0
                 and len(self.interesting) == 0
-                and self.valid_count >= next_optimise_at
+                and self.valid_count >= next_optimize_at
             ):
-                self.optimise_targets(max_calls=self.settings.max_examples)
-                next_optimise_at = self.valid_count + max(
+                # hill climbing would skew the statistics
+                self.collecting_stats = False
+                self.optimize_targets(max_calls=self.settings.max_examples)
+                self.collecting_stats = True
+                next_optimize_at = self.valid_count + max(
                     self.settings.max_examples // 2, 10
                 )
+        self.collecting_stats = False
         if self.tree.is_exhausted() or self.consecutive_duplicates > max(
             100, 2 * self.settings.max_examples
         ):
@@ -694,7 +797,7 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
             else:
                 failed += 1
 
-    def optimise_targets(mut self, max_calls: Int):
+    def optimize_targets(mut self, max_calls: Int):
         """Hill-climb each target score (port of `Optimiser.hill_climb`):
         repeatedly nudge individual integer and float choices of the best
         example in the direction that increases its score."""
@@ -805,7 +908,7 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
             and len(self.best_targets) > 0
             and len(self.interesting) == 0
         ):
-            self.optimise_targets(max_calls=self.settings.max_examples)
+            self.optimize_targets(max_calls=self.settings.max_examples)
         self.check_flaky()
         if len(self.interesting) == 0 and self.valid_count == 0:
             if self.settings.max_examples > 0 and self.settings.phases.generate:

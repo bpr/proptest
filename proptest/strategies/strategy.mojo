@@ -35,9 +35,10 @@ from proptest.internal.data import (
 from proptest.internal.provider import calc_p_continue, average_size
 
 
-comptime Drawable = Copyable & Writable & Deinitable
-"""What a strategy's values must be: copyable (the engine keeps them) and
-writable (falsifying examples are printed)."""
+comptime Drawable = Movable & Writable & Deinitable
+"""What a strategy's values must be: movable and writable (falsifying
+examples are printed). Not copyable: the engine rebuilds values from their
+choices instead of keeping them, so move-only types can be generated."""
 
 
 trait Strategy(Deinitable, Movable):

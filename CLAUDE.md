@@ -14,8 +14,7 @@ pixi run mojo run -I . tests/test_engine.mojo   # same, without the env vars
 pixi run examples
 pixi run package                                # build/proptest.mojoc
 pixi run test-numojo                            # extras/ (needs NuMojo; see extras/run_tests.sh)
-python3 tools/gen_charmap.py                    # regenerate internal/charmap_data.mojo
-python3 tools/gen_from_type.py                  # regenerate strategies/types.mojo
+pixi run gen-unicode                            # regenerate the Unicode tables in internal/
 pixi run format                                 # format / lint
 ```
 

@@ -263,9 +263,9 @@ def test_simpler_case_chars() raises:
 
 
 def test_unicode_category_sizes() raises:
-    # Unicode 15.0 counts
-    assert_equal(len(category_intervals(["Nd"])), 680)
-    assert_equal(len(category_intervals(["Lu"])), 1831)
+    # Unicode 17.0 counts
+    assert_equal(len(category_intervals(["Nd"])), 770)
+    assert_equal(len(category_intervals(["Lu"])), 1886)
     assert_equal(len(as_general_categories(["L"])), 5)
     assert_equal(len(all_categories()), 30)
 

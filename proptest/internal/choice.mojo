@@ -16,7 +16,10 @@ Differences from Hypothesis:
   covers every Mojo integer type including `UInt64` and `Int64`.
 - Strings are stored as lists of codepoints and bytes as lists of byte
   values, in the same `seq` field.
-- Integer `weights` are not supported.
+- Integer `weights` are a list of probabilities for `min_value`,
+  `min_value + 1`, ... (summing to 1), not Hypothesis's mapping of some
+  values to probabilities with the rest uniform. They only change how
+  values are generated; the simplicity order ignores them.
 - Collection choices are compared structurally (shortlex) instead of by
   materialising their (possibly enormous) index.
 """
@@ -160,6 +163,15 @@ struct ChoiceValue(Copyable, Equatable, Hashable, Writable):
 # ===----------------------------------------------------------------------=== #
 
 
+def _same_weights(
+    a: Optional[ArcPointer[List[Float64]]],
+    b: Optional[ArcPointer[List[Float64]]],
+) -> Bool:
+    if not a or not b:
+        return not a and not b
+    return a.value()[] == b.value()[]
+
+
 struct Constraints(Copyable, Equatable, Writable):
     """The constraints a choice was drawn under. Only the fields relevant to
     `kind` are meaningful."""
@@ -171,6 +183,8 @@ struct Constraints(Copyable, Equatable, Writable):
     var min_value: Int128
     var max_value: Int128
     var shrink_towards: Int128
+    var weights: Optional[ArcPointer[List[Float64]]]
+    """Probabilities of `min_value`, `min_value + 1`, ..., or None."""
     # float
     var fmin: Float64
     var fmax: Float64
@@ -190,6 +204,7 @@ struct Constraints(Copyable, Equatable, Writable):
         self.min_value = 0
         self.max_value = 0
         self.shrink_towards = 0
+        self.weights = None
         self.fmin = neg_inf()
         self.fmax = pos_inf()
         self.allow_nan = True
@@ -204,8 +219,10 @@ struct Constraints(Copyable, Equatable, Writable):
         min_value: Optional[Int128] = None,
         max_value: Optional[Int128] = None,
         shrink_towards: Int128 = 0,
+        weights: Optional[ArcPointer[List[Float64]]] = None,
     ) -> Self:
         var c = Self(INTEGER)
+        c.weights = weights
         if min_value:
             c.has_min = True
             c.min_value = min_value.value()
@@ -270,6 +287,7 @@ struct Constraints(Copyable, Equatable, Writable):
                 and (not self.has_min or self.min_value == other.min_value)
                 and (not self.has_max or self.max_value == other.max_value)
                 and self.shrink_towards == other.shrink_towards
+                and _same_weights(self.weights, other.weights)
             )
         if self.kind == FLOAT:
             return (

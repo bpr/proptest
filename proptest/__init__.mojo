@@ -25,7 +25,14 @@ def test_sort_idempotent() raises:
 
 from proptest.core import (
     given,
+    before_minimal_test_case,
+    run_property,
+    PropertyResult,
+    expect_failure,
+    Outcome,
+    Testable,
     given_data,
+    check,
     find,
     example,
     assume,
@@ -33,7 +40,15 @@ from proptest.core import (
     check_examples,
     run_test,
 )
-from proptest.settings import Settings, Phases, Verbosity, HealthCheck
+from proptest.settings import (
+    Settings,
+    Phases,
+    Verbosity,
+    HealthCheck,
+    Confidence,
+)
+from proptest.internal.statistics import Statistics
+from proptest.internal.engine import RunReport
 from proptest.database import ExampleDatabase
 from proptest.internal.data import ConjectureData, Status
 from proptest.strategies.strategy import Strategy, Drawable, Many, draw
@@ -44,12 +59,22 @@ from proptest.strategies.core import (
     floats,
     floats32,
     just,
+    lazy_just,
     sampled_from,
     one_of,
     boxed,
     BoxedStrategy,
     map,
+    apply,
+    Applied2,
+    Applied3,
+    Applied4,
+    Applied5,
+    Applied6,
     filter,
+    filter_map,
+    cover,
+    tabulate,
     flatmap,
     composite,
     lists,
@@ -59,6 +84,7 @@ from proptest.strategies.core import (
     dictionaries,
     optionals,
     permutations,
+    subsequence,
     tuples,
     characters,
     text,
@@ -72,10 +98,15 @@ from proptest.strategies.core import (
     Floats,
     Floats32,
     Just,
+    LazyJust,
     SampledFrom,
     OneOf,
+    Alternatives,
     Mapped,
     Filtered,
+    FilterMapped,
+    Covered,
+    Tabulated,
     FlatMapped,
     Composite,
     Lists,
@@ -85,6 +116,7 @@ from proptest.strategies.core import (
     Dictionaries,
     Optionals,
     Permutations,
+    Subsequences,
     Tuples2,
     Tuples3,
     Tuples4,
@@ -102,10 +134,38 @@ from proptest.strategies.types import (
     FromType,
     Arbitrary,
     draw_from_type,
+    build,
+    Built,
+    field,
+    Field,
+    FieldBinding,
 )
+from proptest.strategies.constraints import (
+    Bounded,
+    Positive,
+    NonNegative,
+    NonZero,
+    NonEmpty,
+    Sorted,
+    Blind,
+    Via,
+)
+from proptest.strategies.special import PolyA, PolyB, PolyC, Poly, Index
+from proptest.strategies.functions import functions, Function, Functions
 from proptest.stateful import (
     StateMachine,
     Bundle,
     run_state_machine_as_test,
     run_state_machine,
+    TypedStateMachine,
+    run_typed_state_machine_as_test,
+    run_typed_state_machine,
+)
+from proptest.commands import (
+    Command,
+    Commands,
+    CommandSequences,
+    commands,
+    run_commands,
+    check_commands,
 )

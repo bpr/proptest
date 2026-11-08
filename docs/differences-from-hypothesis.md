@@ -4,7 +4,7 @@ proptest follows the design of Hypothesis's current engine closely: the
 same choice types and constraints, the same simplicity order, the same
 generation distributions and shrink passes. This document lists where it
 differs and what it leaves out, and for each one says **why**: a Mojo
-language limit, a missing library, a judgement about cost and benefit, or
+language limit, a missing library, a judgment about cost and benefit, or
 simply time. It ends with a list of what would be practical to port next,
 and of what has been ported since the first version of this document.
 
@@ -99,6 +99,31 @@ whose name starts with `rule_`"), `run_state_machine_as_test` could
 generate the dispatch itself. Decorators would allow the Hypothesis API
 almost verbatim.
 
+**The typed alternative.** `TypedStateMachine` (from Rust's
+proptest-state-machine) sidesteps the problem: a step is a value of an
+associated `Transition` type (typically a `Variant` of one struct per
+operation), drawn by `transition(data)` from the current state and
+applied by `apply(t)`. Rules have no numbers or names; the report prints
+each transition through `Writable` (`state.apply(Push(x=0))`). It differs
+from Hypothesis's rules in three ways: there are no bundles or
+initialize rules (keep values in the machine, and set up in `__init__`);
+there is no swarm testing, since transitions have no rule index to
+disable; and when `precondition` rejects three transitions in a row the
+program ends at that step instead of the test case being discarded,
+because only `transition` knows how to draw a valid one.
+
+**Model-based commands.** `Command` (`commands.mojo`) is not in
+Hypothesis. It follows RapidCheck's `rc::state` and Erlang QuickCheck:
+each operation is a struct with its own `generate`, `precondition`,
+`next_state` (on the model) and `run` (on the system under test, given
+the model's prior state). `commands[C1, ..., Cn](model)` is a strategy for
+whole programs generated from the model alone, run inside an ordinary
+property. Programs are encoded like `lists()`, with a rejected
+precondition handled as a rejected element, so they shrink like lists.
+RapidCheck re-checks preconditions during shrinking. Here the later
+commands are regenerated from the same choices in the new model state
+instead, so a shrunk program is always valid.
+
 ### 1.3 `note`, `event`, `target` and `assume` with data are methods on `ConjectureData`
 
 **What.** Hypothesis's `note(...)`, `event(...)` and `target(...)` are free
@@ -134,18 +159,30 @@ Same reason as 1.2: no user decorators. `composite` takes a function
 `def(mut ConjectureData) raises -> T`, which is exactly the body of a
 Hypothesis composite strategy.
 
-### 1.6 Strategy values must be `Copyable` and `Writable`
+### 1.6 Strategy values must be `Movable` and `Writable`
 
-**What.** `Strategy.Value` must conform to `Copyable & Writable &
-Deinitable`.
+**What.** `Strategy.Value` must conform to `Movable & Writable &
+Deinitable` (the `Drawable` composition). A few strategies also need
+`Copyable` values: `just`, `sampled_from`, `permutations` and `shared`
+hand out copies of values they hold, `Bundle` keeps values for later
+steps, and set elements and dictionary keys must be copyable.
 
 **Why.** `Writable` because failures are reported by printing the drawn
 values; Hypothesis can `repr` any Python object, Mojo can only format types
-that opt in. `Copyable` because combinators (`sampled_from`, `just`, the
-recursive and type-erased strategies) hand out copies. Mojo's own `repr()`
-is too verbose to use for reports (`repr(5)` is `Int(5)`, `repr([1])` is
-`List[Int]([Int(1)])`), so proptest uses `write_to` formatting and quotes
-top-level strings itself.
+that opt in. Mojo's own `repr()` is too verbose to use for reports
+(`repr(5)` is `Int(5)`, `repr([1])` is `List[Int]([Int(1)])`), so
+proptest uses `write_to` formatting and quotes top-level strings itself.
+
+Values don't need to be `Copyable` (from Rust proptest, which only asks
+for `Debug`): the engine never keeps a value, because it rebuilds every
+value from its choice sequence when it replays a test case. So tests can
+generate unique handles and other move-only types, and `lazy_just(f)`
+stands in for `just` with them. Two limits:
+- In Mojo 1.3, `List.write_to` copies its elements, so a `List` of a
+  move-only type can be drawn but not printed. It can't be a test
+  argument, though a strategy can still use one internally.
+- Values that can't be destroyed (linear types) are out of reach, because
+  the engine must destroy the inputs of abandoned test cases.
 
 ### 1.7 Recursive data has to avoid self-referential structs
 
@@ -258,7 +295,7 @@ that label, then a descendant span), and a `ChoiceTree` records which
 *combinations* have been tried. Mojo has no generators or coroutines to
 suspend a pass mid-step, so proptest's passes choose only their first
 position from the scheduler and loop over the rest of the combination
-inside the step. The scheduling behaviour is the same at the level that
+inside the step. The scheduling behavior is the same at the level that
 matters (cheap failing steps, random jumps when stalled, pass reordering);
 what's lost is finer-grained resumption inside a step.
 
@@ -275,9 +312,9 @@ with this scheduling, roughly one run in twelve reports the 8-step one.
   `lower()`), and the characters of their NFD and NFKD decompositions and
   casefold (so `'À'` becomes `'A'`, `'ﬁ'` becomes `'F'`, a mathematical
   bold `'𝐓'` becomes `'T'`). Mojo's standard library has case mapping but
-  no normalisation or casefold data, so `tools/gen_charmap.py` generates a
-  table of the decompositions (6,842 codepoints, from Python's
-  `unicodedata`), except for the 11,172 Hangul syllables, whose
+  no normalization or casefold data, so `tools/gen_unicode.mojo` generates a
+  table of the decompositions (6,954 codepoints, from the Unicode
+  Character Database), except for the 11,172 Hangul syllables, whose
   decomposition is computed with the Unicode standard's algorithm to keep
   the table small. The shrinker only parses the table when it meets a
   non-ASCII character. All four of Hypothesis's shrink-quality tests for
@@ -322,7 +359,7 @@ after the same earlier choices), reported as `FlakyStrategyDefinition`.
 Unlike Hypothesis's it does not compress runs of single-child nodes into
 one node.
 
-**Why.** Compression is a memory optimisation that matters for long-running
+**Why.** Compression is a memory optimization that matters for long-running
 tests with large inputs; proptest's tree uses one node per choice, which
 is simpler and has not been a problem at the sizes tested. Flakiness
 detection checks the cases Hypothesis checks (choice kind and constraints,
@@ -346,7 +383,7 @@ it as a flaky *test*.
   the target phase shrinks each member, accepting only shrinks that
   dominate it. Two differences: Hypothesis also compares structural
   coverage *tags*, which proptest doesn't record, and proptest caps the
-  Pareto optimisation at 10 × `max_examples` test calls. The cap exists
+  Pareto optimization at 10 × `max_examples` test calls. The cap exists
   because competing targets (say, a list's length and its sum) make the
   front hundreds of members long and each shrink costs hundreds of calls;
   Hypothesis bounds this indirectly through its target-phase budget,
@@ -470,40 +507,65 @@ Turn it off with `Phases(explain=False)`.
 1. a type implementing the `Arbitrary` trait draws itself with its static
    `arbitrary(data)` (Hypothesis's `register_type_strategy`, but attached
    to the type);
-2. the integer, float, `Bool` and `String` types, and `List`, `Optional`,
-   `Set` and `Dict[String, _]` of them, use the corresponding strategy, as
-   do one level of nesting (`List`/`Optional` of `List`/`Optional`/`Set`,
-   and `Dict[String, List[_]]`), pairs of `Int`, `Int64`, `UInt8`,
-   `Float64`, `Bool` and `String` (and lists of such pairs), and triples
-   of `Int`, `Float64`, `Bool` and `String`;
+2. the standard types have `Arbitrary`-style implementations added by
+   struct extensions (`__extension List(...)`): integer and float
+   scalars, `Bool`, `String`, `List`, `Optional`, `Set`, `Dict` and
+   `Tuple` of one to six elements, each drawing its parameters
+   recursively with `from_type`, so they nest to any depth;
 3. any other struct is built field by field, recursively, each field in
    its own span (Hypothesis's `builds(Cls)` with every argument inferred).
 
+`build[T](field["name"](strategy), ...)` (from RapidCheck's `gen::build`)
+builds a struct field by field like case 3, drawing the named fields from
+the given strategies: Hypothesis's `builds(Cls, name=strategy)`. The
+names and the strategies' types are checked at compile time, against the
+fields rather than an `__init__`'s parameters, for the reason below.
+
 **What differs, and why.**
 
-- **No inference from a test's parameters** (`@given(x=int)`, or
-  `given` with no strategies): Mojo can't inspect function signatures.
+- **Inference from a test's parameters is `check(prop)`, not `given`**:
+  Mojo can't reflect on a function's signature, but overload resolution
+  infers the argument types of a closure type parameter
+  (`check[A: Drawable, B: Drawable, //, P: def(A, B) raises](f: P)`), and
+  each is drawn with `from_type`. This is quickcheck's `Testable` rather
+  than Hypothesis's `@given(x=...)`/`builds` inference: there are
+  separate overloads for one to six arguments and for properties that
+  return `Bool`, and `given` itself still takes explicit strategies.
 - **Structs are built from their fields, not their `__init__`**: Mojo can
   reflect on a struct's fields (`reflect[T].field_types()`,
   `field_offset`) but not on its initializers. The struct is allocated
-  uninitialised and each field written at its offset, so invariants that
+  uninitialized and each field written at its offset, so invariants that
   `__init__` would establish don't hold; such types should implement
   `Arbitrary`.
-- **Containers are matched by enumeration.** Mojo can't pattern-match a
-  generic type (`T == List[E]` for an unknown `E`) or ask a type for its
-  parameters, so `from_type` tries each supported element type in turn.
-  That chain is generated by `tools/gen_from_type.py` (298 branches).
-  Tuples are the awkward case: a `Tuple`'s element types live in a
-  parameter pack, and reflection reports the pack as a single field that
-  can't be indexed (`reflect[Tuple[Int, String]].field_types()[0]` isn't a
-  usable type), so tuples can't go through the struct builder and every
-  supported combination is enumerated; hence pairs and triples of common
-  element types only. Deeper nesting is likewise a matter of adding
-  branches. A field of an unsupported type is a compile-time error.
+- **Standard types get their strategies from struct extensions.** Mojo
+  can't pattern-match a generic type (`T == List[E]` for an unknown `E`)
+  or ask a type for its parameters from outside, but a struct extension
+  can add a trait conformance to `List` whose static method sees
+  `Self.T` (and `Dict`'s `Self.K`/`Self.V`, a `Tuple`'s `Self.Ts[i]`).
+  This is the type-class instance Hypothesis gets from its type registry.
+  The extensions implement a private trait rather than `Arbitrary`
+  itself, because `Optional` and `Tuple` are only conditionally
+  movable: the private trait's draw is generic over the type
+  `draw_from_type` asks for (always `Self`, and known to be copyable).
+  Earlier versions enumerated 298 supported combinations in a generated
+  chain of `comptime if`s, limited to one level of nesting and to pairs
+  and triples of common types. Tuples stop at six elements because
+  `tuples()` does; `Set` and `Dict` need the default hasher. A field of
+  an unsupported type is a compile-time error.
 - If drawing a struct is abandoned part-way (the test case overruns or is
   filtered out), the fields written so far are leaked rather than
-  destroyed, because a partly initialised struct can't be destroyed
+  destroyed, because a partly initialized struct can't be destroyed
   safely. It's small and only happens for discarded test cases.
+- **Constraint types are an addition** (`strategies/constraints.mojo`):
+  `Bounded`, `Positive`, `NonNegative`, `NonZero`, `NonEmpty`, `Sorted`,
+  `Blind` and `Via` come from QuickCheck's modifiers. In Hypothesis the
+  strategy is an argument to `@given`; with `check(prop)` the type is the
+  only place left to say "a non-empty list", so the wrappers implement
+  `Arbitrary` and carry the constraint in the type. `Via[f]` takes a draw
+  function rather than a strategy: a strategy can't be a type parameter
+  because the strategy constructors raise, and a struct field whose type
+  is a strategy parameter's associated `Value` trips a Mojo 1.3 bug
+  ("use of uninitialized value") once the value is non-trivial.
 
 ### 3.6 `from_regex` (ported for the common subset)
 
@@ -583,10 +645,10 @@ min_side=, max_side=)` and `from_dtype[dtype]()`, for NuMojo's `NDArray`.
 
 `characters(categories=, exclude_categories=, codec=)` work as in
 Hypothesis, including one-letter major categories (`"L"`). The category
-table is generated from Python's `unicodedata` (Unicode 15.0) by
-`tools/gen_charmap.py` and checked in, because Mojo's standard library
-has no Unicode category data; Hypothesis builds the same table at run time
-from `unicodedata` and caches it on disk.
+table is generated from the Unicode Character Database (Unicode 17.0,
+pinned in `pixi.toml`) by `tools/gen_unicode.mojo` and checked in, because
+Mojo's standard library has no Unicode category data; Hypothesis builds
+the same table at run time from `unicodedata` and caches it on disk.
 
 **What differs, and why.**
 
@@ -611,15 +673,50 @@ from `unicodedata` and caches it on disk.
   Hypothesis shares between uses of the same strategy *object*, and Mojo
   values have no identity to key on (copies are separate values). proptest
   keys on the source location of the `shared(...)` call instead, which
-  gives the same behaviour for the usual `var x = shared(s)` and reuses of
+  gives the same behavior for the usual `var x = shared(s)` and reuses of
   `x`. Values are kept type-erased on the `ConjectureData`; reading a key
   back as a different type raises an error rather than misbehaving.
+- **`one_of` takes `weights=`** (from Rust's `prop_oneof![w => s, ...]`;
+  Hypothesis has no weighted `one_of`). The branch is still an integer
+  choice in `[0, n)`, so shrinking and the shrinker's alternative-lowering
+  pass are unchanged; the weights live in the choice's constraints and
+  only bias generation. They are a list of probabilities over the whole
+  range, a simplification of Hypothesis's internal `weights` mapping
+  (some values to probabilities, the rest uniform), which Hypothesis uses
+  for `sampled_from`-like internals rather than in its public API.
+  `one_of(s1, ..., s6)` also stores its strategies unboxed, so they need
+  not be `Copyable`.
 - **`fixed_dictionaries`, `frozensets`, `iterables`, `randoms`,
-  `functions`, `slices`, `register_type_strategy`**: Python-specific types
-  or behaviours, or (for `fixed_dictionaries`) easy to write with
+  `slices`, `register_type_strategy`**: Python-specific types
+  or behaviors, or (for `fixed_dictionaries`) easy to write with
   `composite`.
-- **Observability output, statistics (`--hypothesis-show-statistics`),
-  settings profiles, the pytest plugin, the ghostwriter**: tooling around
+- **Statistics are ported as a setting**: `show_statistics=True` prints
+  the generate phase's events (Hypothesis's
+  `--hypothesis-show-statistics`, without the timing lines). QuickCheck's
+  `tabulate` and `cover` add tables and coverage requirements, and
+  `check_coverage=Confidence()` checks the requirements with its Wilson
+  score test, generating past `max_examples` as needed (giving up after
+  100,000 examples, where the observed share decides). Hypothesis has no
+  coverage requirements. `cover` and `tabulate` also exist as strategy
+  wrappers, because `given` tests have no `ConjectureData` to call them
+  on (1.3).
+- **`functions()` is ported** as `functions[A](returns)`, returning a
+  memoized `Function[A, R]`. Hypothesis's version wraps a signature
+  (`like=`) and checks purity; here the argument type is a parameter and
+  results are memoized by key, so a function is pure by construction.
+  Calls print as a table, `{x->y, ...}`, rather than as the calls noted
+  one by one. The argument must be a `KeyElement`. Calling a function
+  after its test case has ended raises.
+- **Additions from other libraries** (not in Hypothesis): `filter_map`
+  and `filter(reason=)`, `subsequence` and `Index`, and `lazy_just`, from
+  Rust proptest; `Outcome` results, `expect_failure`, `run_property` and
+  the `PolyA`/`PolyB`/`PolyC` test types, from QuickCheck; and from
+  RapidCheck, `apply(s1, ..., sN, f)` (Hypothesis's `builds` with a
+  function, with the function last as in `given`, because Mojo infers
+  parameters in argument order), `sampled_from(..., weights=)` (using the
+  same choice weights as `one_of`), `build[T](field["x"](s), ...)` (below,
+  3.5), and the `before_minimal_test_case()` breakpoint hook.
+- **Observability output, settings profiles, the pytest plugin, the ghostwriter**: tooling around
   Python's ecosystem. Environment-variable overrides stand in for profiles.
 - **Health checks**: `filter_too_much`, `data_too_large`,
   `large_base_example` and `too_slow` are ported; `function_scoped_fixture`, `differing_executors`,
@@ -641,7 +738,6 @@ Grouped by what stands in the way.
 | Free-function `note`/`event`/`target` | globals or context variables (1.3) |
 | Recursive data types in tests and examples | self-referential structs (1.7) |
 | Location-based bug identity for all errors | raise locations on `Error` (1.8) |
-| `given` inferring strategies from parameter types | function signature reflection (3.5) |
 | Big integers | a bigint in the stdlib, or `decimo` on Mojo 1.3 (1.9) |
 
 **Ported since this document was first written:**
@@ -659,6 +755,12 @@ Grouped by what stands in the way.
   strategies (3.8), nested containers and tuples in `from_type` (3.5), the
   decomposition half of `normalize_unicode_chars` (2.2), and deadlines for
   stateful steps (3.1).
+- From [ideas.md](ideas.md): type-directed `check(prop)` (3.5), which
+  turned out not to need signature reflection, constraint types (3.5),
+  typed state machines (1.2), unboxed, weighted `one_of` (3.10),
+  statistics with coverage checking (3.10), move-only values (1.6),
+  `functions()` (3.10), and the smaller additions listed there; and
+  from RapidCheck, model-based testing with commands (1.2).
 
 Nothing practical-and-small is left; what remains is either blocked by
 Mojo (above) or of doubtful value (below).

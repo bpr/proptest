@@ -365,6 +365,61 @@ def test_one_of_and_boxed() raises:
     given(one_of(strategies^), prop, fast())
 
 
+def test_one_of_is_unboxed_and_takes_up_to_six() raises:
+    # a capturing lambda makes `map` non-copyable; unboxed one_of doesn't care
+    var offset = 1000
+    var shifted = map(
+        integers(0, 5), lambda (x: Int) {offset} -> Int: x + offset
+    )
+    var s = one_of(just(0), just(1), just(2), just(3), just(4), shifted^)
+
+    def at_least_five(x: Int) -> Bool:
+        return x >= 5
+
+    assert_equal(find(s, at_least_five), 1000)
+
+    def anything(x: Int) -> Bool:
+        return True
+
+    # shrinks towards the first alternative
+    assert_equal(find(one_of(integers(10, 20), integers(0, 5)), anything), 10)
+
+
+def test_one_of_weights() raises:
+    var s = one_of(just(0), just(1), just(2), weights=[1, 8, 1])
+    var counts: List[Int] = [0, 0, 0]
+    for _ in range(1000):
+        counts[example(s)] += 1
+    assert_true(counts[1] > 650 and counts[1] < 950, String(counts))
+    assert_true(counts[0] > 0 and counts[2] > 0, String(counts))
+
+    def anything(x: Int) -> Bool:
+        return True
+
+    # weights don't change the shrink order
+    assert_equal(find(s, anything), 0)
+
+    var boxes: List[BoxedStrategy[Int]] = [boxed(just(0)), boxed(just(1))]
+    var w = one_of(boxes^, weights=[1, 19])
+    var ones = 0
+    for _ in range(500):
+        ones += example(w)
+    assert_true(ones > 400, String(ones))
+
+    var msg = String()
+    try:
+        _ = one_of(just(0), just(1), weights=[1])
+    except e:
+        msg = String(e)
+    assert_true("2 strategies" in msg, msg)
+    msg = String()
+    try:
+        _ = one_of(just(0), just(1), weights=[1, 0])
+    except e:
+        msg = String(e)
+    assert_true("positive" in msg, msg)
+
+
 def test_optionals() raises:
     def some(x: Optional[Int]) -> Bool:
         return Bool(x)
@@ -814,6 +869,31 @@ def test_from_type_nested_containers_and_tuples() raises:
     assert_equal(find(from_type[List[List[Int]]](), nested), [[], [0]])
 
 
+def test_from_type_any_depth_and_arity() raises:
+    def p(
+        a: Dict[Int8, List[Optional[Tuple[Bool, String]]]],
+        b: List[List[List[UInt16]]],
+        c: Tuple[Int],
+        d: Tuple[Int, Bool, String, Float32, UInt8, List[Int]],
+        e: Set[Tuple[Int, Bool]],
+        f: Optional[Optional[Int64]],
+    ) raises:
+        pass
+
+    check(p, fast())
+
+    def deep(xs: List[List[List[UInt16]]]) -> Bool:
+        return len(xs) >= 1 and len(xs[0]) >= 1 and len(xs[0][0]) >= 2
+
+    assert_equal(find(from_type[List[List[List[UInt16]]]](), deep), [[[0, 0]]])
+
+    def keyed(d: Dict[Int8, Bool]) -> Bool:
+        return len(d) >= 2
+
+    var d = find(from_type[Dict[Int8, Bool]](), keyed)
+    assert_equal(len(d), 2)
+
+
 def test_from_type_structs_and_arbitrary() raises:
     def p(s: Sprite) raises:
         assert_true(s.extent.lo <= s.extent.hi)
@@ -833,6 +913,64 @@ def test_from_type_structs_and_arbitrary() raises:
     assert_equal(s.extent.hi, 6)
     assert_false(Bool(s.layer))
     assert_equal(len(s.colors), 0)
+
+
+def test_check_infers_strategies_from_parameter_types() raises:
+    var calls = 0
+
+    def one(xs: List[Int]) raises {mut calls}:
+        calls += 1
+        var ys = xs.copy()
+        ys.reverse()
+        ys.reverse()
+        assert_equal(xs, ys)
+
+    check(one, fast())
+    assert_true(calls > 0)
+
+    def two(s: Sprite, n: UInt8) raises:
+        assert_true(s.extent.lo <= s.extent.hi)
+        assert_true(Int(n) <= 255)
+
+    check(two, fast())
+
+    def six(
+        a: Int, b: Bool, c: String, d: Float64, e: Int8, f: List[Int]
+    ) raises:
+        pass
+
+    check(six, fast())
+
+    def bool_prop(a: Int, b: Int) raises -> Bool:
+        return a + b == b + a
+
+    check(bool_prop, fast())
+
+
+def test_check_reports_shrunk_failures() raises:
+    def raising(a: Int, b: Int) raises:
+        if a >= 1000:
+            fail("too big")
+
+    var msg = String()
+    try:
+        check(raising, fast())
+    except e:
+        msg = String(e)
+    assert_true("given(\n        1000," in msg, msg)
+    assert_true("too big" in msg, msg)
+    assert_true("test_strategies.mojo" in msg, msg)
+
+    def returns_false(xs: List[UInt8]) raises -> Bool:
+        return len(xs) < 3
+
+    msg = String()
+    try:
+        check(returns_false, fast())
+    except e:
+        msg = String(e)
+    assert_true("given([0, 0, 0])" in msg, msg)
+    assert_true("returned False" in msg, msg)
 
 
 def test_example_returns_values() raises:
