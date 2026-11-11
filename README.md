@@ -607,6 +607,10 @@ analysis's access lemma, which catches a splay that is correct but slow.
 `examples/red_black_tree.mojo` is a red-black tree that keeps each node's
 color in the low bit of its parent pointer, as Linux's rbtree does; it
 checks the red-black rules and every link after each command.
+`examples/intrusive_list.mojo` is a Linux-style intrusive list: tasks
+carry their own links, so one task is on two lists at once, and
+`container_of` finds a task from its link with
+`reflect[Task].field_offset`.
 
 ## How it works
 

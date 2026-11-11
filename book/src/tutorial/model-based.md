@@ -379,3 +379,11 @@ is a red-black tree that, like the Linux kernel's, stores each node's
 color in the low bit of its parent pointer. After each command it checks
 the red-black rules, that every parent link points back and holds no
 stray bits, and that the height is at most 2 log2(n + 1).
+
+[`examples/intrusive_list.mojo`](https://github.com/bpr/proptest/blob/master/examples/intrusive_list.mojo)
+is an intrusive list in the Linux kernel's style: the links are fields of
+the tasks themselves, so a task can be on two lists at once, and
+`container_of` recovers a task from its link by subtracting the field's
+offset, `reflect[Task].field_offset[name="ready_link"]()`. A scheduler's
+commands (spawn, wake, block, run, kill, ...) are checked against two
+plain lists of ids, walking both rings both ways after every step.
