@@ -611,6 +611,9 @@ checks the red-black rules and every link after each command.
 carry their own links, so one task is on two lists at once, and
 `container_of` finds a task from its link with
 `reflect[Task].field_offset`.
+`examples/free_list_allocator.mojo` is a malloc-style allocator with
+boundary tags, whose free blocks keep the free list's pointers in their
+own bytes; a model over plain integers predicts every address it returns.
 
 ## How it works
 

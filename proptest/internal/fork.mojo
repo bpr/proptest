@@ -393,8 +393,9 @@ def exit_child(code: Int):
 def prepare_child(timeout_ms: Optional[Float64], quiet: Bool):
     """Set up a new child: no core dumps (writing one can take a second
     per crash), the default action for fatal signals, an alarm after
-    `timeout_ms`, and with `quiet`, stderr sent to /dev/null (sanitizers
-    print long reports, which only the final replay should show)."""
+    `timeout_ms`, and with `quiet`, stdout and stderr sent to /dev/null
+    (sanitizers print long reports, and debug_assert prints to stdout,
+    which only the final replay should show)."""
     comptime if CompilationTarget.is_linux():
         # PR_SET_DUMPABLE: unlike RLIMIT_CORE, this also stops a piped
         # core_pattern (apport, systemd-coredump) from being run
@@ -418,6 +419,7 @@ def prepare_child(timeout_ms: Optional[Float64], quiet: Bool):
             path.as_c_string_span(), Int32(1), Int32(0)
         )
         if fd >= 0:
+            _ = external_call["dup2", Int32](fd, Int32(1))
             _ = external_call["dup2", Int32](fd, Int32(2))
     if timeout_ms:
         var us = max(Int(timeout_ms.value() * 1000), 1)

@@ -387,3 +387,12 @@ the tasks themselves, so a task can be on two lists at once, and
 offset, `reflect[Task].field_offset[name="ready_link"]()`. A scheduler's
 commands (spawn, wake, block, run, kill, ...) are checked against two
 plain lists of ids, walking both rings both ways after every step.
+
+[`examples/free_list_allocator.mojo`](https://github.com/bpr/proptest/blob/master/examples/free_list_allocator.mojo)
+is a malloc-style allocator inside one arena. Its free blocks hold the
+free list's pointers in their own payload bytes, and boundary tags let
+`free` merge neighbors. The model is the same allocator written over
+plain lists of integers, so it predicts every address; the commands also
+check every boundary tag and that each live allocation still holds the
+bytes written to it, which catches what AddressSanitizer can't see inside
+the arena.

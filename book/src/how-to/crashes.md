@@ -49,9 +49,10 @@ to catch memory errors that don't crash:
 mojo build -I . --sanitize address -o my_test my_test.mojo && ./my_test
 ```
 
-While searching and shrinking, children's error output (sanitizer reports,
-for instance) is discarded; the final replay of each shrunk failure shows
-it, so you see one report, for the minimal example.
+While searching and shrinking, children's output is discarded: sanitizer
+reports, failed `debug_assert` messages (which go to stdout), and anything
+the test prints. The final replay of each shrunk failure shows it, so you
+see one report, for the minimal example.
 
 ## `timeout`
 
