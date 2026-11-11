@@ -617,6 +617,9 @@ own bytes; a model over plain integers predicts every address it returns.
 `examples/cheney_gc.mojo` is Cheney's copying garbage collector; after
 every command the graph reachable from the roots must be isomorphic to a
 model object graph, with every object where Cheney's copy order puts it.
+`examples/union_find.mojo` is union-find with path compression and union
+by rank on heap-allocated nodes, checked against a naive partition and
+the rank invariants, including on union by rank's worst-case trees.
 
 ## How it works
 

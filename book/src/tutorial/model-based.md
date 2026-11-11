@@ -405,3 +405,11 @@ breadth-first copy order, so it predicts where every object ends up and
 which allocations trigger a collection. After each command the heap
 reachable from the roots must be isomorphic to the model's graph, with
 shared objects and cycles mapped one to one.
+
+[`examples/union_find.mojo`](https://github.com/bpr/proptest/blob/master/examples/union_find.mojo)
+is a union-find forest of heap-allocated nodes with path compression and
+union by rank, checked against a naive partition. After every command it
+checks that ranks increase toward each root and that every tree is no
+taller than its rank, which is at most log2 of its size. Random commands
+seldom build deep trees, so a second property builds union by rank's worst
+case, a binomial tree, and checks that a find compresses its whole path.
