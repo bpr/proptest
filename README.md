@@ -579,6 +579,12 @@ as an existing key, shrinks less well, because deleting an earlier step
 changes which value the same choice picks. Draw directly with a
 `precondition` when rejections would be rare.
 
+`examples/lru_cache.mojo` tests an LRU cache this way, with a capacity
+drawn per test case and a model that is a plain list in recency order.
+`examples/lru_cache_pointers.mojo` is the same cache with heap-allocated
+nodes linked by raw pointers, checked by the same model plus a link
+invariant after every step, and clean under `--sanitize address`.
+
 ## How it works
 
 The engine is a port of Hypothesis's Conjecture

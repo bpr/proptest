@@ -339,3 +339,16 @@ together in one struct, rather than in an `isa` chain, and the whole
 program exists before it runs. State machines draw each step from the
 current state of the system itself, which is simpler when there's no
 separate model.
+
+## A complete example
+
+[`examples/lru_cache.mojo`](https://github.com/bpr/proptest/blob/master/examples/lru_cache.mojo)
+tests an LRU cache (LeetCode 146) against a model that keeps its entries
+in a plain list, most recently used first. Each test case draws the
+cache's capacity, then a program of `put` and `get` commands, and after
+the program compares the cache's recency order with the model's.
+
+[`examples/lru_cache_pointers.mojo`](https://github.com/bpr/proptest/blob/master/examples/lru_cache_pointers.mojo)
+is the same cache built from heap-allocated nodes and raw pointers. Its
+commands also check the list's links after every step, and building it
+with `--sanitize address` checks for leaks and use after free.
