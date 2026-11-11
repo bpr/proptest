@@ -620,6 +620,9 @@ model object graph, with every object where Cheney's copy order puts it.
 `examples/union_find.mojo` is union-find with path compression and union
 by rank on heap-allocated nodes, checked against a naive partition and
 the rank invariants, including on union by rank's worst-case trees.
+`examples/skip_list.mojo` is a skip list with spans (as in Redis), whose
+nodes are raw allocations of different sizes; the test case chooses every
+node's level, so the model determines the whole structure.
 
 ## How it works
 

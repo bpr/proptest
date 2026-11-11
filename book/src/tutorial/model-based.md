@@ -413,3 +413,12 @@ checks that ranks increase toward each root and that every tree is no
 taller than its rank, which is at most log2 of its size. Random commands
 seldom build deep trees, so a second property builds union by rank's worst
 case, a binomial tree, and checks that a find compresses its whole path.
+
+[`examples/skip_list.mojo`](https://github.com/bpr/proptest/blob/master/examples/skip_list.mojo)
+is a skip list with spans, as in Redis's sorted sets, so it answers rank
+and select queries too. Each node is one raw allocation sized for its
+number of links, with its `String` value written into the raw bytes. The
+test case draws each node's level instead of leaving it to a random number
+generator, so shrinking reaches levels too, and the model (a sorted list
+of keys, values, and levels) determines every lane and every span, which
+the commands check after each step.
