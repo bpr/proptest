@@ -43,6 +43,12 @@ $ mojo-lldb my_test
 The function's argument is the test's location, for a conditional
 breakpoint when a program has several failing tests.
 
+## When the test crashes
+
+A test that segfaults or aborts takes the run down with it, before
+proptest can shrink anything. Run it with `Settings(fork=True)`; see
+[Test code that crashes](crashes.md).
+
 ## See what the test computed
 
 - **Notes**: in a `given_data` test, `data.note(...)` adds lines to the

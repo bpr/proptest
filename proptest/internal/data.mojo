@@ -45,6 +45,16 @@ from proptest.internal.floats import (
     smallest_subnormal,
 )
 from proptest.internal.intervals import IntervalSet
+from proptest.internal.fork import (
+    ForkLog,
+    LogReader,
+    TAG_NODE,
+    TAG_SPAN_START,
+    TAG_SPAN_STOP,
+    TAG_ARG_SPAN,
+    TAG_NOTE,
+    TAG_END,
+)
 from proptest.internal.random import Random
 from proptest.internal.provider import Provider
 from proptest.strategies.strategy import Strategy, format_value
@@ -343,6 +353,9 @@ struct ConjectureData(Movable):
     var live_tokens: List[ArcPointer[Bool]]
     """Set to False when the test case ends; generated functions
     (`functions()`) check theirs before drawing."""
+    var fork_log: Optional[ForkLog]
+    """In a forked child (`Settings(fork=True)`), where to record the test
+    case as it runs, for the parent to rebuild if the child crashes."""
 
     def __init__(
         out self,
@@ -392,6 +405,7 @@ struct ConjectureData(Movable):
         self.explain_note = String()
         self.shared_values = Dict[String, ErasedValue]()
         self.live_tokens = List[ArcPointer[Bool]]()
+        self.fork_log = None
         # the top span (depth 0)
         self.depth = 0
         self.span_stack.append(0)
@@ -433,6 +447,14 @@ struct ConjectureData(Movable):
             )
         )
         self.length += size
+        if self.fork_log:
+            ref log = self.fork_log.value()
+            ref node = self.nodes[len(self.nodes) - 1]
+            log.begin(TAG_NODE)
+            log.value(node.value)
+            log.constraints(node.constraints)
+            log.bool(node.was_forced)
+            log.commit()
         return value^
 
     def _pop_choice(mut self, constraints: Constraints) raises -> ChoiceValue:
@@ -542,6 +564,10 @@ struct ConjectureData(Movable):
         var start = perf_counter_ns() if top_level else 0
         if top_level:
             self.arg_spans.append(len(self.spans))
+            if self.fork_log:
+                self.fork_log.value().begin(TAG_ARG_SPAN)
+                self.fork_log.value().int(len(self.spans))
+                self.fork_log.value().commit()
         self.start_span(strategy.label())
         var v = strategy.do_draw(self)
         self.stop_span()
@@ -559,7 +585,7 @@ struct ConjectureData(Movable):
                     line += String(" (", label, ")")
                 line += String(": ", format_value(v))
                 line += self.arg_comment(self.draw_count - 1)
-                self.notes.append(line^)
+                self.note(line)
         return v^
 
     def arg_comment(self, i: Int) -> String:
@@ -586,6 +612,10 @@ struct ConjectureData(Movable):
         )
         self.span_stack.append(len(self.spans))
         self.spans.append(Span(label, len(self.nodes), parent, self.depth))
+        if self.fork_log:
+            self.fork_log.value().begin(TAG_SPAN_START)
+            self.fork_log.value().u64(label)
+            self.fork_log.value().commit()
         if self.depth > MAX_DEPTH:
             self.mark_invalid("max depth exceeded")
 
@@ -594,6 +624,10 @@ struct ConjectureData(Movable):
         contributing to the final value (e.g. a rejected filter draw)."""
         if self.frozen or len(self.span_stack) == 0:
             return
+        if self.fork_log:
+            self.fork_log.value().begin(TAG_SPAN_STOP)
+            self.fork_log.value().bool(discard)
+            self.fork_log.value().commit()
         var i = self.span_stack.pop()
         self.spans[i].end = len(self.nodes)
         if discard:
@@ -638,6 +672,193 @@ struct ConjectureData(Movable):
 
     def note(mut self, msg: String):
         self.notes.append(msg)
+        self.log_note(msg)
+
+    def log_note(mut self, msg: String):
+        """Record a note of the final replay in the fork log only: if the
+        child crashes, the notes in the log are the ones reported."""
+        if self.fork_log and self.is_final:
+            self.fork_log.value().begin(TAG_NOTE)
+            self.fork_log.value().string(msg)
+            self.fork_log.value().commit()
+
+    # ===------------------------------------------------------------------=== #
+    # Forked test cases
+    # ===------------------------------------------------------------------=== #
+
+    def log_end(mut self, msg: String):
+        """In the child, after the test case is frozen: record the rest of
+        its result, and the error message `msg` if it failed."""
+        if not self.fork_log:
+            return
+        ref log = self.fork_log.value()
+        log.begin(TAG_END)
+        log.int(self.status.value)
+        log.string(self.interesting_origin)
+        log.string(msg)
+        log.bool(self.has_discards)
+        log.bool(self.misaligned)
+        log.int(self.length)
+        log.int(self.draw_time_ns)
+        log.bool(self.hit_max_choices)
+        log.strings(self.notes)
+        log.strings(self.events)
+        log.int(len(self.table_entries))
+        for e in self.table_entries:
+            log.string(e[0])
+            log.string(e[1])
+        log.int(len(self.covers))
+        for item in self.covers.items():
+            log.string(item.key)
+            log.f64(item.value)
+        log.int(len(self.covered))
+        for item in self.covered.items():
+            log.string(item.key)
+            log.bool(item.value)
+        log.int(len(self.target_observations))
+        for item in self.target_observations.items():
+            log.string(item.key)
+            log.f64(item.value)
+        log.int(len(self.arg_spans))
+        for a in self.arg_spans:
+            log.int(a)
+        log.int(len(self.spans))
+        for sp in self.spans:
+            log.u64(sp.label)
+            log.int(sp.start)
+            log.int(sp.end)
+            log.int(sp.parent)
+            log.int(sp.depth)
+            log.bool(sp.discarded)
+        log.commit()
+
+    def load_fork_log(mut self, mut r: LogReader) raises -> Optional[String]:
+        """In the parent: fill in this (unused) test case from a child's
+        log, and freeze it. Returns the error message if the child
+        finished the test case, or None if it died first (the test case
+        then holds what the child did up to that point).
+
+        The child may have corrupted its memory, so nothing in the log is
+        trusted: raises if it is inconsistent, leaving the test case frozen
+        with the nodes read so far and no structure."""
+        try:
+            return self._load_fork_log(r)
+        except e:
+            self.spans = [Span(TOP_LABEL, 0, -1, 0)]
+            self.spans[0].end = len(self.nodes)
+            self.span_stack = []
+            self.arg_spans = []
+            self.notes = []
+            self.freeze()
+            raise e^
+
+    def _load_fork_log(mut self, mut r: LogReader) raises -> Optional[String]:
+        var crash_notes = List[String]()
+        while r.more():
+            var tag = r.u8()
+            if tag == TAG_NODE:
+                var v = r.value()
+                var c = r.constraints()
+                var forced = r.bool()
+                if not choice_permitted(v, c):
+                    raise Error("a choice its constraints don't permit")
+                if c.weights and (
+                    not c.has_min
+                    or not c.has_max
+                    or Int128(len(c.weights.value()[]))
+                    != c.max_value - c.min_value + 1
+                ):
+                    raise Error("weights that don't match their range")
+                self.length += choice_size(v)
+                self.nodes.append(
+                    ChoiceNode(v^, c^, forced, index=len(self.nodes))
+                )
+            elif tag == TAG_SPAN_START:
+                var label = r.u64()
+                self.depth += 1
+                var parent = self.span_stack[len(self.span_stack) - 1]
+                self.span_stack.append(len(self.spans))
+                self.spans.append(
+                    Span(label, len(self.nodes), parent, self.depth)
+                )
+            elif tag == TAG_SPAN_STOP:
+                self.stop_span(r.bool())
+            elif tag == TAG_ARG_SPAN:
+                self.arg_spans.append(r.int())
+            elif tag == TAG_NOTE:
+                crash_notes.append(r.string())
+            elif tag == TAG_END:
+                self.status = Status(r.int())
+                self.interesting_origin = r.string()
+                var msg = r.string()
+                self.has_discards = r.bool()
+                self.misaligned = r.bool()
+                self.length = r.int()
+                self.draw_time_ns = r.int()
+                self.hit_max_choices = r.bool()
+                self.notes = r.strings()
+                self.events = r.strings()
+                self.table_entries = []
+                for _ in range(r.int()):
+                    var table = r.string()
+                    self.table_entries.append((table, r.string()))
+                self.covers = {}
+                for _ in range(r.int()):
+                    var k = r.string()
+                    self.covers[k] = r.f64()
+                self.covered = {}
+                for _ in range(r.int()):
+                    var k = r.string()
+                    self.covered[k] = r.bool()
+                self.target_observations = {}
+                for _ in range(r.int()):
+                    var k = r.string()
+                    self.target_observations[k] = r.f64()
+                self.arg_spans = []
+                for _ in range(r.int()):
+                    self.arg_spans.append(r.int())
+                self.spans = []
+                for _ in range(r.int()):
+                    var label = r.u64()
+                    var start = r.int()
+                    var sp = Span(label, start, 0, 0)
+                    sp.end = r.int()
+                    sp.parent = r.int()
+                    sp.depth = r.int()
+                    sp.discarded = r.bool()
+                    self.spans.append(sp^)
+                self.span_stack = []
+                self.freeze()
+                if self.status.value < 0 or self.status.value > 3:
+                    raise Error("a bad status")
+                self._check_structure()
+                return msg
+            else:
+                raise Error("proptest: bad fork log record ", Int(tag))
+        self.notes = crash_notes^
+        self.freeze()
+        self._check_structure()
+        return None
+
+    def _check_structure(self) raises:
+        """Raise unless the spans nest within the nodes, and the argument
+        spans are spans."""
+        var n = len(self.nodes)
+        if len(self.spans) == 0 or self.spans[0].start != 0:
+            raise Error("no top span")
+        for i in range(len(self.spans)):
+            ref sp = self.spans[i]
+            if not (0 <= sp.start <= sp.end <= n):
+                raise Error("a span outside the choices")
+            if i > 0 and not (0 <= sp.parent < i):
+                raise Error("a span with a bad parent")
+            if i > 0 and sp.depth != self.spans[sp.parent].depth + 1:
+                raise Error("a span at the wrong depth")
+        for a in self.arg_spans:
+            if not (0 < a < len(self.spans)):
+                raise Error("a bad argument span")
+        if self.length < 0 or self.draw_time_ns < 0:
+            raise Error("a bad length")
 
     def event(mut self, msg: String):
         """Record that something happened in this test case. Run statistics

@@ -62,6 +62,15 @@ and RapidCheck (see `docs/ideas.md`).
   `ConjectureData`. `freeze()` and `__deinit__` revoke its liveness token
   (`data.live_tokens`); never move a `ConjectureData` while a test runs.
 
+### Forked test cases
+- With `Settings(fork=True)` (or `timeout=`), `ConjectureRunner.execute`
+  runs each test case in a `fork()`ed child (`internal/fork.mojo`). The
+  child logs nodes, spans, and final-replay notes to shared memory as it
+  goes (hooks in `ConjectureData`), then the rest of the result; the
+  parent rebuilds the test case from the log, so a crash is a shrinkable
+  failure. Validate anything read from the log: the child may have
+  corrupted its memory.
+
 ### Control flow
 - `ConjectureData.mark_*` sets `status`, freezes, and raises `Error(STOP_TEST)`.
 - `assume` raises `Error(UNSATISFIED_ASSUMPTION)`.

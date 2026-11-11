@@ -716,6 +716,19 @@ the same table at run time from `unicodedata` and caches it on disk.
   parameters in argument order), `sampled_from(..., weights=)` (using the
   same choice weights as `one_of`), `build[T](field["x"](s), ...)` (below,
   3.5), and the `before_minimal_test_case()` breakpoint hook.
+- **`Settings(fork=True)` and `Settings(timeout=ms)`** (not in
+  Hypothesis; from Rust proptest's `fork` and `timeout`): each test case
+  runs in a `fork()`ed child, so crashes and hangs fail test cases instead
+  of ending the run, and are shrunk. Python code rarely crashes the
+  interpreter, so Hypothesis has no need for this; Mojo code with raw
+  pointers often does. Unlike Rust proptest, which records each test
+  case's input before running it and restarts a child that dies, the
+  child here logs its choices and spans to memory shared with the parent
+  as it makes them, so a crash partway through still leaves the parent
+  the choices the shrinker needs. Nothing a child logs is trusted: a log
+  that is inconsistent (because the test corrupted the child's memory) is
+  reported as a crash. A crash's interesting origin is its signal, or its
+  exit status (1.8).
 - **Observability output, settings profiles, the pytest plugin, the ghostwriter**: tooling around
   Python's ecosystem. Environment-variable overrides stand in for profiles.
 - **Health checks**: `filter_too_much`, `data_too_large`,

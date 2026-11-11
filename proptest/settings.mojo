@@ -203,6 +203,17 @@ struct Settings(Copyable, Writable):
     """Check `cover` requirements statistically: keep generating past
     `max_examples` until each is known to hold or not, and fail if one
     doesn't (QuickCheck's `checkCoverage`)."""
+    var fork: Bool
+    """Run each test case in a child process (`fork()`), so that a test
+    that crashes (a segfault, an abort, a sanitizer report) fails like any
+    other and is shrunk, instead of ending the run (Rust proptest's
+    `fork`). Side effects of the test don't reach the parent process.
+    POSIX only."""
+    var timeout: Optional[Float64]
+    """Fail test cases that run longer than this many milliseconds,
+    counting the whole test case (drawing included), by killing the child
+    process that runs it; implies `fork`. Unlike `deadline`, this catches
+    tests that never finish."""
 
     def __init__(
         out self,
@@ -223,6 +234,8 @@ struct Settings(Copyable, Writable):
         reproduce: Optional[String] = None,
         show_statistics: Bool = False,
         var check_coverage: Optional[Confidence] = None,
+        fork: Bool = False,
+        timeout: Optional[Float64] = None,
     ):
         self.max_examples = max_examples
         self.seed = seed
@@ -240,6 +253,12 @@ struct Settings(Copyable, Writable):
         self.reproduce = reproduce
         self.show_statistics = show_statistics
         self.check_coverage = check_coverage^
+        self.fork = fork
+        self.timeout = timeout
+
+    def forks(self) -> Bool:
+        """Whether test cases run in child processes."""
+        return self.fork or Bool(self.timeout)
 
     def with_env_overrides(self) -> Self:
         """These settings, updated from `PROPTEST_*` environment variables.
@@ -268,6 +287,9 @@ struct Settings(Copyable, Writable):
                 s.verbosity = Verbosity.verbose
             elif v == "debug":
                 s.verbosity = Verbosity.debug
+        var fork = getenv("PROPTEST_FORK")
+        if not s.fork and (fork == "1" or fork == "true"):
+            s.fork = True
         var db = getenv("PROPTEST_DATABASE")
         if s.database and s.database.value() == DEFAULT_DATABASE:
             if db == "none" or db == "None":

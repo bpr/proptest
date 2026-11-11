@@ -346,6 +346,8 @@ given(s, prop, Settings(
     suppress_health_check=[HealthCheck.filter_too_much],
     deadline=500.0,            # ms per example (default 200; None disables)
     print_blob=True,           # print a blob for reproduce=
+    fork=True,                 # run test cases in child processes
+    timeout=1000.0,            # ms; kill test cases that hang (implies fork)
 ))
 ```
 
@@ -371,7 +373,15 @@ the test's location, for a conditional breakpoint.
 Settings left at their defaults can be set from the environment, like a
 Hypothesis profile: `PROPTEST_MAX_EXAMPLES`, `PROPTEST_SEED`,
 `PROPTEST_VERBOSITY` (`quiet`/`normal`/`verbose`/`debug`) and
-`PROPTEST_DATABASE` (a directory, or `none`).
+`PROPTEST_DATABASE` (a directory, or `none`), and `PROPTEST_FORK`
+(`1` turns `fork` on).
+
+With `fork=True` (after Rust proptest), each test case runs in a
+`fork()`ed child, so a test that segfaults, aborts, or fails under
+AddressSanitizer is reported and shrunk like any other failure instead of
+ending the run. The child logs its choices to shared memory as it makes
+them, so the parent can rebuild a test case that crashed partway.
+`timeout=ms` kills test cases that run too long.
 
 Failing examples are saved in the example database (`.proptest/examples`,
 one directory per test, keyed by the test's source location) and replayed
@@ -584,6 +594,16 @@ drawn per test case and a model that is a plain list in recency order.
 `examples/lru_cache_pointers.mojo` is the same cache with heap-allocated
 nodes linked by raw pointers, checked by the same model plus a link
 invariant after every step, and clean under `--sanitize address`.
+`examples/dancing_links.mojo` is Knuth's Dancing Links: an exact cover
+solver whose nodes are linked by raw pointers in four directions, checked
+against brute force and n-queens counts, with cover and uncover tested
+against a model of every column.
+`examples/xor_list.mojo` is an XOR linked list, whose nodes store the XOR
+of their neighbors' addresses, so every link goes through an integer and
+back; it's checked against a `List` after every command.
+`examples/splay_tree.mojo` is a splay tree with parent pointers, checked
+against a sorted list and, after every splay, against the amortized
+analysis's access lemma, which catches a splay that is correct but slow.
 
 ## How it works
 
@@ -603,6 +623,7 @@ The engine is a port of Hypothesis's Conjecture
 | `internal/intervals.mojo` | `intervalsets.py` | codepoint sets |
 | `internal/charmap.mojo` (+ generated `charmap_data.mojo`) | `charmap.py` | Unicode general categories |
 | `internal/pareto.mojo` | `pareto.py` | the Pareto front of targeted examples |
+| `internal/fork.mojo` | (none; Rust proptest's `fork`) | running test cases in child processes |
 | `strategies/regex.mojo` | `strategies/_internal/regex.py` | `from_regex` |
 | `strategies/types.mojo` | `strategies/_internal/types.py` | `from_type` |
 | `strategies/constraints.mojo` | — (QuickCheck's `Modifiers.hs`) | constraint types (`Positive`, `NonEmpty`, `Via`, ...) |

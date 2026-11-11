@@ -341,7 +341,7 @@ def run_state_machine[
     drawing data) must finish within the deadline."""
     var machine = M()
     if data.is_final:
-        data.notes.append(String("state = ", reflect[M].base_name(), "()"))
+        data.note(String("state = ", reflect[M].base_name(), "()"))
     var failure: Optional[Error] = None
     try:
         machine.check_invariants()
@@ -417,14 +417,12 @@ def run_state_machine[
                     machine.run_rule(rule, data)
                 except e:
                     if data.is_final:
-                        data.notes.append(
-                            _call_text(name, data.step_draws.copy())
-                        )
+                        data.note(_call_text(name, data.step_draws.copy()))
                     data.collect_step_draws = False
                     data.report_depth = 0
                     raise e^
             if data.is_final:
-                data.notes.append(_call_text(name, data.step_draws.copy()))
+                data.note(_call_text(name, data.step_draws.copy()))
             data.collect_step_draws = False
             data.report_depth = 0
             machine.check_invariants()
@@ -437,7 +435,7 @@ def run_state_machine[
     except e:
         failure = e^
     if data.is_final:
-        data.notes.append("state.teardown()")
+        data.note("state.teardown()")
     machine.teardown()
     if failure:
         raise failure.take()
@@ -481,7 +479,7 @@ def run_typed_state_machine[
     invariants, not drawing it) must finish within the deadline."""
     var machine = M()
     if data.is_final:
-        data.notes.append(String("state = ", reflect[M].base_name(), "()"))
+        data.note(String("state = ", reflect[M].base_name(), "()"))
     var failure: Optional[Error] = None
     try:
         machine.check_invariants()
@@ -517,7 +515,7 @@ def run_typed_state_machine[
                 break
             var t = chosen.take()
             if data.is_final:
-                data.notes.append(String("state.apply(", format_value(t), ")"))
+                data.note(String("state.apply(", format_value(t), ")"))
             var step_start = perf_counter_ns()
             var drawn_before = data.draw_time_ns
             machine.apply(t)
@@ -531,7 +529,7 @@ def run_typed_state_machine[
     except e:
         failure = e^
     if data.is_final:
-        data.notes.append("state.teardown()")
+        data.note("state.teardown()")
     machine.teardown()
     if failure:
         raise failure.take()

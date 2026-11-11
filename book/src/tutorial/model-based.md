@@ -352,3 +352,24 @@ the program compares the cache's recency order with the model's.
 is the same cache built from heap-allocated nodes and raw pointers. Its
 commands also check the list's links after every step, and building it
 with `--sanitize address` checks for leaks and use after free.
+
+[`examples/dancing_links.mojo`](https://github.com/bpr/proptest/blob/master/examples/dancing_links.mojo)
+is Knuth's Dancing Links, an exact cover solver whose nodes are linked by
+raw pointers in four directions. Its `Cover` and `Uncover` commands check
+every column against a model after each step, and when every cover has
+been undone they check that every link is back where it started.
+
+[`examples/xor_list.mojo`](https://github.com/bpr/proptest/blob/master/examples/xor_list.mojo)
+is an XOR linked list: each node stores the XOR of its neighbors'
+addresses, so the same code walks it either way, and reversing it is
+swapping its head and tail. Its commands walk the list in both directions
+after every step and compare it with a `List`.
+
+[`examples/splay_tree.mojo`](https://github.com/bpr/proptest/blob/master/examples/splay_tree.mojo)
+is a splay tree whose nodes link to their parents as well as their
+children. Its commands check every link, the key order, and the subtree
+sizes after each step, and compare the tree with a sorted list. A splay
+that moves a node to the root one rotation at a time still gives the right
+answers, only slowly, so the tree also checks the access lemma of
+Sleator and Tarjan's analysis after every splay, and a second property
+checks that accessing every key in order takes at most 4.5 n rotations.

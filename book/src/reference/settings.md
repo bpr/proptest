@@ -21,6 +21,8 @@ Settings(
     reproduce: Optional[String] = None,
     show_statistics: Bool = False,
     check_coverage: Optional[Confidence] = None,
+    fork: Bool = False,
+    timeout: Optional[Float64] = None,
 )
 ```
 
@@ -41,6 +43,8 @@ Settings(
 | `deadline` | Fail a test case whose body (not counting data generation) takes longer than this many milliseconds. `None` disables it. In stateful tests it applies to each step. |
 | `reproduce` | A blob from a failure report: replay exactly that test case, without searching or shrinking (Hypothesis's `@reproduce_failure`). |
 | `show_statistics` | Print the run's statistics: events, tables, and coverage. |
+| `fork` | Run each test case in a child process, so that a crash (a segfault, an abort, a sanitizer report) fails the test case and is shrunk instead of ending the run. See [Test code that crashes](../how-to/crashes.md). |
+| `timeout` | Kill a test case that runs longer than this many milliseconds, and fail it with `Timeout`. Implies `fork`. |
 | `check_coverage` | Check `cover` requirements statistically, generating past `max_examples` until they're settled, and fail if one isn't met (QuickCheck's `checkCoverage`). |
 
 ## Environment variables
@@ -55,6 +59,7 @@ always wins.
 | `PROPTEST_SEED` | `seed` | an integer |
 | `PROPTEST_VERBOSITY` | `verbosity` | `quiet`, `normal`, `verbose`, `debug` |
 | `PROPTEST_DATABASE` | `database` | a directory, or `none` |
+| `PROPTEST_FORK` | `fork` | `1` or `true` |
 
 `settings.with_env_overrides()` returns the settings with these applied;
 the test runners call it for you.

@@ -343,6 +343,19 @@ def _failure_message(
     return out^
 
 
+def _log_given(mut data: ConjectureData, args: List[String]):
+    """In a forked final replay, log the arguments before the test runs:
+    if it crashes, `_note_given` never runs."""
+    if not data.fork_log:
+        return
+    var line = String("given(")
+    for i in range(len(args)):
+        if i > 0:
+            line += ", "
+        line += args[i]
+    data.log_note(line + ")")
+
+
 def _note_given(
     mut data: ConjectureData, var args: List[String], *, at: Int = -1
 ):
@@ -432,6 +445,8 @@ def given[
     def run_one(mut data: ConjectureData) raises {s1, test, deadline}:
         var a = data.draw(s1)
         var mark = len(data.notes)
+        if data.is_final:
+            _log_given(data, [format_value(a)])
         var start = perf_counter_ns()
         try:
             test(a)
@@ -464,6 +479,8 @@ def given[
         var a = data.draw(s1)
         var b = data.draw(s2)
         var mark = len(data.notes)
+        if data.is_final:
+            _log_given(data, [format_value(a), format_value(b)])
         var start = perf_counter_ns()
         try:
             test(a, b)
@@ -502,6 +519,10 @@ def given[
         var b = data.draw(s2)
         var c = data.draw(s3)
         var mark = len(data.notes)
+        if data.is_final:
+            _log_given(
+                data, [format_value(a), format_value(b), format_value(c)]
+            )
         var start = perf_counter_ns()
         try:
             test(a, b, c)
@@ -549,6 +570,16 @@ def given[
         var c = data.draw(s3)
         var d = data.draw(s4)
         var mark = len(data.notes)
+        if data.is_final:
+            _log_given(
+                data,
+                [
+                    format_value(a),
+                    format_value(b),
+                    format_value(c),
+                    format_value(d),
+                ],
+            )
         var start = perf_counter_ns()
         try:
             test(a, b, c, d)
@@ -604,6 +635,17 @@ def given[
         var a4 = data.draw(s4)
         var a5 = data.draw(s5)
         var mark = len(data.notes)
+        if data.is_final:
+            _log_given(
+                data,
+                [
+                    format_value(a1),
+                    format_value(a2),
+                    format_value(a3),
+                    format_value(a4),
+                    format_value(a5),
+                ],
+            )
         var start = perf_counter_ns()
         try:
             test(a1, a2, a3, a4, a5)
@@ -663,6 +705,18 @@ def given[
         var a5 = data.draw(s5)
         var a6 = data.draw(s6)
         var mark = len(data.notes)
+        if data.is_final:
+            _log_given(
+                data,
+                [
+                    format_value(a1),
+                    format_value(a2),
+                    format_value(a3),
+                    format_value(a4),
+                    format_value(a5),
+                    format_value(a6),
+                ],
+            )
         var start = perf_counter_ns()
         try:
             test(a1, a2, a3, a4, a5, a6)
@@ -1405,6 +1459,8 @@ def run_property[
     def run_one(mut data: ConjectureData) raises {strategy, test, deadline}:
         var a = data.draw(strategy)
         var mark = len(data.notes)
+        if data.is_final:
+            _log_given(data, [format_value(a)])
         var start = perf_counter_ns()
         try:
             test(a)

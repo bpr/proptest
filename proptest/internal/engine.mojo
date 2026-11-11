@@ -48,6 +48,22 @@ from proptest.internal.random import Random
 from proptest.settings import Settings, Verbosity, HealthCheck
 from proptest.database import ExampleDatabase
 from proptest.internal.datatree import DataTree
+from proptest.internal.fork import (
+    ForkLog,
+    LogReader,
+    LOG_SIZE,
+    SIGALRM,
+    map_shared,
+    unmap_shared,
+    fork_process,
+    wait_process,
+    prepare_child,
+    exit_child,
+    exited,
+    exit_code,
+    term_signal,
+    signal_name,
+)
 from proptest.internal.pareto import ParetoFront
 from proptest.internal.statistics import (
     Statistics,
@@ -179,6 +195,7 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
     """Count test cases into `stats` (only in the generate phase)."""
     var coverage_next_check: Int
     var coverage_verdict: Int
+    var fork_warned: Bool
 
     def __init__(out self, var test_fn: Self.F, settings: Settings):
         self.test_fn = test_fn^
@@ -241,6 +258,7 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
         self.collecting_stats = False
         self.coverage_next_check = max(settings.max_examples, 100)
         self.coverage_verdict = COVERAGE_UNDECIDED
+        self.fork_warned = False
 
     # ===------------------------------------------------------------------=== #
     # Running test cases
@@ -272,6 +290,86 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
         """Run the test function on `data` and freeze it. Returns the error
         message if the test failed (status INTERESTING)."""
         self.call_count += 1
+        if self.settings.forks():
+            var base = map_shared(LOG_SIZE)
+            if base != 0:
+                var msg = self._execute_forked(data, base)
+                unmap_shared(base, LOG_SIZE)
+                if msg:
+                    return msg.value()
+            # no shared memory or no child process: run it here
+            if not self.fork_warned:
+                self.fork_warned = True
+                print("proptest: warning: can't fork; running in-process")
+        return self._execute_here(data)
+
+    def _execute_forked(
+        mut self, mut data: ConjectureData, base: Int
+    ) -> Optional[String]:
+        """Run the test case in a child process, logging to the shared
+        memory at `base`, and rebuild it in `data` from the log. None if
+        the child couldn't be started."""
+        data.fork_log = ForkLog(base, LOG_SIZE)
+        var pid = fork_process()
+        if pid == 0:
+            prepare_child(self.settings.timeout, quiet=not data.is_final)
+            var msg = self._execute_here(data)
+            data.log_end(msg)
+            exit_child(0)
+        data.fork_log = None
+        if pid < 0:
+            return None
+        var status = wait_process(pid)
+        var reader = LogReader(base)
+        try:
+            var finished = data.load_fork_log(reader)
+            if finished:
+                return finished.value()
+        except e:
+            # what the child sent back is inconsistent: it overwrote its
+            # own memory (e.g. a use after free or a double free)
+            data.status = Status.INTERESTING
+            data.interesting_origin = "Crash: corrupted memory"
+            return String(
+                "Crash: the test case corrupted its memory (the record of",
+                " it sent back by the child process has ",
+                e,
+                "), in a child process (Settings(fork=True))",
+            )
+        if reader.overflowed:
+            # more than LOG_SIZE bytes of choices and notes
+            data.status = Status.OVERRUN
+            return String()
+        data.status = Status.INTERESTING
+        var sig = term_signal(status)
+        if sig == SIGALRM and self.settings.timeout:
+            data.interesting_origin = "Timeout"
+            return String(
+                "Timeout: the test case ran longer than ",
+                self.settings.timeout.value(),
+                " ms (Settings(timeout=...))",
+            )
+        if sig != 0:
+            var name = signal_name(sig)
+            data.interesting_origin = String("Crash: ", name)
+            return String(
+                "Crash: the test case was killed by ",
+                name,
+                " (signal ",
+                sig,
+                "), in a child process (Settings(fork=True))",
+            )
+        var code = exit_code(status) if exited(status) else -1
+        data.interesting_origin = String("Crash: exit ", code)
+        return String(
+            "Crash: the test case exited with status ",
+            code,
+            " before finishing, in a child process (Settings(fork=True));",
+            " a sanitizer's report, if there was one, is printed above",
+        )
+
+    def _execute_here(mut self, mut data: ConjectureData) -> String:
+        """`execute`, in this process."""
         var error_msg = String()
         try:
             self.test_fn(data)
