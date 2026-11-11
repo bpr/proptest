@@ -373,8 +373,8 @@ the test's location, for a conditional breakpoint.
 Settings left at their defaults can be set from the environment, like a
 Hypothesis profile: `PROPTEST_MAX_EXAMPLES`, `PROPTEST_SEED`,
 `PROPTEST_VERBOSITY` (`quiet`/`normal`/`verbose`/`debug`) and
-`PROPTEST_DATABASE` (a directory, or `none`), and `PROPTEST_FORK`
-(`1` turns `fork` on).
+`PROPTEST_DATABASE` (a directory, or `none`), `PROPTEST_FORK`
+(`1` turns `fork` on), and `PROPTEST_TIMEOUT` (milliseconds).
 
 With `fork=True` (after Rust proptest), each test case runs in a
 `fork()`ed child, so a test that segfaults, aborts, or fails under
@@ -604,6 +604,9 @@ back; it's checked against a `List` after every command.
 `examples/splay_tree.mojo` is a splay tree with parent pointers, checked
 against a sorted list and, after every splay, against the amortized
 analysis's access lemma, which catches a splay that is correct but slow.
+`examples/red_black_tree.mojo` is a red-black tree that keeps each node's
+color in the low bit of its parent pointer, as Linux's rbtree does; it
+checks the red-black rules and every link after each command.
 
 ## How it works
 

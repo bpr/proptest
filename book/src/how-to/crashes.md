@@ -77,4 +77,7 @@ never does, such as an infinite loop in a linked list with a cycle.
 - POSIX only (Linux and macOS).
 
 `PROPTEST_FORK=1` in the environment turns `fork` on for tests that
-don't set it.
+don't set it, and `PROPTEST_TIMEOUT=ms` sets `timeout` (and so turns
+`fork` on too). Use a timeout when a bug may corrupt a linked structure:
+a cycle makes a walk loop forever, and with `fork` alone the run waits
+for it.

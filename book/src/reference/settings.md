@@ -60,6 +60,7 @@ always wins.
 | `PROPTEST_VERBOSITY` | `verbosity` | `quiet`, `normal`, `verbose`, `debug` |
 | `PROPTEST_DATABASE` | `database` | a directory, or `none` |
 | `PROPTEST_FORK` | `fork` | `1` or `true` |
+| `PROPTEST_TIMEOUT` | `timeout` | milliseconds |
 
 `settings.with_env_overrides()` returns the settings with these applied;
 the test runners call it for you.

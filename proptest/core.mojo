@@ -266,6 +266,15 @@ def run_test[
                 " Original error: ",
                 runner.interesting_errors[origin],
             )
+        elif r[].interesting_origin != origin:
+            # e.g. a use after free, whose effect depends on the heap
+            msg += String(
+                "\nFlaky: this example failed differently when it was",
+                " found, so it may not have been shrunk (the test may have",
+                " undefined behavior, or depend on state outside its",
+                " inputs). Original error: ",
+                runner.interesting_errors[origin],
+            )
         report.failures.append(r)
         report.errors.append(msg)
     report.valid = runner.valid_count

@@ -18,8 +18,9 @@ Supported: `max_examples`, `seed`/`derandomize`, `database`, `phases`,
 supported: `backend`. Settings left at their defaults can be changed through
 environment variables (like a Hypothesis settings profile):
 `PROPTEST_MAX_EXAMPLES`, `PROPTEST_SEED`, `PROPTEST_VERBOSITY`
-(`quiet`, `normal`, `verbose`, `debug`), and `PROPTEST_DATABASE`
-(a directory, or `none` to disable it).
+(`quiet`, `normal`, `verbose`, `debug`), `PROPTEST_DATABASE`
+(a directory, or `none` to disable it), `PROPTEST_FORK` (`1`), and
+`PROPTEST_TIMEOUT` (milliseconds).
 """
 
 from std.os import getenv
@@ -290,6 +291,12 @@ struct Settings(Copyable, Writable):
         var fork = getenv("PROPTEST_FORK")
         if not s.fork and (fork == "1" or fork == "true"):
             s.fork = True
+        var timeout = getenv("PROPTEST_TIMEOUT")
+        if timeout.byte_length() > 0 and not s.timeout:
+            try:
+                s.timeout = Float64(timeout)
+            except:
+                pass
         var db = getenv("PROPTEST_DATABASE")
         if s.database and s.database.value() == DEFAULT_DATABASE:
             if db == "none" or db == "None":

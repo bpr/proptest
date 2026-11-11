@@ -728,7 +728,10 @@ the same table at run time from `unicodedata` and caches it on disk.
   the choices the shrinker needs. Nothing a child logs is trusted: a log
   that is inconsistent (because the test corrupted the child's memory) is
   reported as a crash. A crash's interesting origin is its signal, or its
-  exit status (1.8).
+  exit status (1.8). A memory error can fail differently from run to run,
+  so when the final replay of a failure fails with a different origin,
+  the report says so and gives the original error (Hypothesis reports the
+  new error alone); such a failure may not have been shrunk.
 - **Observability output, settings profiles, the pytest plugin, the ghostwriter**: tooling around
   Python's ecosystem. Environment-variable overrides stand in for profiles.
 - **Health checks**: `filter_too_much`, `data_too_large`,

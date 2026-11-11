@@ -373,3 +373,9 @@ that moves a node to the root one rotation at a time still gives the right
 answers, only slowly, so the tree also checks the access lemma of
 Sleator and Tarjan's analysis after every splay, and a second property
 checks that accessing every key in order takes at most 4.5 n rotations.
+
+[`examples/red_black_tree.mojo`](https://github.com/bpr/proptest/blob/master/examples/red_black_tree.mojo)
+is a red-black tree that, like the Linux kernel's, stores each node's
+color in the low bit of its parent pointer. After each command it checks
+the red-black rules, that every parent link points back and holds no
+stray bits, and that the height is at most 2 log2(n + 1).

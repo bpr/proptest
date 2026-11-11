@@ -4,7 +4,7 @@
 
 from std.benchmark import keep
 from std.ffi import external_call
-from std.os import abort
+from std.os import abort, setenv, unsetenv
 from std.testing import TestSuite, assert_equal, assert_true, assert_false
 
 from proptest import *
@@ -161,10 +161,37 @@ def test_a_crash_reproduces_from_its_blob() raises:
     assert_true("SIGSEGV" in again, again)
 
 
+def test_a_failure_that_changes_on_replay_says_so() raises:
+    # as a use after free can: the final replay fails differently
+    def prop(mut data: ConjectureData) raises:
+        var x = data.draw(integers())
+        if x > 5:
+            if data.is_final:
+                crash(11)
+            fail("first error")
+
+    var msg = String()
+    try:
+        given_data(prop, forked())
+    except e:
+        msg = String(e)
+    assert_true("SIGSEGV" in msg, msg)
+    assert_true("failed differently when it was found" in msg, msg)
+    assert_true("first error" in msg, msg)
+
+
 def test_the_environment_turns_fork_on() raises:
     var s = Settings()
     assert_false(s.forks())
     assert_true(Settings(timeout=5.0).forks())
+    _ = setenv("PROPTEST_TIMEOUT", "250")
+    var t = Settings().with_env_overrides()
+    assert_true(t.forks())
+    assert_equal(t.timeout.value(), 250.0)
+    assert_equal(
+        Settings(timeout=9.0).with_env_overrides().timeout.value(), 9.0
+    )
+    _ = unsetenv("PROPTEST_TIMEOUT")
 
 
 def main() raises:
