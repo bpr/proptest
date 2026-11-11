@@ -396,3 +396,12 @@ plain lists of integers, so it predicts every address; the commands also
 check every boundary tag and that each live allocation still holds the
 bytes written to it, which catches what AddressSanitizer can't see inside
 the arena.
+
+[`examples/cheney_gc.mojo`](https://github.com/bpr/proptest/blob/master/examples/cheney_gc.mojo)
+is Cheney's copying garbage collector: two semispaces of raw words,
+tagged integers and pointers, and forwarding addresses written over old
+headers. The model is a plain object graph that also replays Cheney's
+breadth-first copy order, so it predicts where every object ends up and
+which allocations trigger a collection. After each command the heap
+reachable from the roots must be isomorphic to the model's graph, with
+shared objects and cycles mapped one to one.

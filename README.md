@@ -614,6 +614,9 @@ carry their own links, so one task is on two lists at once, and
 `examples/free_list_allocator.mojo` is a malloc-style allocator with
 boundary tags, whose free blocks keep the free list's pointers in their
 own bytes; a model over plain integers predicts every address it returns.
+`examples/cheney_gc.mojo` is Cheney's copying garbage collector; after
+every command the graph reachable from the roots must be isomorphic to a
+model object graph, with every object where Cheney's copy order puts it.
 
 ## How it works
 
