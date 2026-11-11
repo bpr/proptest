@@ -54,11 +54,12 @@ and [docs/ideas.md](docs/ideas.md).
 
 ## Documentation
 
-The [proptest book](book/) has a tutorial, how-to guides, explanations,
-and a reference, following the layout of Hypothesis's documentation. Build
-it with [mdbook](https://rust-lang.github.io/mdBook/): `pixi run book`
-(output in `book/build/`), or `pixi run book-serve` to read it in a
-browser. `pixi run book-test` compiles and runs every code example in it.
+The [proptest book](https://bpr.github.io/proptest/) has a tutorial,
+how-to guides, explanations, and a reference, following the layout of
+Hypothesis's documentation. Its sources are in [book/](book/); to build it
+locally, install [mdbook](https://rust-lang.github.io/mdBook/) and run
+`pixi run book` (output in `book/build/`), or `pixi run book-serve` to read
+it in a browser. `pixi run book-test` compiles and runs every code example in it.
 
 ## Setup
 

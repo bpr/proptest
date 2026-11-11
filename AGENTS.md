@@ -132,4 +132,6 @@ and RapidCheck (see `docs/ideas.md`).
   ```` ```mojo-sig ```` blocks; the check imports the names they declare.
   Show real output in ```` ```text ```` blocks, taken from running the
   example.
-
+- `.github/workflows/book.yml` builds the book with mdbook and publishes it
+  to GitHub Pages (https://bpr.github.io/proptest/) on pushes to `master`
+  that touch `book/`. It doesn't run `book-test`, which needs Mojo.
