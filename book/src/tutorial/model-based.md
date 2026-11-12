@@ -355,9 +355,12 @@ with `--sanitize address` checks for leaks and use after free.
 
 [`examples/dancing_links.mojo`](https://github.com/bpr/proptest/blob/master/examples/dancing_links.mojo)
 is Knuth's Dancing Links, an exact cover solver whose nodes are linked by
-raw pointers in four directions. Its `Cover` and `Uncover` commands check
-every column against a model after each step, and when every cover has
-been undone they check that every link is back where it started.
+raw pointers in four directions, extended to his Algorithm C, where
+options can give secondary items colors and share them when the colors
+agree. Its `Cover`, `Purify`, and `Undo` commands check every column, and
+every node's color, against a model after each step, and when everything
+has been undone they check that every link and color is back where it
+started.
 
 [`examples/xor_list.mojo`](https://github.com/bpr/proptest/blob/master/examples/xor_list.mojo)
 is an XOR linked list: each node stores the XOR of its neighbors'

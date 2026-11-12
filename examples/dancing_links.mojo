@@ -1,10 +1,16 @@
 # Knuth's Dancing Links (Algorithm X with DLX, "Dancing Links",
-# arXiv cs/0011047, and TAOCP 7.2.2.1), with heap-allocated nodes linked by
-# raw pointers in four directions.
+# arXiv cs/0011047), extended to Algorithm C, exact covering with colors
+# (TAOCP 7.2.2.1), with heap-allocated nodes linked by raw pointers in four
+# directions.
 #
 # An exact cover problem has items and options (sets of items); a solution
 # is a set of options containing every primary item exactly once and every
 # secondary item at most once. Each option must contain a primary item.
+#
+# With colors, an option may give a secondary item a color, and then the
+# item may be in several options of a solution, as long as all of them
+# give it the same color. (An option that gives it no color still wants it
+# to itself.) With no colors, Algorithm C is Algorithm X.
 #
 # Each item has a header node; each option has a node per item, linked into
 # a circular row (left/right) and into its item's circular column
@@ -13,6 +19,11 @@
 # uncovering relinks them in reverse order. A removed node keeps its own
 # links, so `x.left.right = x; x.right.left = x` puts it back: the links
 # "dance", and the search allocates nothing.
+#
+# Colors add "purifying": choosing an option that gives item i the color
+# c marks every other option with i:c as compatible (color -1) and hides
+# every option that gives i another color or none. Hiding skips nodes
+# marked compatible, so they stay in their purified columns.
 #
 # Covers must be undone in reverse order. Within one uncover, though, the
 # loops could run in either direction: nodes removed from a doubly linked
@@ -30,8 +41,10 @@
 #   minimum-remaining-values heuristic;
 # - that a planted solution is found in larger problems;
 # - that a search leaves every link exactly as it found it;
-# - cover and uncover, model-based: after each step every column must hold
-#   exactly the options the model says;
+# - cover, purify, and their undoing, model-based: after each step every
+#   column must hold exactly the options the model says, with the colors
+#   it says;
+# - Knuth's example of covering with colors;
 # - the n-queens counts, using secondary items for the diagonals.
 #
 # Build with AddressSanitizer to check for use after free and leaks:
@@ -63,6 +76,10 @@ struct Node(Movable):
     """The option's index; -1 for headers and the root."""
     var id: Int
     """The node's index in ExactCover.nodes, for snapshots."""
+    var color: Int
+    """For an option's node: the color it gives its item (0 for none, -1
+    once a purify has found it compatible). For a header: the color it's
+    purified with, while it is."""
 
     def __init__(
         out self,
@@ -81,6 +98,7 @@ struct Node(Movable):
         self.item = item
         self.option = option
         self.id = id
+        self.color = 0
 
 
 comptime NodePtr = Pointer[Node, MutUntrackedOrigin]
@@ -132,13 +150,25 @@ struct ExactCover(Movable):
             _ = n.unsafe_take_pointee()
             n.unsafe_free()
 
-    def add_option(mut self, items: List[Int], at_top: Bool = False) raises:
-        """Add an option: distinct items, at least one primary. It goes at
-        the bottom of each item's column, or at the top if `at_top`."""
+    def add_option(
+        mut self,
+        items: List[Int],
+        colors: List[Int] = [],
+        at_top: Bool = False,
+    ) raises:
+        """Add an option: distinct items, at least one primary, with the
+        colors it gives them (0 for none; only secondary items may have
+        one). It goes at the bottom of each item's column, or at the top if
+        `at_top`."""
         var has_primary = False
+        if len(colors) != 0 and len(colors) != len(items):
+            raise Error("add_option: one color per item")
         for i in range(len(items)):
             if items[i] < 0 or items[i] >= self.n_items:
                 raise Error("add_option: no item ", items[i])
+            var color = colors[i] if len(colors) > 0 else 0
+            if color < 0 or (color > 0 and items[i] < self.n_primary):
+                raise Error("add_option: bad color for item ", items[i])
             for j in range(i):
                 if items[j] == items[i]:
                     raise Error("add_option: item ", items[i], " repeated")
@@ -148,12 +178,14 @@ struct ExactCover(Movable):
         var option = len(self.options)
         self.options.append(items.copy())
         var first: Optional[NodePtr] = None
-        for item in items:
+        for k in range(len(items)):
             # UNSAFE: links a new node into its column and at the end of
             # its row
+            var item = items[k]
             var h = self.headers[item]
             var n = _alloc(self.nodes, item, option)
             n[].column = h
+            n[].color = colors[k] if len(colors) > 0 else 0
             if at_top:
                 n[].up = h
                 n[].down = h[].down
@@ -174,6 +206,29 @@ struct ExactCover(Movable):
             else:
                 first = n
 
+    def hide(mut self, i: NodePtr):
+        """Remove the rest of i's option from their columns, except nodes
+        a purify found compatible (Knuth's hide')."""
+        # UNSAFE: unlinks the other nodes of i's row from their columns
+        var j = i[].right
+        while j != i:
+            if j[].color >= 0:
+                j[].down[].up = j[].up
+                j[].up[].down = j[].down
+                j[].column[].size -= 1
+            j = j[].right
+
+    def unhide(mut self, i: NodePtr):
+        """Undo hide(i)."""
+        # UNSAFE: relinks what hide(i) unlinked, in reverse order
+        var j = i[].left
+        while j != i:
+            if j[].color >= 0:
+                j[].column[].size += 1
+                j[].down[].up = j
+                j[].up[].down = j
+            j = j[].left
+
     def cover(mut self, c: NodePtr):
         """Remove item c's header from the ring, and every option in c's
         column from the other columns."""
@@ -182,12 +237,7 @@ struct ExactCover(Movable):
         c[].left[].right = c[].right
         var i = c[].down
         while i != c:
-            var j = i[].right
-            while j != i:
-                j[].down[].up = j[].up
-                j[].up[].down = j[].down
-                j[].column[].size -= 1
-                j = j[].right
+            self.hide(i)
             i = i[].down
 
     def uncover(mut self, c: NodePtr):
@@ -195,21 +245,63 @@ struct ExactCover(Movable):
         # UNSAFE: c must be the most recently covered header
         var i = c[].up
         while i != c:
-            var j = i[].left
-            while j != i:
-                j[].column[].size += 1
-                j[].down[].up = j
-                j[].up[].down = j
-                j = j[].left
+            self.unhide(i)
             i = i[].up
         c[].right[].left = c
         c[].left[].right = c
+
+    def purify(mut self, c: NodePtr, color: Int):
+        """Commit secondary item c to `color`: mark the options giving it
+        that color compatible (-1), and hide the others."""
+        # UNSAFE: c must be a header that isn't covered or purified
+        c[].color = color
+        var i = c[].down
+        while i != c:
+            if i[].color == color:
+                i[].color = -1
+            else:
+                self.hide(i)
+            i = i[].down
+
+    def unpurify(mut self, c: NodePtr):
+        """Undo purify(c, ...), in reverse order."""
+        # UNSAFE: c must be the most recently purified or covered header
+        var color = c[].color
+        var i = c[].up
+        while i != c:
+            if i[].color < 0:
+                i[].color = color
+            else:
+                self.unhide(i)
+            i = i[].up
+        c[].color = 0
+
+    def commit(mut self, j: NodePtr):
+        """Choosing j's option: cover j's item, or purify it with j's
+        color (nothing if j is already marked compatible)."""
+        if j[].color == 0:
+            self.cover(j[].column)
+        elif j[].color > 0:
+            self.purify(j[].column, j[].color)
+
+    def uncommit(mut self, j: NodePtr):
+        """Undo commit(j)."""
+        if j[].color == 0:
+            self.uncover(j[].column)
+        elif j[].color > 0:
+            self.unpurify(j[].column)
 
     def cover_item(mut self, item: Int):
         self.cover(self.headers[item])
 
     def uncover_item(mut self, item: Int):
         self.uncover(self.headers[item])
+
+    def purify_item(mut self, item: Int, color: Int):
+        self.purify(self.headers[item], color)
+
+    def unpurify_item(mut self, item: Int):
+        self.unpurify(self.headers[item])
 
     def _search(
         mut self,
@@ -236,12 +328,12 @@ struct ExactCover(Movable):
             partial.append(r[].option)
             var j = r[].right
             while j != r:
-                self.cover(j[].column)
+                self.commit(j)
                 j = j[].right
             stop = self._search(partial, solutions, limit, mrv)
             j = r[].left
             while j != r:
-                self.uncover(j[].column)
+                self.uncommit(j)
                 j = j[].left
             _ = partial.pop()
             r = r[].down
@@ -281,8 +373,18 @@ struct ExactCover(Movable):
             p = p[].down
         return out^
 
+    def colors(self, item: Int) -> List[Int]:
+        """The colors of the nodes in the item's column, top to bottom."""
+        var out = List[Int]()
+        var h = self.headers[item]
+        var p = h[].down
+        while p != h and len(out) <= len(self.options):
+            out.append(p[].color)
+            p = p[].down
+        return out^
+
     def snapshot(self) -> List[Int]:
-        """Every link and size, as node ids."""
+        """Every link, size, and color, as node ids."""
         var out = List[Int]()
         for n in self.nodes:
             out.append(n[].left[].id)
@@ -291,6 +393,7 @@ struct ExactCover(Movable):
             out.append(n[].down[].id)
             out.append(n[].column[].id)
             out.append(n[].size)
+            out.append(n[].color)
         return out^
 
     def check_links(self) raises:
@@ -351,6 +454,17 @@ struct Problem(Copyable, Writable):
     var at_top: Int
     """A bitmask of the options added at the top of their columns, so the
     columns don't all list the options in the same order."""
+    var colors: List[List[Int]]
+    """The color option k gives item i, at [k][i] (0 for none)."""
+
+    @staticmethod
+    def uncolored(
+        n_items: Int, n_primary: Int, var options: List[Int], at_top: Int
+    ) -> Self:
+        var colors = List[List[Int]]()
+        for _ in range(len(options)):
+            colors.append(List[Int](length=n_items, fill=0))
+        return Self(n_items, n_primary, options^, at_top, colors^)
 
     def column_order(self, item: Int) -> List[Int]:
         """The options in the item's column, top to bottom."""
@@ -370,25 +484,43 @@ struct Problem(Copyable, Writable):
                 out.append(i)
         return out^
 
+    def option_colors(self, option: Int) -> List[Int]:
+        var out = List[Int]()
+        for i in self.items(option):
+            out.append(self.colors[option][i])
+        return out^
+
     def build(self) raises -> ExactCover:
         var x = ExactCover(self.n_items, self.n_primary)
         for k in range(len(self.options)):
-            x.add_option(self.items(k), at_top=Bool(self.at_top & (1 << k)))
+            x.add_option(
+                self.items(k),
+                self.option_colors(k),
+                at_top=Bool(self.at_top & (1 << k)),
+            )
         return x^
 
     def brute_force(self) -> List[Int]:
-        """Every solution, as a bitmask of options, in increasing order."""
+        """Every solution, as a bitmask of options, in increasing order:
+        each primary item in exactly one chosen option, and each secondary
+        item in at most one, or in several that all give it one color."""
         var primary = (1 << self.n_primary) - 1
         var out = List[Int]()
         for chosen in range(1 << len(self.options)):
             var used = 0
+            var color = List[Int](length=self.n_items, fill=0)
             var ok = True
             for k in range(len(self.options)):
-                if chosen & (1 << k):
-                    if used & self.options[k]:
-                        ok = False
-                        break
-                    used |= self.options[k]
+                if not chosen & (1 << k):
+                    continue
+                for i in self.items(k):
+                    var c = self.colors[k][i]
+                    if used & (1 << i):
+                        # shared: fine only if both give it the same color
+                        if c == 0 or c != color[i]:
+                            ok = False
+                    color[i] = c
+                    used |= 1 << i
             if ok and used & primary == primary:
                 out.append(chosen)
         return out^
@@ -406,7 +538,10 @@ def as_masks(solutions: List[List[Int]]) -> List[Int]:
 
 
 def draw_problem(
-    mut data: ConjectureData, max_items: Int, max_options: Int
+    mut data: ConjectureData,
+    max_items: Int,
+    max_options: Int,
+    max_colors: Int = 2,
 ) raises -> Problem:
     var n = data.draw(integers(1, max_items))
     var n_primary = data.draw(integers(1, n))
@@ -422,50 +557,113 @@ def draw_problem(
     )
     var options = List[Int]()
     var at_top = 0
+    var colors = List[List[Int]]()
     for k in range(len(masks)):  # every option gets a primary item
         options.append(masks[k][0] | (1 << masks[k][1]))
         if masks[k][2]:
             at_top |= 1 << k
-    return Problem(n, n_primary, options^, at_top)
+        # a color (or none) for each secondary item; few colors, so that
+        # they often agree
+        var c = List[Int](length=n, fill=0)
+        for i in range(n_primary, n):
+            if options[k] & (1 << i):
+                c[i] = data.draw(integers(0, max_colors))
+        colors.append(c^)
+    return Problem(n, n_primary, options^, at_top, colors^)
 
 
-# ---- a model of cover and uncover
+# ---- a model of cover, purify, and undoing them
 
 
 @fieldwise_init
 struct CoverModel(Copyable, Writable):
+    """The structure as sets: which nodes are linked into their columns,
+    and each node's color."""
+
     var problem: Problem
     var stack: List[Int]
-    """The covered items, in the order they were covered."""
+    """The covered or purified items, in order."""
+    var purified_with: List[Int]
+    """The color each item on the stack was purified with (0: covered)."""
+    var linked: List[List[Bool]]
+    """Whether option k's node for item i is in item i's column, at [k][i]."""
+    var color: List[List[Int]]
+    """That node's color, at [k][i]."""
+    var saved_linked: List[List[List[Bool]]]
+    var saved_color: List[List[List[Int]]]
+    """The state before each operation on the stack, to undo it."""
     var initial: List[Int]
-    """The structure's snapshot before any cover."""
+    """The structure's snapshot before any operation."""
 
-    def is_covered(self, item: Int) -> Bool:
-        for c in self.stack:
-            if c == item:
-                return True
-        return False
+    @staticmethod
+    def start(problem: Problem, initial: List[Int]) -> Self:
+        var linked = List[List[Bool]]()
+        for _ in range(len(problem.options)):
+            linked.append(List[Bool](length=problem.n_items, fill=True))
+        return Self(
+            problem.copy(),
+            [],
+            [],
+            linked^,
+            problem.colors.copy(),
+            [],
+            [],
+            initial.copy(),
+        )
+
+    def is_used(self, item: Int) -> Bool:
+        return item in self.stack
 
     def ring(self) -> List[Int]:
         var out = List[Int]()
         for i in range(self.problem.n_primary):
-            if not self.is_covered(i):
+            if not self.is_used(i):
                 out.append(i)
         return out^
 
     def column(self, item: Int) -> List[Int]:
-        """The options containing `item` and none of the items covered
-        before it (all of them, if it isn't covered)."""
-        var before = 0
-        for c in self.stack:
-            if c == item:
-                break
-            before |= 1 << c
+        """The options whose node for `item` is still in its column."""
         var out = List[Int]()
         for k in self.problem.column_order(item):
-            if not (self.problem.options[k] & before):
+            if self.linked[k][item]:
                 out.append(k)
         return out^
+
+    def colors(self, item: Int) -> List[Int]:
+        var out = List[Int]()
+        for k in self.column(item):
+            out.append(self.color[k][item])
+        return out^
+
+    def _hide(mut self, option: Int, item: Int):
+        for i in self.problem.items(option):
+            if i != item and self.color[option][i] >= 0:
+                self.linked[option][i] = False
+
+    def _save(mut self, item: Int, color: Int):
+        self.saved_linked.append(self.linked.copy())
+        self.saved_color.append(self.color.copy())
+        self.stack.append(item)
+        self.purified_with.append(color)
+
+    def cover(mut self, item: Int):
+        self._save(item, 0)
+        for k in self.column(item):
+            self._hide(k, item)
+
+    def purify(mut self, item: Int, color: Int):
+        self._save(item, color)
+        for k in self.column(item):
+            if self.color[k][item] == color:
+                self.color[k][item] = -1
+            else:
+                self._hide(k, item)
+
+    def undo(mut self):
+        self.linked = self.saved_linked.pop()
+        self.color = self.saved_color.pop()
+        _ = self.stack.pop()
+        _ = self.purified_with.pop()
 
 
 def check_against(model: CoverModel, sut: ExactCover) raises:
@@ -473,6 +671,7 @@ def check_against(model: CoverModel, sut: ExactCover) raises:
     assert_true(sut.ring() == model.ring(), "ring")
     for i in range(model.problem.n_items):
         assert_true(sut.column(i) == model.column(i), String("column ", i))
+        assert_true(sut.colors(i) == model.colors(i), String("colors ", i))
 
 
 @fieldwise_init
@@ -486,10 +685,10 @@ struct Cover(Command):
         return Self(data.draw(integers(0, model.problem.n_items - 1)))
 
     def precondition(self, model: CoverModel) raises -> Bool:
-        return not model.is_covered(self.item)
+        return not model.is_used(self.item)
 
     def next_state(self, mut model: CoverModel) raises:
-        model.stack.append(self.item)
+        model.cover(self.item)
 
     def run(self, model: CoverModel, mut sut: ExactCover) raises:
         sut.cover_item(self.item)
@@ -502,7 +701,44 @@ struct Cover(Command):
 
 
 @fieldwise_init
-struct Uncover(Command):
+struct Purify(Command):
+    comptime Model = CoverModel
+    comptime Sut = ExactCover
+    var item: Int
+    var color: Int
+
+    @staticmethod
+    def generate(model: CoverModel, mut data: ConjectureData) raises -> Self:
+        var p = model.problem.copy()
+        if p.n_primary == p.n_items:
+            return Self(0, 1)  # rejected by precondition
+        return Self(
+            data.draw(integers(p.n_primary, p.n_items - 1)),
+            data.draw(integers(1, 2)),
+        )
+
+    def precondition(self, model: CoverModel) raises -> Bool:
+        return self.item >= model.problem.n_primary and not model.is_used(
+            self.item
+        )
+
+    def next_state(self, mut model: CoverModel) raises:
+        model.purify(self.item, self.color)
+
+    def run(self, model: CoverModel, mut sut: ExactCover) raises:
+        sut.purify_item(self.item, self.color)
+        var after = model.copy()
+        self.next_state(after)
+        check_against(after, sut)
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("purify(", self.item, ", color ", self.color, ")")
+
+
+@fieldwise_init
+struct Undo(Command):
+    """Uncover or unpurify the last item covered or purified."""
+
     comptime Model = CoverModel
     comptime Sut = ExactCover
 
@@ -514,10 +750,14 @@ struct Uncover(Command):
         return len(model.stack) > 0
 
     def next_state(self, mut model: CoverModel) raises:
-        _ = model.stack.pop()
+        model.undo()
 
     def run(self, model: CoverModel, mut sut: ExactCover) raises:
-        sut.uncover_item(model.stack[len(model.stack) - 1])
+        var last = len(model.stack) - 1
+        if model.purified_with[last] > 0:
+            sut.unpurify_item(model.stack[last])
+        else:
+            sut.uncover_item(model.stack[last])
         var after = model.copy()
         self.next_state(after)
         check_against(after, sut)
@@ -525,7 +765,29 @@ struct Uncover(Command):
             assert_true(sut.snapshot() == after.initial, "links restored")
 
     def write_to(self, mut writer: Some[Writer]):
-        writer.write("uncover()")
+        writer.write("undo()")
+
+
+# ---- Knuth's example of exact covering with colors (TAOCP 7.2.2.1)
+
+
+def knuths_color_example() raises:
+    # primary items p, q, r (0..2); secondary items x, y (3, 4); colors
+    # A = 1, B = 2. The options:
+    #   0: p q x y:A    1: p r x:A y    2: p x:B    3: q x:A    4: r y:B
+    var x = ExactCover(5, 3)
+    x.add_option([0, 1, 3, 4], [0, 0, 0, 1])
+    x.add_option([0, 2, 3, 4], [0, 0, 1, 0])
+    x.add_option([0, 3], [0, 2])
+    x.add_option([1, 3], [0, 1])
+    x.add_option([2, 4], [0, 2])
+    var before = x.snapshot()
+    var solutions = x.solve()
+    assert_equal(len(solutions), 1, "one solution")
+    var s = solutions[0].copy()
+    sort(s)
+    assert_true(s == [1, 3], "options 1 and 3 (p r x:A y, q x:A)")
+    assert_true(x.snapshot() == before, "links and colors restored")
 
 
 # ---- n queens: rows and columns primary, diagonals secondary
@@ -563,6 +825,8 @@ def main() raises:
 
     queens_counts()
     print("n queens, 1..8: passed")
+    knuths_color_example()
+    print("Knuth's color example: passed")
 
     def matches_brute_force(mut data: ConjectureData) raises:
         var p = draw_problem(data, 6, 10)
@@ -598,7 +862,7 @@ def main() raises:
             options.append(m)
         var shuffled = data.draw(permutations(options^))
         var at_top = data.draw(integers(0, (1 << len(shuffled)) - 1))
-        var x = Problem(n, n, shuffled.copy(), at_top).build()
+        var x = Problem.uncolored(n, n, shuffled.copy(), at_top).build()
         var found = x.solve()
         x.check_links()
         var cover = 0
@@ -626,11 +890,11 @@ def main() raises:
     def cover_matches_model(mut data: ConjectureData) raises:
         var p = draw_problem(data, 6, 10)
         var x = p.build()
-        var model = CoverModel(p.copy(), [], x.snapshot())
-        run_commands[Cover, Uncover](model, x, data)
+        var model = CoverModel.start(p, x.snapshot())
+        run_commands[Cover, Purify, Undo](model, x, data)
 
     given_data(cover_matches_model, settings)
-    print("cover and uncover match the model: passed")
+    print("cover, purify, and undo match the model: passed")
 
     # Moving the structure doesn't move its nodes.
     def survives_a_move(mut data: ConjectureData) raises:

@@ -594,10 +594,11 @@ drawn per test case and a model that is a plain list in recency order.
 `examples/lru_cache_pointers.mojo` is the same cache with heap-allocated
 nodes linked by raw pointers, checked by the same model plus a link
 invariant after every step, and clean under `--sanitize address`.
-`examples/dancing_links.mojo` is Knuth's Dancing Links: an exact cover
-solver whose nodes are linked by raw pointers in four directions, checked
-against brute force and n-queens counts, with cover and uncover tested
-against a model of every column.
+`examples/dancing_links.mojo` is Knuth's Dancing Links, extended to
+Algorithm C (exact covering with colors): a solver whose nodes are linked
+by raw pointers in four directions, checked against brute force, n-queens
+counts, and Knuth's color example, with cover, purify, and undo tested
+against a model of every column and every node's color.
 `examples/xor_list.mojo` is an XOR linked list, whose nodes store the XOR
 of their neighbors' addresses, so every link goes through an integer and
 back; it's checked against a `List` after every command.
