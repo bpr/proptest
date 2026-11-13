@@ -21,7 +21,7 @@ health check.
 
 Large inputs are slow to generate, to run, and to shrink. Pass `max_size`
 to collection strategies when the code under test doesn't need large
-inputs to show its behaviour; most bugs show up with small ones.
+inputs to show its behavior; most bugs show up with small ones.
 
 ### Compare against a model
 

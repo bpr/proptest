@@ -42,7 +42,7 @@ strategies don't reject too much, or generate data too large or too slow.
 shrinking.
 
 **Model.** A simple value describing the state a system under test should
-be in, used to check the system's behaviour.
+be in, used to check the system's behavior.
 
 **Overrun.** A test case abandoned because it made too many choices.
 

@@ -243,7 +243,7 @@ around them:
   `Int128`.
 - **Collection indices.** Hypothesis's `choice_to_index` for strings and
   bytes is `alphabet**length`-sized and routinely exceeds any fixed width.
-  proptest never materialises it: `choice_compare` compares collections
+  proptest never materializes it: `choice_compare` compares collections
   structurally (shortlex by element order), which is the same order.
   `choice_from_index` for collections is computed in 128 bits and raises
   `ChoiceTooLarge` past that, which only matters for the "simplest"

@@ -32,7 +32,7 @@ values, for the same reasons as Hypothesis:
   engine deliberately over-represents those.
 - The distribution changes during a run: proptest starts with small,
   simple inputs, mutates inputs it has seen, and steers towards new
-  behaviour. A fixed distribution would fight this.
+  behavior. A fixed distribution would fight this.
 - Shrinking doesn't depend on the distribution, so there's no need to bias
   towards small values to get small counterexamples.
 

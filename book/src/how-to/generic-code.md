@@ -3,7 +3,7 @@
 To test a generic function, you have to pick a type to test it at. The
 obvious choice, `Int`, can hide bugs: a property may pass because of
 something particular to integers, such as arithmetic coincidences, or
-because a function quietly relies on behaviour only `Int` has.
+because a function quietly relies on behavior only `Int` has.
 
 `PolyA`, `PolyB`, and `PolyC` are opaque stand-in types for this (Haskell
 QuickCheck's `Test.QuickCheck.Poly`). Each holds an integer, but supports

@@ -212,5 +212,5 @@ result without computing the result by hand. Common kinds of property:
   for any valid input.
 
 It complements example-based tests rather than replacing them. A handful of
-examples documents behaviour you care about; properties find the inputs you
+examples documents behavior you care about; properties find the inputs you
 didn't think of.

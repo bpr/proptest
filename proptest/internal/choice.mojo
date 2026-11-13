@@ -21,7 +21,7 @@ Differences from Hypothesis:
   values to probabilities with the rest uniform. They only change how
   values are generated; the simplicity order ignores them.
 - Collection choices are compared structurally (shortlex) instead of by
-  materialising their (possibly enormous) index.
+  materializing their (possibly enormous) index.
 """
 
 from std.memory import ArcPointer
