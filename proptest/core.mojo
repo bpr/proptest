@@ -183,6 +183,21 @@ def run_test[
             runner = sh^.release()
             # resume at the largest member simpler than the old target
             i = runner.front.value().bisect_left(target)
+    shrink_and_replay(runner, report, settings, name)
+    return report^
+
+
+def shrink_and_replay[
+    F: def(mut ConjectureData) raises
+](
+    mut runner: ConjectureRunner[F],
+    mut report: RunReport,
+    settings: Settings,
+    name: String,
+) raises:
+    """Shrink the failures `runner` found, replay each shrunk failure for
+    the report, and fill in `report`. Used by `run_test` and by the fuzz
+    loop (`FuzzTarget.fuzz`)."""
     if (
         settings.verbosity >= Verbosity.verbose
         and runner.first_bug_found_at >= 0
@@ -200,12 +215,16 @@ def run_test[
             var origin = runner.origins[k]
             var target = runner.interesting[origin]
             var sh = Shrinker[F](runner^, target)
-            sh.shrink()
-            if settings.verbosity >= Verbosity.debug:
-                sh.report_pass_statistics()
-            if settings.phases.explain:
-                sh.max_stall = 1 << 60
-                sh.explain()
+            try:
+                sh.shrink()
+                if settings.verbosity >= Verbosity.debug:
+                    sh.report_pass_statistics()
+                if settings.phases.explain:
+                    sh.max_stall = 1 << 60
+                    sh.explain()
+            except e:
+                runner = sh^.release()
+                raise e^
             var best = sh.target
             var comments = sh.arg_comments.copy()
             var explain_note = sh.explain_note
@@ -285,7 +304,6 @@ def run_test[
     _report_statistics(
         report, runner.stats, runner.coverage_verdict, name, settings
     )
-    return report^
 
 
 def _report_statistics(

@@ -40,6 +40,7 @@ from proptest.core import (
     check_examples,
     run_test,
 )
+from proptest.fuzz import FuzzReport, FuzzTarget, fuzz_target, fuzz_target_data
 from proptest.settings import (
     Settings,
     Phases,

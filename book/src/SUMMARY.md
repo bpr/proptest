@@ -28,6 +28,7 @@
 - [Suppress a health check](how-to/suppress-healthchecks.md)
 - [Debug a failing test](how-to/debugging.md)
 - [Test code that crashes](how-to/crashes.md)
+- [Drive a test from a fuzzer](how-to/fuzzing.md)
 - [Generate NuMojo arrays](how-to/numojo.md)
 - [Run proptest in CI](how-to/ci.md)
 

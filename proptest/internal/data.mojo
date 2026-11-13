@@ -57,6 +57,7 @@ from proptest.internal.fork import (
 )
 from proptest.internal.random import Random
 from proptest.internal.provider import Provider
+from proptest.internal.bytestring import ByteReader
 from proptest.strategies.strategy import Strategy, format_value
 
 
@@ -353,6 +354,9 @@ struct ConjectureData(Movable):
     var live_tokens: List[ArcPointer[Bool]]
     """Set to False when the test case ends; generated functions
     (`functions()`) check theirs before drawing."""
+    var byte_reader: Optional[ByteReader]
+    """With `fuzz_one_input`, the bytes new choices are read from, in place
+    of the provider."""
     var fork_log: Optional[ForkLog]
     """In a forked child (`Settings(fork=True)`), where to record the test
     case as it runs, for the parent to rebuild if the child crashes."""
@@ -405,6 +409,7 @@ struct ConjectureData(Movable):
         self.explain_note = String()
         self.shared_values = Dict[String, ErasedValue]()
         self.live_tokens = List[ArcPointer[Bool]]()
+        self.byte_reader = None
         self.fork_log = None
         # the top span (depth 0)
         self.depth = 0
@@ -434,6 +439,11 @@ struct ConjectureData(Movable):
             value = forced.value().copy()
         elif self.extend_simplest:
             value = choice_simplest(constraints)
+        elif self.byte_reader:
+            var v = self.byte_reader.value().draw(constraints)
+            if not v:
+                self.mark_overrun()
+            value = v.take()
         else:
             value = self.provider.draw(constraints)
         if value.kind == FLOAT and isnan(value.f):

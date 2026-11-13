@@ -333,6 +333,27 @@ function that should fail (a negative control: does this property, with
 these generators, find the bug?) and returns the failure report, raising if
 the test passes.
 
+### Fuzzing
+
+`fuzz_target(strategies..., test)` takes the same arguments as `given`
+and returns a target whose `fuzz_one_input(bytes)` runs the test once,
+with its inputs read from the bytes (Hypothesis's `fuzz_one_input`), so a
+byte-level fuzzer can drive it. It returns the canonical bytes for a
+passing input, `None` for an invalid one, and raises for a failure,
+after saving it to the database for `given` to replay and shrink.
+
+`target.fuzz(seconds)` fuzzes the test itself, for a time instead of a
+number of examples: it keeps a corpus of the test cases that covered
+something new (pairs of strategies, `event`s, `target` scores), mutates
+them (boundary values, splicing spans between test cases), saves the
+corpus to the database for the next run, and reports failures, shrunk,
+as `given` does.
+
+```mojo
+var target = fuzz_target(lists(integers()), prop)
+print(target.fuzz(60))   # what it did, unless it found a failure
+```
+
 ### Settings
 
 ```mojo
@@ -644,6 +665,7 @@ The engine is a port of Hypothesis's Conjecture
 | `internal/charmap.mojo` (+ generated `charmap_data.mojo`) | `charmap.py` | Unicode general categories |
 | `internal/pareto.mojo` | `pareto.py` | the Pareto front of targeted examples |
 | `internal/fork.mojo` | (none; Rust proptest's `fork`) | running test cases in child processes |
+| `internal/bytestring.mojo`, `fuzz.mojo` | `providers.py` (`BytestringProvider`), `core.py` (`fuzz_one_input`) | choices read from bytes; fuzz targets |
 | `strategies/regex.mojo` | `strategies/_internal/regex.py` | `from_regex` |
 | `strategies/types.mojo` | `strategies/_internal/types.py` | `from_type` |
 | `strategies/constraints.mojo` | — (QuickCheck's `Modifiers.hs`) | constraint types (`Positive`, `NonEmpty`, `Via`, ...) |
@@ -689,6 +711,10 @@ port next.
   stateful tests shrink further.
 - Strings are lists of codepoints inside the engine.
 - The database is a directory of text files, one choice per line.
+- `fuzz_one_input` is a method of the target `fuzz_target(...)` returns; it
+  returns bytes that replay the test case, and saves failures under the
+  test's own database key. `FuzzTarget.fuzz` is a built-in fuzz loop,
+  which Hypothesis leaves to HypoFuzz.
 
 ## Layout
 

@@ -738,6 +738,54 @@ the same table at run time from `unicodedata` and caches it on disk.
   `large_base_example` and `too_slow` are ported; `function_scoped_fixture`, `differing_executors`,
   `nested_given` and `return_value` are about pytest or Python semantics.
 
+### 3.11 `fuzz_one_input` (ported as `fuzz_target`)
+
+Hypothesis attaches `fuzz_one_input` to every `@given` test. proptest's
+`given` runs immediately, so `fuzz_target(strategies..., test)` takes the
+same arguments and returns a `FuzzTarget` with a `fuzz_one_input(bytes)`
+method. Mojo can't return a closure-typed value without naming its type,
+so the target type-erases the engine's runner (as `BoxedStrategy` does),
+and is generic over the type of the test and its strategies, which it
+owns, so that a test capturing variables by reference keeps them alive.
+The bytes are read as in Hypothesis's `BytestringProvider`
+(`internal/bytestring.mojo`): bit-exact integers with rejection,
+one-byte booleans, 65-bit floats clamped into range, and a continue byte
+before each optional element of a string or byte string; weights and
+special values are ignored. The differences:
+
+- **The return value replays.** For a passing test, Hypothesis returns
+  the test case's database encoding, which `fuzz_one_input` reads
+  differently. proptest returns the bytes that decode to the same
+  choices (its own inverse of the reader), so a fuzzer can store them in
+  its corpus.
+- **Failures are saved under the test's key, not `<key>.secondary`.**
+  Hypothesis replays its secondary corpus only when the primary one is
+  small; proptest's `given` replays the key it saves to, so a failure
+  found by fuzzing is reported by the next ordinary run. As in Hypothesis,
+  only failures simpler than the simplest seen so far for their origin
+  are saved. The two share a key only if they are given the same
+  `database_key`: the defaults are their call sites, where Hypothesis
+  uses a digest of the test function.
+- **Crashes**: with `fork=True` (3.10) each input runs in a child
+  process, so a crash raises from `fuzz_one_input` and is saved instead
+  of ending the fuzzer.
+- **A built-in fuzz loop.** `FuzzTarget.fuzz(seconds)` has no Hypothesis
+  counterpart; the nearest is HypoFuzz, a separate project, which
+  measures code coverage. Mojo has no coverage hooks a library can read,
+  so proptest's loop measures what the strategies did instead: each
+  (parent span label, span label) pair, with its count in AFL's buckets,
+  each `event`, and any improved `target` score. A valid test case that
+  adds one joins the corpus, saved under `<database_key>.fuzz`. Each
+  new test case is either generated fresh (one in ten) or a mutation of
+  a corpus entry: one to three values replaced by random or boundary
+  values (0, +-1, the bounds, powers of two near machine-type limits,
+  infinities, NaN, subnormals), and/or a span spliced from another entry
+  with the same label, deleted, duplicated, or cut off and redrawn.
+  Failures are shrunk and reported as `given` reports them. Without
+  coverage, a test that branches on values its strategies don't
+  distinguish gets no guidance unless it calls `event` or `target`.
+- No observability output.
+
 ---
 
 ## 4. What is practical to port

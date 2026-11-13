@@ -65,6 +65,34 @@ replay, then return a `RunReport` without raising for failures. `name`
 identifies the test in reports, and its `settings.database_key` should be
 set if you use the database.
 
+### `fuzz_target`
+
+```mojo-sig
+fuzz_target(s1, test, settings=Settings()) -> FuzzTarget[...]
+fuzz_target(s1, s2, test, settings=Settings()) -> FuzzTarget[...]
+...                                        # up to six strategies
+fuzz_target_data(test, settings=Settings()) -> FuzzTarget[...]
+```
+
+Makes a fuzz target from the same arguments as `given` (or
+`given_data`), without running it. `target.fuzz_one_input(bytes)` runs
+the test once, reading its choices from `bytes` (Hypothesis's
+`fuzz_one_input`). It returns the canonical bytes that replay the test
+case if the test passed, `None` if the bytes don't make a valid test case,
+and raises the test's error if it failed, after saving the example to the
+database. The target owns the test and its strategies.
+
+```mojo-sig
+target.fuzz(seconds=60, *, max_inputs=None) -> FuzzReport
+```
+
+Fuzzes the test for `seconds` (or `max_inputs` test cases), keeping a
+corpus of test cases that covered something new and mutating them. It
+raises the shrunk failures, as `given` does, if it finds any, and returns
+a `FuzzReport` (`inputs`, `valid`, `corpus`, `features`, `seconds`)
+otherwise. With a database, the corpus is saved under
+`<database_key>.fuzz`. See [Drive a test from a fuzzer](../how-to/fuzzing.md).
+
 ## Inside a test
 
 ### `assume`
