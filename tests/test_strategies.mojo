@@ -275,6 +275,27 @@ def test_binary_sizes() raises:
     assert_equal(find(binary(), nonzero), [UInt8(1)])
 
 
+def test_binary_draws_boundary_bytes() raises:
+    # Uniform bytes would almost never give four 0xFF bytes in a row
+    # (2**-32 a time); runs of one boundary byte make it likely.
+    def no_ff_run(b: List[UInt8]) raises:
+        var run = 0
+        for x in b:
+            run = run + 1 if x == 0xFF else 0
+            if run >= 4:
+                fail("four 0xFF bytes")
+
+    def run() raises:
+        given(
+            binary(),
+            no_ff_run,
+            Settings(database=None, seed=UInt64(1), max_examples=1000),
+        )
+
+    var msg = expect_failure(run)
+    assert_true("given([255, 255, 255, 255])" in msg, msg)
+
+
 def _double(x: Int) -> Int:
     return x * 2
 

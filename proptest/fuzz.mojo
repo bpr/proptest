@@ -58,6 +58,7 @@ from proptest.internal.data import (
     Result,
     Status,
 )
+from proptest.internal.provider import _boundary_byte
 from proptest.internal.datatree import DataTree
 from proptest.internal.engine import ConjectureRunner, RunReport
 from proptest.internal.floats import (
@@ -243,8 +244,12 @@ def _boundary(mut rnd: Random, c: Constraints, v: ChoiceValue) -> ChoiceValue:
         out = ChoiceValue(boolean=v.i == 0)
     else:
         var seq = List[UInt32]()
-        var k = rnd.below(3)
-        if k == 1:
+        var k = rnd.below(4) if c.kind == BYTES else rnd.below(3)
+        if k == 3 and len(v.seq) > 0:
+            # one byte set to a boundary byte
+            seq = v.seq.copy()
+            seq[Int(rnd.below(UInt64(len(seq))))] = _boundary_byte(rnd.below(6))
+        elif k == 1:
             # repeat it
             for _ in range(2):
                 for x in v.seq:

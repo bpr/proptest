@@ -112,7 +112,9 @@ raise `InvalidArgument`.
 binary(*, min_size: Int = 0, max_size: Optional[Int] = None) raises -> Binary
 ```
 
-Byte strings (`List[UInt8]`).
+Byte strings (`List[UInt8]`). A byte is one of 0x00, 0x01, 0x7F, 0x80,
+0xFE and 0xFF more often than other values, and some byte strings are one
+of those repeated, since byte-handling code tends to break at them.
 
 ## Collections
 

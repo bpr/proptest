@@ -388,9 +388,25 @@ it as a flaky *test*.
   front hundreds of members long and each shrink costs hundreds of calls;
   Hypothesis bounds this indirectly through its target-phase budget,
   which proptest structures differently.
-- **No integer `weights`.** Hypothesis's integer choices can carry explicit
-  probabilities for particular values; nothing in proptest's strategies
-  needs them yet.
+- **Byte strings favor boundary bytes.** Hypothesis draws each byte of
+  a byte string uniformly (its only bias is toward constants scraped
+  from the test's module, which proptest has no way to collect). proptest
+  makes each byte one of 0x00, 0x01, 0x7F, 0x80, 0xFE and 0xFF with
+  probability 1/8, and 5% of byte strings one of them repeated, as
+  byte-level fuzzers do: parsers and codecs break at those values (sign
+  bits, terminators, all-ones fields), which uniform bytes hit once in
+  256 draws each. Shrinking is unaffected; the fuzz loop
+  (`FuzzTarget.fuzz`) also mutates single bytes to these values.
+- **Integer `weights` are a full distribution.** Hypothesis's integer
+  choices take `weights`, a mapping from some values to probabilities
+  summing to less than 1, with the rest of the probability spread over
+  the whole range. proptest's are a list of probabilities for
+  `min_value`, `min_value + 1`, ..., `max_value`, summing to 1, which is
+  all its users need: `one_of(..., weights=)`, `sampled_from(...,
+  weights=)` and the command choice of `commands()` each pick an index in
+  a small range. As in Hypothesis, weights only change how values are
+  generated: the simplicity order and the shrinker ignore them, and so
+  does the byte reader of `fuzz_one_input` (3.11).
 
 ### 2.6 Strings are codepoint lists inside the engine
 

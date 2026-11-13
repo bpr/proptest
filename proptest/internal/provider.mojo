@@ -343,6 +343,16 @@ def average_size(min_size: Int, max_size: Int) -> Float64:
 # ===----------------------------------------------------------------------=== #
 
 
+def _boundary_byte(i: UInt64) -> UInt32:
+    """The `i`th of 0x00, 0x01, 0x7F, 0x80, 0xFE, 0xFF: the bytes at the
+    edges of signed and unsigned bytes, where byte-handling bugs hide."""
+    if i < 2:
+        return UInt32(i)
+    if i < 4:
+        return UInt32(0x7F + i - 2)
+    return UInt32(0xFE + i - 4)
+
+
 struct Provider(Movable):
     """Draws random choices (port of `HypothesisProvider`)."""
 
@@ -514,8 +524,20 @@ struct Provider(Movable):
         return out^
 
     def draw_bytes(mut self, c: Constraints) -> List[UInt32]:
+        """Random bytes, with boundary bytes (0x00, 0x01, 0x7F, 0x80, 0xFE,
+        0xFF) mixed in: each byte is one with probability 1/8, and 5% of
+        byte strings are one of them repeated. Hypothesis draws bytes
+        uniformly."""
         var size = self._draw_size(c.min_size, c.max_size)
         var out = List[UInt32](capacity=size)
+        if self.random.random() < 0.05:
+            var b = _boundary_byte(self.random.below(6))
+            for _ in range(size):
+                out.append(b)
+            return out^
         for _ in range(size):
-            out.append(UInt32(self.random.below(256)))
+            if self.random.below(8) == 0:
+                out.append(_boundary_byte(self.random.below(6)))
+            else:
+                out.append(UInt32(self.random.below(256)))
         return out^
