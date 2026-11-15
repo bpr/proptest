@@ -331,6 +331,23 @@ tabulate(strategy: S, table: String, key: def(S.Value) raises -> String) -> Tabu
 Values from `strategy`, recording `key(value)` in the statistics table
 `table` (QuickCheck's `tabulate`).
 
+## Fuzzing
+
+### `traced`
+
+```mojo-sig
+traced(strategy: S) -> TracedStrategy[S]
+```
+
+Values from `strategy` (integers of any width, or `String`) wrapped in a
+`Traced[T]`, which compares, hashes and prints like its `.value` but
+records every comparison it takes part in (`==`, `!=`, `<`, `<=`, `>`,
+`>=`, and for strings `startswith`, `endswith` and `in`). `Int(x)`
+works for integers and `x.byte_length()` for strings. `Traced[T]`
+conforms to `Comparable` and `Hashable`, so generic code accepts it.
+`Traced(value, data.comparisons)` wraps a value computed in a test. See
+[Get past magic values](../how-to/fuzzing.md#get-past-magic-values).
+
 ## Types
 
 ### `from_type`

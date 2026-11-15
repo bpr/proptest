@@ -159,6 +159,10 @@ corpus entries: changing a few values, to random values or to boundary
 values (0, -1, the bounds of the range, powers of two near the limits of
 machine integers, infinities, NaN), and copying a strategy's choices from
 one test case into another, or deleting, duplicating or cutting them off.
+It keeps only the simplest test case for each thing covered, and mutates
+the entries that cover rarely seen things most often, so a test whose
+common paths produce many variants doesn't bury the few that got
+further.
 
 proptest can't see which lines of the test ran, so "something new" means
 something the strategies or the test reported: a strategy drawing from
@@ -205,7 +209,7 @@ def main() raises:
 Falsifying example (unlock.mojo:14:34):
     Draw 1: [1, 2, 3, 4, 5]
 At unlock.mojo:12:13: AssertionError: unlocked
-10000 inputs; corpus of 9
+10000 inputs; corpus of 11
 ```
 
 When it finds no failure, `fuzz` returns a `FuzzReport` of what it did,
@@ -213,6 +217,59 @@ which prints as `N inputs (V valid) in Ts; corpus of C covering F
 features`. With a database, the corpus is saved under
 `<database_key>.fuzz`, and the next run starts from it, and failures are
 saved under the test's key, as `given` saves them.
+
+## Get past magic values
+
+Some checks are all but impossible to pass by chance: `x == 20261114`
+holds for one integer in 2<sup>64</sup>. Fuzzers get past them by
+watching the program's comparisons and trying the values it compares
+with. proptest can't see your code's comparisons, but a `Traced` value
+can: draw it with `traced(...)` and it records every comparison it takes
+part in. `fuzz` then tries setting the choice that produced the value
+to what it was compared with (and, for integers, one either side of it;
+for strings, also the current string with it added at the front or the
+back). It also counts getting closer than before at a comparison as
+covering something new, which helps when the compared value is
+computed from several draws:
+
+```mojo
+from proptest import fuzz_target, traced, integers, text, fail
+from proptest import Settings, Traced
+
+
+def main() raises:
+    def check(code: Traced[Int], cmd: Traced[String]) raises:
+        if code == 20261114 and cmd.startswith("UNLOCK"):
+            fail("unlocked")
+
+    var target = fuzz_target(
+        traced(integers()),
+        traced(text()),
+        check,
+        Settings(database=None, seed=UInt64(1)),
+    )
+    try:
+        _ = target.fuzz(10)
+    except e:
+        print(e)
+```
+
+```text
+Falsifying example (magic.mojo:10:29):
+    given(20261114, 'UNLOCK')
+At magic.mojo:8:17: AssertionError: unlocked
+```
+
+It takes about a hundred inputs; without `traced`, `fuzz` doesn't find
+it at all. `Traced[T]` works for integers of any width and `String`,
+and conforms to `Comparable` and `Hashable`, so you can pass it to
+generic code, whose comparisons are recorded too. To trace a value
+computed in the test, wrap it yourself: `Traced(x + y,
+data.comparisons)` in a test that draws its own data. Arithmetic on a
+`Traced` value gives a plain one, whose comparisons aren't recorded.
+
+The values compared with also join the "nasty" constants that `given`
+and `fuzz` occasionally generate, so `given` tries them too.
 
 ## Crashes
 

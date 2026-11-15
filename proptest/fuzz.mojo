@@ -133,7 +133,8 @@ def _bucket(n: Int) -> UInt64:
 def _features(r: ConjectureResult) -> List[UInt64]:
     """What a test case covers, in place of code coverage: each pair of a
     strategy and the strategy that drew it (by span label), with how often
-    it occurred (bucketed), and each event."""
+    it occurred (bucketed), each event, and how close each comparison
+    made with a `Traced` value came to equality."""
     var counts = Dict[UInt64, Int]()
     for s in r.spans:
         var parent = r.spans[s.parent].label if s.parent >= 0 else UInt64(0)
@@ -144,39 +145,191 @@ def _features(r: ConjectureResult) -> List[UInt64]:
         out.append(_mix(item.key, _bucket(item.value)))
     for e in r.events:
         out.append(_mix(0x6576656E74, UInt64(hash(e))))
+    # the closest each comparison site came to equality (libFuzzer's value
+    # profile), so the corpus keeps each step toward a match
+    var closest = Dict[UInt64, Int]()
+    for c in r.comparisons:
+        if c.closeness > closest.get(c.site, -1):
+            closest[c.site] = c.closeness
+    for item in closest.items():
+        out.append(_mix(_mix(0x636D70, item.key), UInt64(item.value)))
     return out^
 
 
-struct _Corpus(Movable):
-    """The valid test cases that covered something new."""
+struct _Entry(Copyable):
+    """A corpus entry, with its features and how many of them (and of the
+    `target` labels) it is the entry to keep for."""
 
-    var entries: List[Result]
-    var seen: Set[UInt64]
+    var result: Result
+    var features: List[UInt64]
+    var owns: Int
+
+    def __init__(out self, result: Result, var features: List[UInt64]):
+        self.result = result
+        self.features = features^
+        self.owns = 0
+
+
+comptime _REWEIGH_EVERY = 256
+"""Parent weights are recomputed after this many picks (feature
+frequencies change with every test case), or when the corpus changes."""
+
+
+struct _Corpus(Movable):
+    """The valid test cases worth mutating: for each feature, the simplest
+    test case that covered it, and for each `target` label, the test case
+    with the best score.
+
+    As in libFuzzer, a test case that covers only features already seen
+    still joins the corpus if it is simpler than the entry kept for one
+    of them, and an entry is dropped once it is kept for nothing. Parents
+    are picked by the rarity of their features (libFuzzer's Entropic,
+    simplified): an entry's weight is the sum over its features of
+    1 / (the number of test cases that covered the feature), so entries
+    that reach rarely covered features are mutated more often.
+    """
+
+    var entries: List[_Entry]
+    var owner: Dict[UInt64, Int]
+    """The entry kept for each feature (an index into `entries`)."""
+    var freq: Dict[UInt64, Int]
+    """How many valid test cases covered each feature."""
     var best: Dict[String, Float64]
     """The best score seen for each `target` label."""
+    var best_owner: Dict[String, Int]
+    var dropped: List[Result]
+    """Entries dropped since the caller last cleared this (to delete from
+    the database)."""
+    var _cumulative: List[Float64]
+    var _picks: Int
 
     def __init__(out self):
-        self.entries = List[Result]()
-        self.seen = Set[UInt64]()
+        self.entries = List[_Entry]()
+        self.owner = Dict[UInt64, Int]()
+        self.freq = Dict[UInt64, Int]()
         self.best = Dict[String, Float64]()
+        self.best_owner = Dict[String, Int]()
+        self.dropped = List[Result]()
+        self._cumulative = List[Float64]()
+        self._picks = 0
 
     def add(mut self, r: Result) -> Bool:
-        """Keep `r` if it covers a new feature or improves a target score."""
+        """Count `r`'s features, and keep `r` if it covers a new feature,
+        is simpler than the entry kept for one, or improves a target
+        score."""
         if r[].status != Status.VALID:
             return False
-        var novel = False
+        var features = List[UInt64]()
+        var unique = Set[UInt64]()
         for f in _features(r[]):
-            if f not in self.seen:
-                self.seen.add(f)
-                novel = True
+            if f not in unique:
+                unique.add(f)
+                features.append(f)
+        var claims = List[UInt64]()
+        for f in features:
+            self.freq[f] = self.freq.get(f, 0) + 1
+            var o = self.owner.get(f)
+            if not o or sort_key_less(
+                r[].nodes, self.entries[o.value()].result[].nodes
+            ):
+                claims.append(f)
+        var labels = List[String]()
         for item in r[].target_observations.items():
             var best = self.best.get(item.key)
             if not best or item.value > best.value():
                 self.best[item.key] = item.value
-                novel = True
-        if novel:
-            self.entries.append(r)
-        return novel
+                labels.append(item.key)
+        if len(claims) == 0 and len(labels) == 0:
+            return False
+        var idx = len(self.entries)
+        self.entries.append(_Entry(r, features^))
+        var losers = List[Int]()
+        for f in claims:
+            var o = self.owner.get(f)
+            if o:
+                self.entries[o.value()].owns -= 1
+                losers.append(o.value())
+            self.owner[f] = idx
+            self.entries[idx].owns += 1
+        for label in labels:
+            var o = self.best_owner.get(label)
+            if o:
+                self.entries[o.value()].owns -= 1
+                losers.append(o.value())
+            self.best_owner[label] = idx
+            self.entries[idx].owns += 1
+        # drop the entries now kept for nothing, highest index first, so
+        # that each removal moves only entries not yet looked at
+        sort(losers)
+        var i = len(losers) - 1
+        while i >= 0:
+            var k = losers[i]
+            if (i == 0 or losers[i - 1] != k) and self.entries[k].owns == 0:
+                self._remove(k)
+            i -= 1
+        self._cumulative.clear()
+        return True
+
+    def _remove(mut self, k: Int):
+        """Drop entry `k`, moving the last entry into its place."""
+        self.dropped.append(self.entries[k].result)
+        var last = len(self.entries) - 1
+        if k != last:
+            self.entries[k] = self.entries[last].copy()
+            for f in self.entries[k].features:
+                if self.owner.get(f, -1) == last:
+                    self.owner[f] = k
+            var moved = List[String]()
+            for item in self.best_owner.items():
+                if item.value == last:
+                    moved.append(item.key)
+            for label in moved:
+                self.best_owner[label] = k
+        _ = self.entries.pop()
+
+    def pick(mut self, mut rnd: Random) -> Int:
+        """The index of a parent to mutate, by the rarity of its
+        features."""
+        self._picks += 1
+        if (
+            len(self._cumulative) != len(self.entries)
+            or self._picks >= _REWEIGH_EVERY
+        ):
+            self._reweigh()
+        var total = self._cumulative[len(self._cumulative) - 1]
+        var x = rnd.random() * total
+        var lo = 0
+        var hi = len(self._cumulative) - 1
+        while lo < hi:
+            var mid = (lo + hi) // 2
+            if self._cumulative[mid] > x:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+    def _reweigh(mut self):
+        self._picks = 0
+        self._cumulative.clear()
+        var weights = List[Float64](capacity=len(self.entries))
+        var sum = 0.0
+        for e in self.entries:
+            var w = 0.0
+            for f in e.features:
+                w += 1.0 / Float64(self.freq.get(f, 1))
+            weights.append(w)
+            sum += w
+        # an entry kept for a target score gets an average entry's weight
+        # per label, so hill climbing goes on as coverage grows
+        var mean = sum / Float64(max(len(self.entries), 1))
+        if mean <= 0:
+            mean = 1.0
+        for item in self.best_owner.items():
+            weights[item.value] += mean
+        var acc = 0.0
+        for w in weights:
+            acc += max(w, mean * 1e-3)
+            self._cumulative.append(acc)
 
 
 def _boundary(mut rnd: Random, c: Constraints, v: ChoiceValue) -> ChoiceValue:
@@ -266,6 +419,50 @@ def _boundary(mut rnd: Random, c: Constraints, v: ChoiceValue) -> ChoiceValue:
     return out^
 
 
+def _input_to_state(
+    mut rnd: Random, p: ConjectureResult
+) -> Optional[List[ChoiceValue]]:
+    """Redqueen's input-to-state replacement: pick a comparison the test
+    made with a `Traced` value, and set a choice equal to that value to
+    what it was compared with (one either side of it, for integers, to
+    get past `<` and `>`; for strings, maybe prefixed or suffixed to the
+    current value instead, for `startswith`, `endswith` and `in`). None if
+    no choice holds the value (it was computed from the choices, not drawn
+    as is)."""
+    ref c = p.comparisons[Int(rnd.below(UInt64(len(p.comparisons))))]
+    var matches = List[Int]()
+    for k in range(len(p.nodes)):
+        ref n = p.nodes[k]
+        if not n.was_forced and n.value == c.lhs:
+            matches.append(k)
+    if len(matches) == 0:
+        return None
+    var k = matches[Int(rnd.below(UInt64(len(matches))))]
+    ref node = p.nodes[k]
+    var v: ChoiceValue
+    if c.rhs.kind == INTEGER:
+        var d = Int128(Int(rnd.below(3))) - 1 if rnd.below(2) == 0 else Int128(
+            0
+        )
+        v = ChoiceValue(integer=c.rhs.i + d)
+    else:
+        var seq = List[UInt32]()
+        var how = rnd.below(4)
+        if how == 2:
+            seq = c.rhs.seq.copy()
+            seq.extend(node.value.seq.copy())
+        else:
+            if how == 3:
+                seq = node.value.seq.copy()
+            seq.extend(c.rhs.seq.copy())
+        v = ChoiceValue(string=seq^)
+    if not choice_permitted(v, node.constraints):
+        return None
+    var choices = p.choices()
+    choices[k] = v^
+    return choices^
+
+
 def _mutate[
     F: def(mut ConjectureData) raises
 ](mut runner: ConjectureRunner[F], corpus: _Corpus, parent: Result) -> List[
@@ -276,6 +473,10 @@ def _mutate[
     entry, deleted, duplicated, or cut off (the rest is then drawn at
     random)."""
     ref p = parent[]
+    if len(p.comparisons) > 0 and runner.random.below(3) == 0:
+        var replaced = _input_to_state(runner.random, p)
+        if replaced:
+            return replaced.take()
     var choices = p.choices()
     var free = List[Int]()
     for k in range(len(p.nodes)):
@@ -308,7 +509,7 @@ def _mutate[
         # splice in a span with the same label from another entry
         ref other = corpus.entries[
             Int(runner.random.below(UInt64(len(corpus.entries))))
-        ][]
+        ].result[]
         var matches = List[Int]()
         for i in range(len(other.spans)):
             if other.spans[i].label == s.label:
@@ -413,6 +614,9 @@ def _fuzz_loop[
         for choices in runner.db.value().fetch(key):
             if not corpus.add(runner.cached_test_function(choices)):
                 runner.db.value().delete(key, choices)
+            for r in corpus.dropped:
+                runner.db.value().delete(key, r[].choices())
+            corpus.dropped.clear()
     var verbose = runner.settings.verbosity >= Verbosity.verbose
     while _keep_looking(runner):
         if runner.call_count - calls0 >= max_inputs:
@@ -429,7 +633,7 @@ def _fuzz_loop[
                     " inputs, corpus of ",
                     len(corpus.entries),
                     ", ",
-                    len(corpus.seen),
+                    len(corpus.freq),
                     " features",
                 )
             )
@@ -444,18 +648,19 @@ def _fuzz_loop[
             var data = runner.new_data(prefix^)
             result = runner.test_function(data)
         else:
-            var parent = corpus.entries[
-                Int(runner.random.below(UInt64(len(corpus.entries))))
-            ]
+            var parent = corpus.entries[corpus.pick(runner.random)].result
             var attempt = _mutate(runner, corpus, parent)
             result = runner.cached_test_function(attempt, extend=-1)
         if corpus.add(result) and use_db:
             runner.db.value().save(key, result[].choices())
+            for r in corpus.dropped:
+                runner.db.value().delete(key, r[].choices())
+        corpus.dropped.clear()
     var report = FuzzReport()
     report.inputs = runner.call_count - calls0
     report.valid = runner.valid_count - valid0
     report.corpus = len(corpus.entries)
-    report.features = len(corpus.seen)
+    report.features = len(corpus.freq)
     report.seconds = Float64(perf_counter_ns() - start) / 1e9
     if verbose:
         print(String("proptest: fuzzed ", report))
@@ -557,6 +762,16 @@ struct FuzzTarget[P: Movable & Deinitable](Movable):
         coverage, so a test case's coverage is what its strategies did:
         each pair of strategies (one drawing from the other), with roughly
         how often, and each `event`. Improving a `target` score counts too.
+
+        The corpus keeps, for each feature, the simplest test case that
+        covered it (and for each `target` label, the best scorer), and
+        picks entries to mutate by the rarity of their features, so the
+        test cases that reach rarely covered code get most of the work.
+
+        Values drawn with `traced(...)` record what they're compared
+        with: the loop tries setting a choice to the value its traced
+        value was compared with, and counts getting closer than before at
+        a comparison as a new feature.
 
         With a database, failures go to the test's `database_key` and the
         corpus to `<database_key>.fuzz`, so the next run starts where this

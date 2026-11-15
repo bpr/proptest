@@ -130,6 +130,7 @@ from proptest.strategies.core import (
     Recursive,
 )
 from proptest.strategies.regex import from_regex, Regex
+from proptest.strategies.traced import Traced, TracedStrategy, traced
 from proptest.strategies.types import (
     from_type,
     FromType,

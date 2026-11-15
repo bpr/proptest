@@ -14,6 +14,8 @@ infinities and NaN, and integers follow a heavy-tailed distribution that
 is uniform on [-256, 256] and log-Student-t outside it.
 """
 
+from std.collections import Set
+from std.hash import hash
 from std.memory import ArcPointer
 from std.math import (
     sqrt,
@@ -175,8 +177,11 @@ struct Constants(Movable):
     var integers: List[Int128]
     var floats: List[Float64]
     var strings: List[List[UInt32]]
+    var learned: Set[UInt64]
+    """Hashes of the values added by `learn`."""
 
     def __init__(out self):
+        self.learned = Set[UInt64]()
         var base = List[Int128]()
         for n in range(16, 66):
             base.append(Int128(1) << Int128(n))
@@ -294,6 +299,28 @@ struct Constants(Movable):
         self.strings = List[List[UInt32]]()
         for s in strs:
             self.strings.append(string_to_codepoints(s))
+
+    def learn(mut self, v: ChoiceValue):
+        """Add an integer or string that the test compared a value with
+        (see `internal/comparisons.mojo`), up to `MAX_LEARNED` of them:
+        the runtime counterpart of the constants Hypothesis collects from
+        the test's source."""
+        if len(self.learned) >= MAX_LEARNED or (
+            v.kind != INTEGER and v.kind != STRING
+        ):
+            return
+        var h = UInt64(hash(v))
+        if h in self.learned:
+            return
+        self.learned.add(h)
+        if v.kind == INTEGER:
+            self.integers.append(v.i)
+        else:
+            self.strings.append(v.seq.copy())
+
+
+comptime MAX_LEARNED = 256
+"""The most constants `Constants.learn` adds."""
 
 
 # ===----------------------------------------------------------------------=== #

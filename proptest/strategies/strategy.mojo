@@ -59,10 +59,17 @@ trait Strategy(Deinitable, Movable):
         return calc_label_from_name(reflect[Self].name())
 
 
+trait QuotedInReports(Writable):
+    """Types whose values failure reports write with `write_repr_to`, as
+    they write strings (e.g. `Traced[String]`)."""
+
+    pass
+
+
 def format_value[T: Writable](value: T) -> String:
     """How values appear in failure reports: as written by `write_to`,
     except that strings are quoted (like Python's `repr`)."""
-    comptime if T == String:
+    comptime if T == String or conforms_to(T, QuotedInReports):
         return repr(value)
     return String(value)
 

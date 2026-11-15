@@ -791,7 +791,14 @@ special values are ignored. The differences:
   so proptest's loop measures what the strategies did instead: each
   (parent span label, span label) pair, with its count in AFL's buckets,
   each `event`, and any improved `target` score. A valid test case that
-  adds one joins the corpus, saved under `<database_key>.fuzz`. Each
+  adds one, or is simpler (`sort_key_less`) than the entry kept for one,
+  joins the corpus, saved under `<database_key>.fuzz`; an entry kept for
+  no feature or `target` label any more is dropped (libFuzzer's input
+  reduction). Parents are picked with weight sum(1 / count) over their
+  features, the count being how many valid test cases covered the
+  feature (a simplified form of libFuzzer's Entropic schedule); an
+  entry holding a best `target` score gets an average entry's weight
+  more per label. Each
   new test case is either generated fresh (one in ten) or a mutation of
   a corpus entry: one to three values replaced by random or boundary
   values (0, +-1, the bounds, powers of two near machine-type limits,
@@ -799,7 +806,20 @@ special values are ignored. The differences:
   with the same label, deleted, duplicated, or cut off and redrawn.
   Failures are shrunk and reported as `given` reports them. Without
   coverage, a test that branches on values its strategies don't
-  distinguish gets no guidance unless it calls `event` or `target`.
+  distinguish gets no guidance unless it calls `event` or `target`, or
+  uses `traced` values.
+- **`traced` comparison feedback** (no Hypothesis counterpart). A
+  `Traced[T]` (integers or `String`) records the comparisons it takes
+  part in, standing in for the comparison instrumentation of AFL++
+  (CmpLog) and libFuzzer (`-use_cmp`, `-use_value_profile`), which Mojo
+  doesn't offer a library. The fuzz loop uses them for Redqueen's
+  input-to-state replacement (a choice equal to the traced value is set
+  to the value it was compared with, +-1, or for strings with it
+  prefixed or appended) and as features (the closest each comparison
+  site came to equality, by bit length of the difference or length of
+  the common prefix). The engine adds the compared-with values (up to
+  256) to the constants pool, the runtime counterpart of the constants
+  Hypothesis collects from the test's source.
 - No observability output.
 
 ---

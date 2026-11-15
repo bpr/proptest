@@ -86,6 +86,26 @@ comptime NARROW_DTYPES: List[String] = [
 ]
 comptime NARROW_BITS: List[Int] = [8, 8, 16, 16, 32, 32, 64]
 comptime N_NARROW = 7
+comptime VEC_DTYPES: List[String] = [
+    "int32",
+    "uint16",
+    "int16",
+    "uint32",
+    "uint8",
+    "int64",
+]
+"""The lane type of each vector type `Vk` (the type of `sk`)."""
+comptime VEC_SCALARS: List[String] = [
+    "Int32",
+    "UInt16",
+    "Int16",
+    "UInt32",
+    "UInt8",
+    "Int64",
+]
+comptime VEC_LANES: List[Int] = [4, 4, 8, 8, 16, 2]
+comptime VEC_BITS: List[Int] = [32, 16, 16, 32, 8, 64]
+comptime N_VEC = 6
 
 
 struct ProgramGenerator(Movable):
@@ -142,7 +162,7 @@ struct ProgramGenerator(Movable):
     def int_expr(
         mut self, mut data: ConjectureData, depth: Int
     ) raises -> String:
-        var choice = data.draw(integers(0, 14 if depth < 3 else 1))
+        var choice = data.draw(integers(0, 16 if depth < 3 else 1))
         if choice == 0:
             return self.atom(data)
         if choice == 1:
@@ -241,6 +261,35 @@ struct ProgramGenerator(Movable):
         if choice == 13:
             var k = data.draw(integers(0, N_NARROW - 1))
             return String("Int(", self.narrow_expr(data, k, depth + 1), ")")
+        if choice == 15:
+            # a lane
+            var k = data.draw(integers(0, N_VEC - 1))
+            return String(
+                "Int(",
+                self.vec_expr(data, k, depth + 1),
+                "[",
+                self.int_expr(data, depth + 1),
+                " & ",
+                materialize[VEC_LANES]()[k] - 1,
+                "])",
+            )
+        if choice == 16:
+            var k = data.draw(integers(0, N_VEC - 1))
+            var x = self.vec_expr(data, k, depth + 1)
+            if data.draw(integers(0, 6)) == 0:
+                return String(x, ".reduce_bit_count()")
+            var f = Self.pick(
+                data,
+                [
+                    "reduce_add",
+                    "reduce_mul",
+                    "reduce_max",
+                    "reduce_min",
+                    "reduce_and",
+                    "reduce_or",
+                ],
+            )
+            return String("Int(", x, ".", f, "())")
         # a call to an earlier function, at most twice per function and
         # never inside a loop, so run time stays linear
         if self.function_index > 0 and self.loop_depth == 0 and self.calls < 2:
@@ -350,6 +399,217 @@ struct ProgramGenerator(Movable):
             return String("(", op, self.narrow_expr(data, k, d), ")")
         return String("n", k)
 
+    # ---- SIMD vector expressions
+
+    def vec_expr(
+        mut self, mut data: ConjectureData, k: Int, depth: Int
+    ) raises -> String:
+        """An expression of type `Vk`, a SIMD vector type (that of `sk`)."""
+        var v = String("V", k)
+        var t = materialize[VEC_SCALARS]()[k]
+        var n = materialize[VEC_LANES]()[k]
+        var bits = materialize[VEC_BITS]()[k]
+        var choice = data.draw(integers(0, 19 if depth < 3 else 1))
+        var d = depth + 1
+        if choice == 0:
+            return String("s", k)
+        if choice == 1:
+            # a splat, truncating
+            return String(v, "(", self.int_expr(data, 3), ")")
+        if choice == 2:
+            var lanes = String(v, "(")
+            for i in range(n):
+                if i > 0:
+                    lanes += ", "
+                lanes += String(t, "(", self.int_expr(data, 3), ")")
+            return lanes + ")"
+        if choice == 3:
+            var op = Self.pick(data, ["+", "-", "*", "&", "|", "^"])
+            return String(
+                "(",
+                self.vec_expr(data, k, d),
+                " ",
+                op,
+                " ",
+                self.vec_expr(data, k, d),
+                ")",
+            )
+        if choice == 4:
+            var f = "_vdiv" if data.draw(booleans()) else "_vmod"
+            return String(
+                f,
+                "(",
+                self.vec_expr(data, k, d),
+                ", ",
+                self.vec_expr(data, k, d),
+                ")",
+            )
+        if choice == 5:
+            # shifts of at least the width are undefined
+            var op = "<<" if data.draw(booleans()) else ">>"
+            return String(
+                "(",
+                self.vec_expr(data, k, d),
+                " ",
+                op,
+                " (",
+                self.vec_expr(data, k, d),
+                " & ",
+                v,
+                "(",
+                bits - 1,
+                ")))",
+            )
+        if choice == 6:
+            return String(
+                "(",
+                self.vec_expr(data, k, d),
+                " if ",
+                self.condition(data, d),
+                " else ",
+                self.vec_expr(data, k, d),
+                ")",
+            )
+        if choice == 7:
+            var f = "min" if data.draw(booleans()) else "max"
+            return String(
+                f,
+                "(",
+                self.vec_expr(data, k, d),
+                ", ",
+                self.vec_expr(data, k, d),
+                ")",
+            )
+        if choice == 8:
+            var cmp = Self.pick(data, ["eq", "ne", "lt", "le", "gt", "ge"])
+            return String(
+                self.vec_expr(data, k, d),
+                ".",
+                cmp,
+                "(",
+                self.vec_expr(data, k, d),
+                ").select(",
+                self.vec_expr(data, k, d),
+                ", ",
+                self.vec_expr(data, k, d),
+                ")",
+            )
+        if choice == 9:
+            # a shuffle of one vector or two
+            var two = data.draw(booleans())
+            var top = 2 * n - 1 if two else n - 1
+            var mask = String()
+            for i in range(n):
+                if i > 0:
+                    mask += ", "
+                mask += String(data.draw(integers(0, top)))
+            var x = self.vec_expr(data, k, d)
+            if two:
+                return String(
+                    x, ".shuffle[", mask, "](", self.vec_expr(data, k, d), ")"
+                )
+            return String(x, ".shuffle[", mask, "]()")
+        if choice == 10:
+            return String(self.vec_expr(data, k, d), ".reversed()")
+        if choice == 11:
+            # lane rotations and shifts (LLVM intrinsics at run time)
+            var kind = data.draw(integers(0, 3))
+            var x = self.vec_expr(data, k, d)
+            if kind < 2:
+                # rotate_left takes -n <= s < n, rotate_right -n < s <= n
+                var f = "_rotl" if kind == 0 else "_rotr"
+                return String(
+                    f, "[", data.draw(integers(-n, n - 1)) + kind, "](", x, ")"
+                )
+            var f = "_lshift" if kind == 2 else "_rshift"
+            return String(f, "[", data.draw(integers(0, n)), "](", x, ")")
+        if choice == 12:
+            # a lane conversion from a vector with as many lanes
+            var lanes = materialize[VEC_LANES]()
+            var same = List[Int]()
+            for j in range(N_VEC):
+                if lanes[j] == n:
+                    same.append(j)
+            var j = same[data.draw(integers(0, len(same) - 1))]
+            return String(
+                self.vec_expr(data, j, d),
+                ".cast[DType.",
+                materialize[VEC_DTYPES]()[k],
+                "]()",
+            )
+        if choice == 13 or choice == 14:
+            var f = ".join(" if choice == 13 else ".interleave("
+            return String(
+                self.vec_expr(data, k, d),
+                f,
+                self.vec_expr(data, k, d),
+                ").slice[",
+                n,
+                ", offset=",
+                data.draw(integers(0, n)),
+                "]()",
+            )
+        if choice == 15:
+            # insert a slice of width m at a multiple of m
+            var m = 1
+            var limit = data.draw(integers(0, 4))
+            while m * 2 <= n and limit > 0:
+                m *= 2
+                limit -= 1
+            var offset = m * data.draw(integers(0, n // m - 1))
+            return String(
+                "_vinsert[",
+                offset,
+                "](",
+                self.vec_expr(data, k, d),
+                ", ",
+                self.vec_expr(data, k, d),
+                ".slice[",
+                m,
+                ", offset=",
+                data.draw(integers(0, n - m)),
+                "]())",
+            )
+        if choice == 16:
+            return String(
+                "_vdeint[",
+                data.draw(integers(0, 1)),
+                "](",
+                self.vec_expr(data, k, d),
+                ", ",
+                self.vec_expr(data, k, d),
+                ")",
+            )
+        if choice == 17:
+            return String(
+                self.vec_expr(data, k, d),
+                ".fma(",
+                self.vec_expr(data, k, d),
+                ", ",
+                self.vec_expr(data, k, d),
+                ")",
+            )
+        if choice == 18:
+            var op = Self.pick(data, ["-", "~", "abs"])
+            if op == "abs":
+                return String("abs(", self.vec_expr(data, k, d), ")")
+            return String("(", op, self.vec_expr(data, k, d), ")")
+        if choice == 19:
+            return String(
+                "_vset(",
+                self.vec_expr(data, k, d),
+                ", ",
+                self.int_expr(data, d),
+                " & ",
+                n - 1,
+                ", ",
+                t,
+                "(",
+                self.int_expr(data, d),
+                "))",
+            )
+        return String("s", k)
+
     # ---- Optional[NodePtr] expressions
 
     @staticmethod
@@ -388,7 +648,7 @@ struct ProgramGenerator(Movable):
     def condition(
         mut self, mut data: ConjectureData, depth: Int
     ) raises -> String:
-        var choice = data.draw(integers(0, 11 if depth < 3 else 0))
+        var choice = data.draw(integers(0, 12 if depth < 3 else 0))
         var d = depth + 1
         if choice == 0:
             var op = Self.pick(data, ["<", "==", "!=", ">="])
@@ -463,6 +723,15 @@ struct ProgramGenerator(Movable):
                 self.narrow_expr(data, k, d),
                 ")",
             )
+        if choice == 12:
+            var k = data.draw(integers(0, N_VEC - 1))
+            var x = self.vec_expr(data, k, d)
+            var y = self.vec_expr(data, k, d)
+            if data.draw(booleans()):
+                return String("(", x, " == ", y, ")")
+            var cmp = Self.pick(data, ["eq", "ne", "lt", "le", "gt", "ge"])
+            var f = "reduce_or" if data.draw(booleans()) else "reduce_and"
+            return String(x, ".", cmp, "(", y, ").", f, "()")
         # x != y for Optional pointers, spelled out as in
         # https://github.com/modular/modular/issues/7534
         var x = self.cursor_expr(data, d)
@@ -507,7 +776,7 @@ struct ProgramGenerator(Movable):
     def statement(
         mut self, mut data: ConjectureData, indent: String, depth: Int
     ) raises -> String:
-        var choice = data.draw(integers(0, 24))
+        var choice = data.draw(integers(0, 26))
         var inner = indent + "    "
         if choice == 0:
             return String(
@@ -830,6 +1099,29 @@ struct ProgramGenerator(Movable):
                     "))",
                 )
             return String(indent, "n", k, " ", op, " ", e, "\n")
+        if choice == 25:
+            var k = data.draw(integers(0, N_VEC - 1))
+            var op = Self.pick(data, ["=", "+=", "-=", "*=", "^=", "&=", "|="])
+            return String(
+                indent, "s", k, " ", op, " ", self.vec_expr(data, k, 0), "\n"
+            )
+        if choice == 26:
+            # a lane store
+            var k = data.draw(integers(0, N_VEC - 1))
+            return String(
+                indent,
+                "s",
+                k,
+                "[",
+                self.int_expr(data, 1),
+                " & ",
+                materialize[VEC_LANES]()[k] - 1,
+                "] = ",
+                materialize[VEC_SCALARS]()[k],
+                "(",
+                self.int_expr(data, 0),
+                ")\n",
+            )
         if choice >= 16:
             return self.ownership_statement(data, choice, indent, depth)
         return String(
@@ -1085,6 +1377,7 @@ struct ProgramGenerator(Movable):
         return (
             "_mix(v0, v1, v2, v3, buf, opt, pool, q0, q1, t0, t1, lst, ot)"
             " * 31 + _nmix(n0, n1, n2, n3, n4, n5, n6)"
+            " * 31 + _vmix(s0, s1, s2, s3, s4, s5)"
         )
 
     def function(mut self, mut data: ConjectureData) raises -> String:
@@ -1113,6 +1406,18 @@ struct ProgramGenerator(Movable):
                 types[k],
                 "(",
                 ["a", "b", "c"][k % 3],
+                ")\n",
+            )
+        for k in range(N_VEC):
+            s += String(
+                "    var s",
+                k,
+                " = _ramp[DType.",
+                materialize[VEC_DTYPES]()[k],
+                ", ",
+                materialize[VEC_LANES]()[k],
+                "](",
+                ["a", "b", "c"][(k + 1) % 3],
                 ")\n",
             )
         s += self.block(data, "    ", 0)
@@ -1172,6 +1477,64 @@ def _nmix(
     h = h * 31 + Int(n4)
     h = h * 31 + Int(n5)
     return h * 31 + Int(n6)
+
+
+comptime V0 = SIMD[DType.int32, 4]
+comptime V1 = SIMD[DType.uint16, 4]
+comptime V2 = SIMD[DType.int16, 8]
+comptime V3 = SIMD[DType.uint32, 8]
+comptime V4 = SIMD[DType.uint8, 16]
+comptime V5 = SIMD[DType.int64, 2]
+
+
+@always_inline
+def _vdiv[
+    dt: DType, n: SIMDLength
+](a: SIMD[dt, n], b: SIMD[dt, n]) -> SIMD[dt, n]:
+    comptime if dt.is_signed():
+        var m = b.eq(SIMD[dt, n](-1))
+        return m.select(SIMD[dt, n](0) - a, a // m.select(SIMD[dt, n](1), b))
+    return a // b
+
+
+@always_inline
+def _vmod[
+    dt: DType, n: SIMDLength
+](a: SIMD[dt, n], b: SIMD[dt, n]) -> SIMD[dt, n]:
+    comptime if dt.is_signed():
+        var m = b.eq(SIMD[dt, n](-1))
+        return m.select(SIMD[dt, n](0), a % m.select(SIMD[dt, n](1), b))
+    return a % b
+
+
+def _ramp[dt: DType, n: SIMDLength](x: Int) -> SIMD[dt, n]:
+    var r = SIMD[dt, n](0)
+    for i in range(Int(n)):
+        r[i] = Scalar[dt](x + i * i * 7 - i)
+    return r
+
+
+@always_inline
+def _vset[
+    dt: DType, n: SIMDLength
+](var v: SIMD[dt, n], i: Int, s: Scalar[dt]) -> SIMD[dt, n]:
+    v[i] = s
+    return v
+
+
+def _vhash[dt: DType, n: SIMDLength](v: SIMD[dt, n]) -> Int:
+    var h = 0
+    for i in range(Int(n)):
+        h = h * 31 + Int(v[i])
+    return h
+
+
+def _vmix(s0: V0, s1: V1, s2: V2, s3: V3, s4: V4, s5: V5) -> Int:
+    var h = _vhash(s0) * 31 + _vhash(s1)
+    h = h * 31 + _vhash(s2)
+    h = h * 31 + _vhash(s3)
+    h = h * 31 + _vhash(s4)
+    return h * 31 + _vhash(s5)
 
 
 FILE_SPECIFIC_HELPERS
@@ -1317,6 +1680,44 @@ def _check_balance(f: Int, live: Int):
         print("UNBALANCED", f, live)
 
 
+@always_inline
+def _rotl[dt: DType, n: SIMDLength, //, s: Int](v: SIMD[dt, n]) -> SIMD[dt, n]:
+    return v.rotate_left[s]()
+
+
+@always_inline
+def _rotr[dt: DType, n: SIMDLength, //, s: Int](v: SIMD[dt, n]) -> SIMD[dt, n]:
+    return v.rotate_right[s]()
+
+
+@always_inline
+def _lshift[
+    dt: DType, n: SIMDLength, //, s: Int
+](v: SIMD[dt, n]) -> SIMD[dt, n]:
+    return v.shift_left[s]()
+
+
+@always_inline
+def _rshift[
+    dt: DType, n: SIMDLength, //, s: Int
+](v: SIMD[dt, n]) -> SIMD[dt, n]:
+    return v.shift_right[s]()
+
+
+@always_inline
+def _vinsert[
+    dt: DType, n: SIMDLength, m: SIMDLength, //, offset: Int
+](x: SIMD[dt, n], y: SIMD[dt, m]) -> SIMD[dt, n]:
+    return x.insert[offset=offset](y)
+
+
+@always_inline
+def _vdeint[
+    dt: DType, n: SIMDLength, //, which: Int
+](x: SIMD[dt, n], y: SIMD[dt, n]) -> SIMD[dt, n]:
+    return rebind[SIMD[dt, n]](x.join(y).deinterleave()[which])
+
+
 """
 # Compile time can't evaluate min/max of a small and a large Int
 # (unfiled-mojo-issue-comptime-index-min-max.md), so comptime.mojo
@@ -1331,6 +1732,61 @@ def _max(a: Int, b: Int) -> Int:
 
 def _check_balance(f: Int, live: Int):
     pass  # the live count is part of run_fN's result
+
+
+# Lane loops for the operations that are LLVM intrinsics, which compile
+# time can't evaluate
+
+
+def _rotl[dt: DType, n: SIMDLength, //, s: Int](v: SIMD[dt, n]) -> SIMD[dt, n]:
+    var r = v
+    for i in range(Int(n)):
+        r[i] = v[(i + s + Int(n)) % Int(n)]
+    return r
+
+
+def _rotr[dt: DType, n: SIMDLength, //, s: Int](v: SIMD[dt, n]) -> SIMD[dt, n]:
+    var r = v
+    for i in range(Int(n)):
+        r[i] = v[(i - s + Int(n)) % Int(n)]
+    return r
+
+
+def _lshift[
+    dt: DType, n: SIMDLength, //, s: Int
+](v: SIMD[dt, n]) -> SIMD[dt, n]:
+    var r = SIMD[dt, n](0)
+    for i in range(Int(n) - s):
+        r[i] = v[i + s]
+    return r
+
+
+def _rshift[
+    dt: DType, n: SIMDLength, //, s: Int
+](v: SIMD[dt, n]) -> SIMD[dt, n]:
+    var r = SIMD[dt, n](0)
+    for i in range(s, Int(n)):
+        r[i] = v[i - s]
+    return r
+
+
+def _vinsert[
+    dt: DType, n: SIMDLength, m: SIMDLength, //, offset: Int
+](x: SIMD[dt, n], y: SIMD[dt, m]) -> SIMD[dt, n]:
+    var r = x
+    for j in range(Int(m)):
+        r[offset + j] = y[j]
+    return r
+
+
+def _vdeint[
+    dt: DType, n: SIMDLength, //, which: Int
+](x: SIMD[dt, n], y: SIMD[dt, n]) -> SIMD[dt, n]:
+    var r = x
+    for i in range(Int(n)):
+        var j = 2 * i + which
+        r[i] = x[j] if j < Int(n) else y[j - Int(n)]
+    return r
 
 
 """

@@ -58,6 +58,11 @@ from proptest.internal.fork import (
 from proptest.internal.random import Random
 from proptest.internal.provider import Provider
 from proptest.internal.bytestring import ByteReader
+from proptest.internal.comparisons import (
+    Comparison,
+    ComparisonLog,
+    MAX_COMPARISONS,
+)
 from proptest.strategies.strategy import Strategy, format_value
 
 
@@ -233,6 +238,8 @@ struct ConjectureResult(Copyable):
     var target_observations: Dict[String, Float64]
     var notes: List[String]
     var events: List[String]
+    var comparisons: List[Comparison]
+    """The comparisons made with `Traced` values (see `comparisons.mojo`)."""
     var table_entries: List[Tuple[String, String]]
     var covers: Dict[String, Float64]
     var covered: Dict[String, Bool]
@@ -257,6 +264,7 @@ struct ConjectureResult(Copyable):
         self.target_observations = Dict[String, Float64]()
         self.notes = List[String]()
         self.events = List[String]()
+        self.comparisons = List[Comparison]()
         self.table_entries = List[Tuple[String, String]]()
         self.covers = Dict[String, Float64]()
         self.covered = Dict[String, Bool]()
@@ -320,6 +328,9 @@ struct ConjectureData(Movable):
     var misaligned: Bool
     var notes: List[String]
     var events: List[String]
+    var comparisons: ArcPointer[ComparisonLog]
+    """Shared with the `Traced` values drawn in this test case, which record
+    their comparisons in it."""
     var table_entries: List[Tuple[String, String]]
     """Values recorded with `tabulate`, as (table, value)."""
     var covers: Dict[String, Float64]
@@ -389,6 +400,7 @@ struct ConjectureData(Movable):
         self.misaligned = False
         self.notes = List[String]()
         self.events = List[String]()
+        self.comparisons = ArcPointer(ComparisonLog())
         self.table_entries = List[Tuple[String, String]]()
         self.covers = Dict[String, Float64]()
         self.covered = Dict[String, Bool]()
@@ -732,6 +744,13 @@ struct ConjectureData(Movable):
         log.int(len(self.arg_spans))
         for a in self.arg_spans:
             log.int(a)
+        ref cmps = self.comparisons[].entries
+        log.int(len(cmps))
+        for c in cmps:
+            log.u64(c.site)
+            log.value(c.lhs)
+            log.value(c.rhs)
+            log.int(c.closeness)
         log.int(len(self.spans))
         for sp in self.spans:
             log.u64(sp.label)
@@ -827,6 +846,15 @@ struct ConjectureData(Movable):
                 self.arg_spans = []
                 for _ in range(r.int()):
                     self.arg_spans.append(r.int())
+                var n_cmps = r.int()
+                if n_cmps < 0 or n_cmps > MAX_COMPARISONS:
+                    raise Error("a bad number of comparisons")
+                self.comparisons = ArcPointer(ComparisonLog())
+                for _ in range(n_cmps):
+                    var site = r.u64()
+                    var lhs = r.value()
+                    var rhs = r.value()
+                    self.comparisons[].record(site, lhs^, rhs^, r.int())
                 self.spans = []
                 for _ in range(r.int()):
                     var label = r.u64()
@@ -904,6 +932,7 @@ struct ConjectureData(Movable):
         r.target_observations = self.target_observations.copy()
         r.notes = self.notes.copy()
         r.events = self.events.copy()
+        r.comparisons = self.comparisons[].entries.copy()
         r.table_entries = self.table_entries.copy()
         r.covers = self.covers.copy()
         r.covered = self.covered.copy()

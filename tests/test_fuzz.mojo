@@ -278,6 +278,48 @@ def test_fuzz_is_guided_by_events() raises:
     assert_true("found it" in msg, msg)
 
 
+def test_fuzz_favors_entries_with_rare_features() raises:
+    # The noise list's (position, value) events fill the corpus with
+    # entries covering common features. Picking parents by the rarity of
+    # their features finds the chain in about 35_000 inputs with this seed;
+    # picking them uniformly mostly doesn't within 200_000.
+    def prop(mut data: ConjectureData) raises:
+        var noise = data.draw(lists(integers(0, 15), max_size=12))
+        for i in range(len(noise)):
+            data.event(String("noise ", i, " ", noise[i]))
+        var xs = data.draw(lists(integers(0, 15), min_size=6, max_size=6))
+        for i in range(6):
+            if xs[i] != i + 1:
+                return
+            data.event(String("matched ", i + 1))
+        fail("found it")
+
+    var target = fuzz_target_data(prop, Settings(database=None, seed=UInt64(1)))
+    var msg = String()
+    try:
+        _ = target.fuzz(max_inputs=100_000)
+    except e:
+        msg = String(e)
+    assert_true("found it" in msg, msg)
+
+
+def test_fuzz_keeps_an_entry_only_while_it_is_the_simplest_for_something() raises:
+    # Each entry is kept for at least one feature it is the simplest test
+    # case to cover, so the corpus can't outgrow the features.
+    def prop(xs: List[Int], s: String) raises:
+        pass
+
+    var target = fuzz_target(
+        lists(integers(0, 100)),
+        text(),
+        prop,
+        Settings(database=None, seed=UInt64(7)),
+    )
+    var report = target.fuzz(max_inputs=5000)
+    assert_true(report.corpus > 5, String(report))
+    assert_true(report.corpus <= report.features, String(report))
+
+
 def test_fuzz_shrinks_and_reports_like_given() raises:
     def prop(xs: List[Int]) raises:
         var total = 0

@@ -428,6 +428,8 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
                 self.stats.record(r)
             except:
                 pass
+        for c in r.comparisons:
+            self.constants[].learn(c.rhs)
         if r.status == Status.VALID:
             self.valid_count += 1
         elif r.status == Status.INVALID:

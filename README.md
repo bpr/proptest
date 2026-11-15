@@ -345,9 +345,11 @@ after saving it to the database for `given` to replay and shrink.
 `target.fuzz(seconds)` fuzzes the test itself, for a time instead of a
 number of examples: it keeps a corpus of the test cases that covered
 something new (pairs of strategies, `event`s, `target` scores), mutates
-them (boundary values, splicing spans between test cases), saves the
-corpus to the database for the next run, and reports failures, shrunk,
-as `given` does.
+them (boundary values, splicing spans between test cases), favoring the
+ones that cover rarely seen features, saves the corpus to the database
+for the next run, and reports failures, shrunk, as `given` does. Values
+drawn with `traced(...)` record what they're compared with, which `fuzz`
+uses to get past checks like `x == 4242`.
 
 ```mojo
 var target = fuzz_target(lists(integers()), prop)
@@ -666,6 +668,7 @@ The engine is a port of Hypothesis's Conjecture
 | `internal/pareto.mojo` | `pareto.py` | the Pareto front of targeted examples |
 | `internal/fork.mojo` | (none; Rust proptest's `fork`) | running test cases in child processes |
 | `internal/bytestring.mojo`, `fuzz.mojo` | `providers.py` (`BytestringProvider`), `core.py` (`fuzz_one_input`) | choices read from bytes; fuzz targets |
+| `internal/comparisons.mojo`, `strategies/traced.mojo` | (none; AFL++'s CmpLog, libFuzzer's value profile) | `traced` values and the comparisons they record |
 | `strategies/regex.mojo` | `strategies/_internal/regex.py` | `from_regex` |
 | `strategies/types.mojo` | `strategies/_internal/types.py` | `from_type` |
 | `strategies/constraints.mojo` | — (QuickCheck's `Modifiers.hs`) | constraint types (`Positive`, `NonEmpty`, `Via`, ...) |
