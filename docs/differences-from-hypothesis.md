@@ -829,6 +829,15 @@ special values are ignored. The differences:
   engine adds the compared-with values (up to
   256) to the constants pool, the runtime counterpart of the constants
   Hypothesis collects from the test's source.
+- **Fuzzing dictionaries** (no Hypothesis counterpart).
+  `Settings(dictionary=...)` takes tokens, as AFL++ and libFuzzer take
+  a dictionary (`load_dictionary` reads their `.dict` format). The fuzz
+  loop inserts one to three tokens into strings and byte strings (half
+  the time at the end, to build sequences of tokens), writes them over
+  part of a value or in its place, and sets integers to the tokens that
+  are numbers; generation returns a whole token one time in ten for
+  strings, bytes and integers. Hypothesis collects constants from the
+  test's source instead, which Mojo can't do at run time.
 - No observability output.
 
 ---

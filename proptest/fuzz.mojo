@@ -47,6 +47,7 @@ from proptest.internal.choice import (
     FLOAT,
     BOOLEAN,
     BYTES,
+    STRING,
     choice_permitted,
     choice_simplest,
     sort_key_less,
@@ -58,7 +59,7 @@ from proptest.internal.data import (
     Result,
     Status,
 )
-from proptest.internal.provider import _boundary_byte
+from proptest.internal.provider import Constants, _boundary_byte
 from proptest.internal.datatree import DataTree
 from proptest.internal.engine import ConjectureRunner, RunReport
 from proptest.internal.floats import (
@@ -465,6 +466,71 @@ def _input_to_state(
     return choices^
 
 
+def _dictionary_mutation(
+    mut rnd: Random, p: ConjectureResult, k: Constants
+) -> Optional[List[ChoiceValue]]:
+    """Use tokens from the user's dictionary (`Settings.dictionary`), one
+    to three times (stacked, as AFL's havoc stage does, so a few tokens can
+    appear together): a string or byte string gets a token inserted,
+    written over part of it, or in place of it; an integer is set to a
+    token that is a number. None if no choice can take one."""
+    var free = List[Int]()
+    for i in range(len(p.nodes)):
+        ref n = p.nodes[i]
+        if n.was_forced:
+            continue
+        var kind = n.constraints.kind
+        if (
+            kind == INTEGER
+            and len(k.dict_ints) > 0
+            or kind == STRING
+            and len(k.dict_texts) > 0
+            or kind == BYTES
+        ):
+            free.append(i)
+    if len(free) == 0:
+        return None
+    var choices = p.choices()
+    var changed = False
+    for _ in range(1 + Int(rnd.below(3))):
+        var i = free[Int(rnd.below(UInt64(len(free))))]
+        ref c = p.nodes[i].constraints
+        var v: ChoiceValue
+        if c.kind == INTEGER:
+            var d = k.dictionary_value(rnd, c)
+            if not d:
+                continue
+            v = d.take()
+        else:
+            ref pool = k.dict_texts if c.kind == STRING else k.dict_bytes
+            ref tok = pool[Int(rnd.below(UInt64(len(pool))))]
+            ref cur = choices[i].seq
+            var seq = List[UInt32]()
+            var how = rnd.below(3)
+            if how == 0:
+                seq = tok.copy()
+            else:
+                # half the time at the end, which builds token sequences
+                var at = len(cur) if rnd.below(2) == 0 else Int(
+                    rnd.below(UInt64(len(cur) + 1))
+                )
+                for j in range(at):
+                    seq.append(cur[j])
+                seq.extend(tok.copy())
+                var rest = at if how == 1 else at + len(tok)
+                for j in range(rest, len(cur)):
+                    seq.append(cur[j])
+            v = ChoiceValue(bytes=seq^) if c.kind == BYTES else ChoiceValue(
+                string=seq^
+            )
+        if choice_permitted(v, c):
+            choices[i] = v^
+            changed = True
+    if not changed:
+        return None
+    return choices^
+
+
 def _mutate[
     F: def(mut ConjectureData) raises
 ](mut runner: ConjectureRunner[F], corpus: _Corpus, parent: Result) -> List[
@@ -475,6 +541,10 @@ def _mutate[
     entry, deleted, duplicated, or cut off (the rest is then drawn at
     random)."""
     ref p = parent[]
+    if len(runner.constants[].dict_bytes) > 0 and runner.random.below(4) == 0:
+        var used = _dictionary_mutation(runner.random, p, runner.constants[])
+        if used:
+            return used.take()
     if len(p.comparisons) > 0 and runner.random.below(3) == 0:
         var replaced = _input_to_state(runner.random, p)
         if replaced:
@@ -773,7 +843,9 @@ struct FuzzTarget[P: Movable & Deinitable](Movable):
         Values drawn with `traced(...)` record what they're compared
         with: the loop tries setting a choice to the value its traced
         value was compared with, and counts getting closer than before at
-        a comparison as a new feature.
+        a comparison as a new feature. With `Settings.dictionary`, it
+        inserts the dictionary's tokens into strings and byte strings, and
+        sets integers to the tokens that are numbers.
 
         With a database, failures go to the test's `database_key` and the
         corpus to `<database_key>.fuzz`, so the next run starts where this

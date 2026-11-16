@@ -25,6 +25,8 @@ environment variables (like a Hypothesis settings profile):
 
 from std.os import getenv
 
+from proptest.dictionary import Dictionary
+
 
 struct Verbosity(
     Comparable, Copyable, Equatable, TrivialRegisterPassable, Writable
@@ -215,6 +217,11 @@ struct Settings(Copyable, Writable):
     counting the whole test case (drawing included), by killing the child
     process that runs it; implies `fork`. Unlike `deadline`, this catches
     tests that never finish."""
+    var dictionary: Dictionary
+    """Tokens the inputs are likely to need (keywords, magic bytes,
+    numbers): generation occasionally returns one, and `fuzz` inserts them
+    into strings and byte strings (AFL++'s and libFuzzer's dictionaries).
+    A list of strings converts; `load_dictionary` reads a `.dict` file."""
 
     def __init__(
         out self,
@@ -237,6 +244,7 @@ struct Settings(Copyable, Writable):
         var check_coverage: Optional[Confidence] = None,
         fork: Bool = False,
         timeout: Optional[Float64] = None,
+        var dictionary: Dictionary = Dictionary(),
     ):
         self.max_examples = max_examples
         self.seed = seed
@@ -256,6 +264,7 @@ struct Settings(Copyable, Writable):
         self.check_coverage = check_coverage^
         self.fork = fork
         self.timeout = timeout
+        self.dictionary = dictionary^
 
     def forks(self) -> Bool:
         """Whether test cases run in child processes."""

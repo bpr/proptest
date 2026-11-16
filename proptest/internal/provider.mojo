@@ -27,6 +27,7 @@ from std.math import (
     log,
 )
 
+from proptest.dictionary import Dictionary
 from proptest.internal.choice import (
     ChoiceValue,
     Constraints,
@@ -179,9 +180,18 @@ struct Constants(Movable):
     var strings: List[List[UInt32]]
     var learned: Set[UInt64]
     """Hashes of the values added by `learn`."""
+    var dict_texts: List[List[UInt32]]
+    """The user's dictionary (`Settings.dictionary`): its UTF-8 tokens..."""
+    var dict_bytes: List[List[UInt32]]
+    """... all its tokens, as byte strings..."""
+    var dict_ints: List[Int128]
+    """... and the tokens that are integers (`42`, `-1`, `0x7f`)."""
 
     def __init__(out self):
         self.learned = Set[UInt64]()
+        self.dict_texts = List[List[UInt32]]()
+        self.dict_bytes = List[List[UInt32]]()
+        self.dict_ints = List[Int128]()
         var base = List[Int128]()
         for n in range(16, 66):
             base.append(Int128(1) << Int128(n))
@@ -299,6 +309,61 @@ struct Constants(Movable):
         self.strings = List[List[UInt32]]()
         for s in strs:
             self.strings.append(string_to_codepoints(s))
+
+    def use_dictionary(mut self, d: Dictionary):
+        """Take tokens from `d` (see `Settings.dictionary`)."""
+        for t in d.tokens:
+            var seq = List[UInt32]()
+            for b in t:
+                seq.append(UInt32(b))
+            self.dict_bytes.append(seq^)
+            try:
+                var s = String(from_utf8=Span(t))
+                self.dict_texts.append(string_to_codepoints(s))
+                var n = atol(s.strip(), base=0)
+                self.dict_ints.append(Int128(n))
+            except:
+                pass
+
+    @staticmethod
+    def _pick_permitted(
+        mut rnd: Random, pool: List[List[UInt32]], c: Constraints
+    ) -> Optional[List[UInt32]]:
+        var permitted = List[Int]()
+        for i in range(len(pool)):
+            var v = ChoiceValue(
+                bytes=pool[i].copy()
+            ) if c.kind == BYTES else ChoiceValue(string=pool[i].copy())
+            if choice_permitted(v, c):
+                permitted.append(i)
+        if len(permitted) == 0:
+            return None
+        return pool[permitted[Int(rnd.below(UInt64(len(permitted))))]].copy()
+
+    def dictionary_value(
+        self, mut rnd: Random, c: Constraints
+    ) -> Optional[ChoiceValue]:
+        """A permitted token from the user's dictionary for `c` (None if
+        there is none)."""
+        if c.kind == INTEGER:
+            var permitted = List[Int128]()
+            for x in self.dict_ints:
+                if choice_permitted(ChoiceValue(integer=x), c):
+                    permitted.append(x)
+            if len(permitted) == 0:
+                return None
+            return ChoiceValue(
+                integer=permitted[Int(rnd.below(UInt64(len(permitted))))]
+            )
+        if c.kind == STRING:
+            var t = Self._pick_permitted(rnd, self.dict_texts, c)
+            if t:
+                return ChoiceValue(string=t.take())
+        elif c.kind == BYTES:
+            var t = Self._pick_permitted(rnd, self.dict_bytes, c)
+            if t:
+                return ChoiceValue(bytes=t.take())
+        return None
 
     def learn(mut self, v: ChoiceValue):
         """Add an integer or string that the test compared a value with
@@ -428,6 +493,15 @@ struct Provider(Movable):
             return -1
         return permitted[Int(self.random.below(UInt64(len(permitted))))]
 
+    def _maybe_dictionary_value(
+        mut self, c: Constraints
+    ) -> Optional[ChoiceValue]:
+        """With probability 1/10, a permitted token from the user's
+        dictionary, if it has one for `c`."""
+        if len(self.constants[].dict_bytes) == 0 or self.random.random() >= 0.1:
+            return None
+        return self.constants[].dictionary_value(self.random, c)
+
     def draw_integer(mut self, c: Constraints) -> Int128:
         if c.weights:
             ref w = c.weights.value()[]
@@ -437,6 +511,9 @@ struct Provider(Movable):
                 if r < 0:
                     return c.min_value + Int128(i)
             return c.min_value + Int128(len(w) - 1)
+        var dv = self._maybe_dictionary_value(c)
+        if dv:
+            return dv.value().i
         var ci = self._maybe_constant_index(c, 0.05)
         if ci >= 0:
             return self.constants[].integers[ci]
@@ -533,6 +610,9 @@ struct Provider(Movable):
         var n = len(alpha)
         if n == 0:
             return List[UInt32]()
+        var dv = self._maybe_dictionary_value(c)
+        if dv:
+            return dv.value().seq.copy()
         var ci = self._maybe_constant_index(c, 0.05)
         if ci >= 0:
             return self.constants[].strings[ci].copy()
@@ -555,6 +635,9 @@ struct Provider(Movable):
         0xFF) mixed in: each byte is one with probability 1/8, and 5% of
         byte strings are one of them repeated. Hypothesis draws bytes
         uniformly."""
+        var dv = self._maybe_dictionary_value(c)
+        if dv:
+            return dv.value().seq.copy()
         var size = self._draw_size(c.min_size, c.max_size)
         var out = List[UInt32](capacity=size)
         if self.random.random() < 0.05:

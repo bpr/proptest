@@ -313,6 +313,56 @@ lost) with the other taken as a constant.
 The values compared with also join the "nasty" constants that `given`
 and `fuzz` occasionally generate, so `given` tries them too.
 
+## Use a dictionary
+
+When the input is a text or binary format, the tokens it uses
+(keywords, magic bytes, separators) are as hard to hit by chance as a
+magic number. List them in `Settings(dictionary=...)`, as you would give
+AFL++ or libFuzzer a dictionary: `fuzz` then inserts tokens into strings
+and byte strings, writes them over part of a value or in place of it
+(up to three at a time, so tokens can appear together), and sets
+integers to the tokens that are numbers (`42`, `-1`, `0x7f`). `given`
+and `fuzz` also generate a token whole now and then.
+
+```mojo
+from proptest import fuzz_target, text, fail, Settings
+
+
+def main() raises:
+    def handle(request: String) raises:
+        if request.startswith("POST /admin"):
+            fail("reached the admin page")
+
+    var target = fuzz_target(
+        text(),
+        handle,
+        Settings(
+            database=None,
+            seed=UInt64(1),
+            dictionary=["GET", "POST", " ", "/admin", "/index", "HTTP/1.1"],
+        ),
+    )
+    try:
+        _ = target.fuzz(30)
+    except e:
+        print(e)
+```
+
+```text
+Falsifying example (admin.mojo:9:29):
+    given('POST /admin')
+At admin.mojo:7:17: AssertionError: reached the admin page
+```
+
+Without the dictionary, `fuzz` doesn't find it. For tokens that
+aren't text, or a dictionary you already have, `load_dictionary(path)`
+reads the AFL++/libFuzzer format (one `name="value"` per line, with
+`\xNN` escapes, as in AFL++'s `dictionaries/` directory), and
+`parse_dictionary(text)` reads it from a string. A token that isn't
+valid UTF-8 is used only for byte strings. A dictionary and `traced`
+work together: the dictionary supplies the tokens, and `traced` values
+supply the values the code compares with.
+
 ## Fuzz model-based tests
 
 A program from `commands()` (see [Stateful testing](../tutorial/stateful.md)) is
@@ -454,7 +504,7 @@ must save the input itself. `fuzz` shrinks a crash as `given` does.
 
 ## Settings
 
-`database`, `database_key`, `fork` and `timeout` apply to a fuzz target.
+`database`, `database_key`, `fork`, `timeout` and `dictionary` apply to a fuzz target.
 `fuzz` also uses `seed`, `verbosity` (`Verbosity.verbose` prints its
 progress every five seconds), `phases.shrink`, `phases.explain` and
 `report_multiple_bugs`. There is no deadline.

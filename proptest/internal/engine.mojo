@@ -211,6 +211,7 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
         self.seed = seed
         self.random = Random(seed)
         self.constants = ArcPointer(Constants())
+        self.constants[].use_dictionary(settings.dictionary)
         self.tree = DataTree()
         self.saved = List[List[ChoiceValue]]()
         self.arg_comments = Dict[String, Dict[Int, String]]()

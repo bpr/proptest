@@ -352,7 +352,9 @@ drawn with `traced(...)` record what they're compared with, which `fuzz`
 uses to get past checks like `x == 4242` (or `x * 3 + 1 == 4242`:
 arithmetic on them stays traced), and `commands()` takes a
 `fingerprint` of the model state, so that `fuzz` favors programs that
-reach new states.
+reach new states. `Settings(dictionary=["GET", "POST"])` (or
+`load_dictionary("http.dict")`, in the AFL++/libFuzzer format) gives
+tokens that `fuzz` inserts into strings and byte strings.
 
 ```mojo
 var target = fuzz_target(lists(integers()), prop)
@@ -671,6 +673,7 @@ The engine is a port of Hypothesis's Conjecture
 | `internal/pareto.mojo` | `pareto.py` | the Pareto front of targeted examples |
 | `internal/fork.mojo` | (none; Rust proptest's `fork`) | running test cases in child processes |
 | `internal/bytestring.mojo`, `fuzz.mojo` | `providers.py` (`BytestringProvider`), `core.py` (`fuzz_one_input`) | choices read from bytes; fuzz targets |
+| `dictionary.mojo` | (none; AFL++'s and libFuzzer's dictionaries) | `Dictionary`, `load_dictionary` |
 | `internal/comparisons.mojo`, `strategies/traced.mojo` | (none; AFL++'s CmpLog, libFuzzer's value profile) | `traced` values and the comparisons they record |
 | `strategies/regex.mojo` | `strategies/_internal/regex.py` | `from_regex` |
 | `strategies/types.mojo` | `strategies/_internal/types.py` | `from_type` |

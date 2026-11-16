@@ -23,6 +23,7 @@ Settings(
     check_coverage: Optional[Confidence] = None,
     fork: Bool = False,
     timeout: Optional[Float64] = None,
+    dictionary: Dictionary = Dictionary(),
 )
 ```
 
@@ -45,6 +46,7 @@ Settings(
 | `show_statistics` | Print the run's statistics: events, tables, and coverage. |
 | `fork` | Run each test case in a child process, so that a crash (a segfault, an abort, a sanitizer report) fails the test case and is shrunk instead of ending the run. See [Test code that crashes](../how-to/crashes.md). |
 | `timeout` | Kill a test case that runs longer than this many milliseconds, and fail it with `Timeout`. Implies `fork`. |
+| `dictionary` | Tokens the inputs are likely to need: generation occasionally returns one whole, and `fuzz` inserts them into strings and byte strings. A list of strings converts to a `Dictionary`. See [Use a dictionary](../how-to/fuzzing.md#use-a-dictionary). |
 | `check_coverage` | Check `cover` requirements statistically, generating past `max_examples` until they're settled, and fail if one isn't met (QuickCheck's `checkCoverage`). |
 
 ## Environment variables
@@ -64,6 +66,24 @@ always wins.
 
 `settings.with_env_overrides()` returns the settings with these applied;
 the test runners call it for you.
+
+## `Dictionary`
+
+```mojo-sig
+struct Dictionary(Copyable, Sized, Writable)
+load_dictionary(path: String) raises -> Dictionary
+parse_dictionary(text: String, name: String = "<string>") raises -> Dictionary
+```
+
+Tokens for `Settings.dictionary`, kept as bytes. `Dictionary()` is
+empty, and `Dictionary(["GET", "POST"])` (or a list literal where a
+`Dictionary` is expected) holds those strings. `d.add(token)`,
+`d.add_bytes(span)` and `d.add(other)` add tokens, skipping ones it
+already has; `d.tokens` lists them. `load_dictionary` and
+`parse_dictionary` read the AFL++/libFuzzer format: one token per line,
+written `"value"` or `name="value"` (or `name@level="value"`), with
+`\\`, `\"` and `\xNN` escapes; blank lines and `#` comments are
+skipped, and a malformed line raises an error naming it.
 
 ## `Phases`
 
