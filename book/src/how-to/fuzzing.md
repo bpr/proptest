@@ -265,8 +265,50 @@ it at all. `Traced[T]` works for integers of any width and `String`,
 and conforms to `Comparable` and `Hashable`, so you can pass it to
 generic code, whose comparisons are recorded too. To trace a value
 computed in the test, wrap it yourself: `Traced(x + y,
-data.comparisons)` in a test that draws its own data. Arithmetic on a
-`Traced` value gives a plain one, whose comparisons aren't recorded.
+data.comparisons)` in a test that draws its own data.
+
+Arithmetic on a `Traced` value gives a `Traced` value too. When the
+result was computed from one drawn value by steps that can be undone
+(adding, subtracting, multiplying, shifting left, XOR, negating, and
+`~` for integers; adding text at either end for strings), a comparison
+also works out what the drawn value would need to be, and `fuzz` tries
+that:
+
+```mojo
+from proptest import fuzz_target, traced, integers, fail
+from proptest import Settings, Traced
+
+
+def main() raises:
+    def check(x: Traced[Int]) raises:
+        var checksum = (x * 31 + 7) ^ 0xBEEF
+        if checksum == 0xBD8B68:
+            fail("checksum matches")
+
+    var target = fuzz_target(
+        traced(integers()),
+        check,
+        Settings(database=None, seed=UInt64(1)),
+    )
+    try:
+        _ = target.fuzz(10)
+    except e:
+        print(e)
+```
+
+```text
+Falsifying example (checksum.mojo:11:29):
+    given(400000)
+At checksum.mojo:9:17: AssertionError: checksum matches
+```
+
+The arithmetic wraps as the type's does, and the reverse steps wrap the
+same way, but a multiplication is only undone when the division is
+exact. Dividing, taking a remainder, `&`, `|` and `>>` lose track of
+the drawn value; the result is still traced, so getting closer at its
+comparisons still counts. When both operands are `Traced`, the result is
+traced back to the left one (or the right one, if the left was already
+lost) with the other taken as a constant.
 
 The values compared with also join the "nasty" constants that `given`
 and `fuzz` occasionally generate, so `given` tries them too.

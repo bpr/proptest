@@ -343,7 +343,11 @@ Values from `strategy` (integers of any width, or `String`) wrapped in a
 `Traced[T]`, which compares, hashes and prints like its `.value` but
 records every comparison it takes part in (`==`, `!=`, `<`, `<=`, `>`,
 `>=`, and for strings `startswith`, `endswith` and `in`). `Int(x)`
-works for integers and `x.byte_length()` for strings. `Traced[T]`
+works for integers and `x.byte_length()` for strings. Arithmetic
+(`+`, `-`, `*`, `//`, `%`, `&`, `|`, `^`, `<<`, `>>`, unary `-` and `~`
+for integers, `+` for strings, with a plain or `Traced` operand) gives a
+`Traced` result, which remembers the invertible steps from the drawn
+value so its comparisons can be traced back. `Traced[T]`
 conforms to `Comparable` and `Hashable`, so generic code accepts it.
 `Traced(value, data.comparisons)` wraps a value computed in a test. See
 [Get past magic values](../how-to/fuzzing.md#get-past-magic-values).

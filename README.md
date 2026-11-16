@@ -349,7 +349,8 @@ them (boundary values, splicing spans between test cases), favoring the
 ones that cover rarely seen features, saves the corpus to the database
 for the next run, and reports failures, shrunk, as `given` does. Values
 drawn with `traced(...)` record what they're compared with, which `fuzz`
-uses to get past checks like `x == 4242`, and `commands()` takes a
+uses to get past checks like `x == 4242` (or `x * 3 + 1 == 4242`:
+arithmetic on them stays traced), and `commands()` takes a
 `fingerprint` of the model state, so that `fuzz` favors programs that
 reach new states.
 

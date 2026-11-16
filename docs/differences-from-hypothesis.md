@@ -821,7 +821,12 @@ special values are ignored. The differences:
   to the value it was compared with, +-1, or for strings with it
   prefixed or appended) and as features (the closest each comparison
   site came to equality, by bit length of the difference or length of
-  the common prefix). The engine adds the compared-with values (up to
+  the common prefix). Arithmetic on a `Traced` value keeps it traced
+  and remembers the invertible steps from the drawn value (add,
+  multiply, XOR; affixes for strings), so a comparison of the result
+  also records the drawn value against the one that would satisfy it,
+  as AFL++'s Redqueen handles simple input-to-state transforms. The
+  engine adds the compared-with values (up to
   256) to the constants pool, the runtime counterpart of the constants
   Hypothesis collects from the test's source.
 - No observability output.
