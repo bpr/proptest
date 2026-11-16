@@ -125,6 +125,7 @@ In `given_data` tests, `composite` functions, state machine rules, and
 | `data.draw(strategy, label="")` | Draw a value. With a label, the value is named in reports. |
 | `data.note(msg)` | Add a line to the report of the final, shrunk example. |
 | `data.event(label)` | Record an event, counted in the run's statistics. |
+| `data.feature(x: UInt64)` | Record a coverage feature for `FuzzTarget.fuzz`: a test case with a new one joins the corpus. Ignored outside fuzzing. |
 | `data.tabulate(table, value)` | Record a value in a statistics table. |
 | `data.cover(percent, condition, label)` | Declare a coverage requirement. |
 | `data.target(score, label="")` | Report a score for targeted search to maximize. |

@@ -65,6 +65,7 @@ from std.reflection import call_location, SourceLocation
 from std.memory import ArcPointer
 from std.utils import Variant
 
+from proptest.internal.comparisons import mix as _mix
 from proptest.internal.data import ConjectureData, combine_labels
 from proptest.strategies.strategy import Many, Strategy
 from proptest.strategies.core import _normalize_weights
@@ -72,6 +73,8 @@ from proptest.settings import Settings
 from proptest.core import given
 
 comptime COMMANDS_LABEL: UInt64 = 0x636F6D6D616E6473
+comptime _STATE: UInt64 = 0x7374617465
+comptime _STATE_COMMAND: UInt64 = 0x7374636D64
 
 
 trait Command(Copyable, Deinitable, Writable):
@@ -179,20 +182,24 @@ struct CommandSequences[*Cs: Command](Copyable, Strategy):
     `commands()`."""
 
     comptime Value = Commands[*Self.Cs]
+    comptime Fingerprint = def(Self.Cs[0].Model) thin raises -> UInt64
 
     var model: Self.Cs[0].Model
     var max_commands: Int
     var weights: Optional[ArcPointer[List[Float64]]]
+    var fingerprint: Optional[Self.Fingerprint]
 
     def __init__(
         out self,
         model: Self.Cs[0].Model,
         max_commands: Int,
         var weights: Optional[ArcPointer[List[Float64]]] = None,
+        fingerprint: Optional[Self.Fingerprint] = None,
     ):
         self.model = model.copy()
         self.max_commands = max_commands
         self.weights = weights^
+        self.fingerprint = fingerprint
 
     def label(self) -> UInt64:
         return combine_labels(COMMANDS_LABEL, UInt64(len(Self.Cs)))
@@ -205,6 +212,12 @@ struct CommandSequences[*Cs: Command](Copyable, Strategy):
         var steps = Many(
             0, self.max_commands, avg_size=Float64(self.max_commands) / 2
         )
+        # coverage for the fuzz loop: each abstract model state reached,
+        # and each command type run in one
+        var state = UInt64(0)
+        if self.fingerprint:
+            state = self.fingerprint.value()(model)
+            data.feature(_mix(_STATE, state))
         while steps.more(data):
             var k = Int(
                 data.draw_integer(
@@ -218,6 +231,12 @@ struct CommandSequences[*Cs: Command](Copyable, Strategy):
                     if c.precondition(m):
                         c.next_state(m)
                         program.steps.append(Commands[*Self.Cs].Step(c^))
+                        if self.fingerprint:
+                            data.feature(
+                                _mix(_mix(_STATE_COMMAND, state), UInt64(k))
+                            )
+                            state = self.fingerprint.value()(model)
+                            data.feature(_mix(_STATE, state))
                     else:
                         steps.reject(data)
         return program^
@@ -235,12 +254,47 @@ def commands[
 def commands[
     *Cs: Command
 ](
+    model: Cs[0].Model,
+    *,
+    fingerprint: CommandSequences[*Cs].Fingerprint,
+    max_commands: Int = 50,
+) -> CommandSequences[*Cs]:
+    """Like `commands(model)`, with `fingerprint` mapping each model state
+    to an abstract state for the fuzz loop (`FuzzTarget.fuzz`): each
+    abstract state a program reaches, and each command run in one, counts
+    as coverage, so programs that reach new states are kept and extended.
+    Make it coarse (a size, a few flags, which keys are held rather than
+    their values): if almost every state is new, nothing stands out.
+    Without one, the fuzz loop sees only what the commands' strategies
+    drew."""
+    return CommandSequences[*Cs](model, max_commands, fingerprint=fingerprint)
+
+
+def commands[
+    *Cs: Command
+](
     model: Cs[0].Model, *, weights: List[Int], max_commands: Int = 50
 ) raises -> CommandSequences[*Cs]:
     """Like `commands(model)`, choosing each command type in proportion to
     its (positive) weight."""
     var ws = _normalize_weights(weights, len(Cs), "commands", "command types")
     return CommandSequences[*Cs](model, max_commands, ws^)
+
+
+def commands[
+    *Cs: Command
+](
+    model: Cs[0].Model,
+    *,
+    weights: List[Int],
+    fingerprint: CommandSequences[*Cs].Fingerprint,
+    max_commands: Int = 50,
+) raises -> CommandSequences[*Cs]:
+    """Weighted command types and a fingerprint; see the other overloads."""
+    var ws = _normalize_weights(weights, len(Cs), "commands", "command types")
+    return CommandSequences[*Cs](
+        model, max_commands, ws^, fingerprint=fingerprint
+    )
 
 
 def run_commands[

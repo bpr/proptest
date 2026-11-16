@@ -225,5 +225,125 @@ def test_bad_weights() raises:
     assert_true("commands() got 2 weights for 3 command types" in msg, msg)
 
 
+# ---- fuzzing with a model fingerprint
+
+comptime DEEP = 12
+
+
+struct DeepStack(Defaultable, Movable):
+    """A stack that loses an item when popped back below depth 12."""
+
+    var items: List[Int]
+
+    def __init__(out self):
+        self.items = []
+
+    def pop(mut self) raises:
+        _ = self.items.pop()
+        if len(self.items) == DEEP - 1:
+            raise Error("lost an item at depth ", DEEP)
+
+
+@fieldwise_init
+struct SPush(Command):
+    comptime Model = Int
+    comptime Sut = DeepStack
+    var x: Int
+
+    @staticmethod
+    def generate(model: Int, mut data: ConjectureData) raises -> Self:
+        return Self(data.draw(integers(0, 9)))
+
+    def next_state(self, mut model: Int) raises:
+        model += 1
+
+    def run(self, model: Int, mut sut: DeepStack) raises:
+        sut.items.append(self.x)
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("SPush(", self.x, ")")
+
+
+@fieldwise_init
+struct SPop(Command):
+    comptime Model = Int
+    comptime Sut = DeepStack
+
+    @staticmethod
+    def generate(model: Int, mut data: ConjectureData) raises -> Self:
+        return Self()
+
+    def precondition(self, model: Int) raises -> Bool:
+        return model > 0
+
+    def next_state(self, mut model: Int) raises:
+        model -= 1
+
+    def run(self, model: Int, mut sut: DeepStack) raises:
+        sut.pop()
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("SPop()")
+
+
+@fieldwise_init
+struct SClear(Command):
+    comptime Model = Int
+    comptime Sut = DeepStack
+
+    @staticmethod
+    def generate(model: Int, mut data: ConjectureData) raises -> Self:
+        return Self()
+
+    def next_state(self, mut model: Int) raises:
+        model = 0
+
+    def run(self, model: Int, mut sut: DeepStack) raises:
+        sut.items.clear()
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("SClear()")
+
+
+def stack_depth(model: Int) raises -> UInt64:
+    return UInt64(model)
+
+
+def test_a_fingerprint_guides_fuzzing_to_deep_states() raises:
+    # Pop and Clear keep a random program shallow; with the depth as the
+    # fingerprint, each new depth is coverage, and the fuzz loop reaches
+    # depth 12 in about 800 inputs (about 8_000 without).
+    def prop(program: Commands[SPush, SPop, SClear]) raises:
+        var sut = DeepStack()
+        program.run(0, sut)
+
+    var target = fuzz_target(
+        commands[SPush, SPop, SClear](0, fingerprint=stack_depth),
+        prop,
+        Settings(database=None, seed=UInt64(1)),
+    )
+    var msg = String()
+    try:
+        _ = target.fuzz(max_inputs=4000)
+    except e:
+        msg = String(e)
+    assert_true("lost an item" in msg, msg)
+    # shrunk to twelve pushes and a pop
+    assert_true("SPush(0), SPop()]" in msg, msg)
+
+
+def test_a_fingerprint_records_states_and_commands_as_features() raises:
+    def prop(mut data: ConjectureData) raises:
+        _ = data.draw(
+            commands[SPush, SPop, SClear](
+                0, weights=[1, 1, 1], fingerprint=stack_depth
+            )
+        )
+        # the initial state, then a state and a (state, command) per step
+        assert_true(len(data.features) % 2 == 1)
+
+    given_data(prop, fast())
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

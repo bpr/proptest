@@ -271,6 +271,136 @@ data.comparisons)` in a test that draws its own data. Arithmetic on a
 The values compared with also join the "nasty" constants that `given`
 and `fuzz` occasionally generate, so `given` tries them too.
 
+## Fuzz model-based tests
+
+A program from `commands()` (see [Stateful testing](../tutorial/stateful.md)) is
+a value like any other, so `fuzz_target` takes one. What `fuzz` can
+see of it, though, is only what the commands drew, and the bugs that
+model-based tests find are usually in states that take many steps to
+reach. Give `commands` a `fingerprint`, a function from the model to
+an abstract state, and each abstract state a program reaches (and each
+command type run in one) counts as covering something new, so `fuzz`
+keeps the programs that get somewhere new and extends them.
+
+Here a stack loses an item when it's popped back below depth 12, and
+`Pop` and `Clear` keep random programs shallow. With the depth as the
+fingerprint, `fuzz` finds the bug in about 800 inputs, where it takes
+about 8,000 without:
+
+```mojo
+from proptest import Command, Commands, ConjectureData, Settings
+from proptest import commands, fuzz_target, integers
+
+
+struct Stack(Movable):
+    """A stack that loses an item when popped back below depth 12."""
+
+    var items: List[Int]
+
+    def __init__(out self):
+        self.items = []
+
+    def pop(mut self) raises:
+        _ = self.items.pop()
+        if len(self.items) == 11:
+            raise Error("lost an item")
+
+
+@fieldwise_init
+struct Push(Command):
+    comptime Model = Int  # the depth
+    comptime Sut = Stack
+    var x: Int
+
+    @staticmethod
+    def generate(model: Int, mut data: ConjectureData) raises -> Self:
+        return Self(data.draw(integers(0, 9)))
+
+    def next_state(self, mut model: Int) raises:
+        model += 1
+
+    def run(self, model: Int, mut sut: Stack) raises:
+        sut.items.append(self.x)
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("Push(", self.x, ")")
+
+
+@fieldwise_init
+struct Pop(Command):
+    comptime Model = Int
+    comptime Sut = Stack
+
+    @staticmethod
+    def generate(model: Int, mut data: ConjectureData) raises -> Self:
+        return Self()
+
+    def precondition(self, model: Int) raises -> Bool:
+        return model > 0
+
+    def next_state(self, mut model: Int) raises:
+        model -= 1
+
+    def run(self, model: Int, mut sut: Stack) raises:
+        sut.pop()
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("Pop()")
+
+
+@fieldwise_init
+struct Clear(Command):
+    comptime Model = Int
+    comptime Sut = Stack
+
+    @staticmethod
+    def generate(model: Int, mut data: ConjectureData) raises -> Self:
+        return Self()
+
+    def next_state(self, mut model: Int) raises:
+        model = 0
+
+    def run(self, model: Int, mut sut: Stack) raises:
+        sut.items.clear()
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("Clear()")
+
+
+def depth(model: Int) raises -> UInt64:
+    return UInt64(model)
+
+
+def main() raises:
+    def prop(program: Commands[Push, Pop, Clear]) raises:
+        var stack = Stack()
+        program.run(0, stack)
+
+    var target = fuzz_target(
+        commands[Push, Pop, Clear](0, fingerprint=depth),
+        prop,
+        Settings(database=None, seed=UInt64(1)),
+    )
+    try:
+        _ = target.fuzz(10)
+    except e:
+        print(e)
+```
+
+```text
+Falsifying example (stack.mojo:89:29):
+    given([Push(0), Push(0), Push(0), Push(0), Push(0), Push(0), Push(0), Push(0), Push(0), Push(0), Push(0), Push(0), Pop()])
+lost an item
+```
+
+Make the fingerprint coarse: a size, a few flags, which keys a store
+holds rather than their values. If almost every state is new, nothing
+stands out, and the corpus fills with programs that differ only in
+detail. The fingerprint must be a function without captures. To report
+coverage from any test, call `data.feature(x)` with a `UInt64` that
+identifies what the test case reached; a new one counts like a new
+`event`.
+
 ## Crashes
 
 A fuzzer usually finds crashes, not errors. With `Settings(fork=True)`

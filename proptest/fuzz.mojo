@@ -133,8 +133,8 @@ def _bucket(n: Int) -> UInt64:
 def _features(r: ConjectureResult) -> List[UInt64]:
     """What a test case covers, in place of code coverage: each pair of a
     strategy and the strategy that drew it (by span label), with how often
-    it occurred (bucketed), each event, and how close each comparison
-    made with a `Traced` value came to equality."""
+    it occurred (bucketed), each event and `feature`, and how close each
+    comparison made with a `Traced` value came to equality."""
     var counts = Dict[UInt64, Int]()
     for s in r.spans:
         var parent = r.spans[s.parent].label if s.parent >= 0 else UInt64(0)
@@ -145,6 +145,8 @@ def _features(r: ConjectureResult) -> List[UInt64]:
         out.append(_mix(item.key, _bucket(item.value)))
     for e in r.events:
         out.append(_mix(0x6576656E74, UInt64(hash(e))))
+    for f in r.features:
+        out.append(_mix(0x66656174, f))
     # the closest each comparison site came to equality (libFuzzer's value
     # profile), so the corpus keeps each step toward a match
     var closest = Dict[UInt64, Int]()

@@ -320,6 +320,49 @@ def test_fuzz_keeps_an_entry_only_while_it_is_the_simplest_for_something() raise
     assert_true(report.corpus <= report.features, String(report))
 
 
+def _feature_chain(mut data: ConjectureData) raises:
+    var xs = data.draw(lists(integers(0, 15), min_size=5, max_size=5))
+    for i in range(5):
+        if xs[i] != i + 1:
+            return
+        data.feature(UInt64(i))
+    fail("found it")
+
+
+def test_fuzz_is_guided_by_features() raises:
+    # as test_fuzz_is_guided_by_events, with features in place of events
+    var target = fuzz_target_data(
+        _feature_chain, Settings(database=None, seed=UInt64(3))
+    )
+    var msg = String()
+    try:
+        _ = target.fuzz(max_inputs=50_000)
+    except e:
+        msg = String(e)
+    assert_true("found it" in msg, msg)
+
+
+def test_features_survive_fork_mode() raises:
+    # a shorter chain: each input runs in a child process
+    def prop(mut data: ConjectureData) raises:
+        var xs = data.draw(lists(integers(0, 15), min_size=3, max_size=3))
+        for i in range(3):
+            if xs[i] != i + 1:
+                return
+            data.feature(UInt64(i))
+        fail("found it")
+
+    var target = fuzz_target_data(
+        prop, Settings(database=None, fork=True, seed=UInt64(3))
+    )
+    var msg = String()
+    try:
+        _ = target.fuzz(max_inputs=20_000)
+    except e:
+        msg = String(e)
+    assert_true("found it" in msg, msg)
+
+
 def test_fuzz_shrinks_and_reports_like_given() raises:
     def prop(xs: List[Int]) raises:
         var total = 0

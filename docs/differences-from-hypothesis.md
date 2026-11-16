@@ -807,7 +807,11 @@ special values are ignored. The differences:
   Failures are shrunk and reported as `given` reports them. Without
   coverage, a test that branches on values its strategies don't
   distinguish gets no guidance unless it calls `event` or `target`, or
-  uses `traced` values.
+  uses `traced` values, or records `data.feature(x)` (a cheap,
+  string-free `event` that only the fuzz loop reads). `commands()`
+  takes an optional `fingerprint` of the model state; each abstract
+  state reached, and each (state, command type) pair, is a feature, as
+  in state-coverage-guided fuzzing of protocol implementations (AFLNet).
 - **`traced` comparison feedback** (no Hypothesis counterpart). A
   `Traced[T]` (integers or `String`) records the comparisons it takes
   part in, standing in for the comparison instrumentation of AFL++

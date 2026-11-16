@@ -127,12 +127,18 @@ Prints as `[Put(0, 0), Get(0)]`.
 
 ```mojo-sig
 commands[*Cs: Command](model, *, max_commands: Int = 50) -> CommandSequences[*Cs]
+commands[*Cs: Command](model, *, fingerprint: def(Model) raises -> UInt64, max_commands: Int = 50) -> CommandSequences[*Cs]
 commands[*Cs: Command](model, *, weights: List[Int], max_commands: Int = 50) raises -> CommandSequences[*Cs]
+commands[*Cs: Command](model, *, weights: List[Int], fingerprint: def(Model) raises -> UInt64, max_commands: Int = 50) raises -> CommandSequences[*Cs]
 ```
 
 A strategy for programs of up to `max_commands` commands, valid from
 `model`. Shrinks towards shorter programs, and towards the first command
-type. `weights` biases the choice of command type.
+type. `weights` biases the choice of command type. `fingerprint` (a
+function without captures) maps a model state to an abstract state for
+the fuzz loop: each abstract state a program reaches, and each command
+type run in one, is coverage. See [Fuzz model-based
+tests](../how-to/fuzzing.md#fuzz-model-based-tests).
 
 ### `check_commands`
 

@@ -225,6 +225,10 @@ struct ErasedValue(Movable):
 # ===----------------------------------------------------------------------=== #
 
 
+comptime MAX_FEATURES = 4096
+"""The most features `ConjectureData.feature` keeps per test case."""
+
+
 struct ConjectureResult(Copyable):
     """The frozen record of a finished test case."""
 
@@ -240,6 +244,8 @@ struct ConjectureResult(Copyable):
     var events: List[String]
     var comparisons: List[Comparison]
     """The comparisons made with `Traced` values (see `comparisons.mojo`)."""
+    var features: List[UInt64]
+    """Coverage features recorded with `ConjectureData.feature`."""
     var table_entries: List[Tuple[String, String]]
     var covers: Dict[String, Float64]
     var covered: Dict[String, Bool]
@@ -265,6 +271,7 @@ struct ConjectureResult(Copyable):
         self.notes = List[String]()
         self.events = List[String]()
         self.comparisons = List[Comparison]()
+        self.features = List[UInt64]()
         self.table_entries = List[Tuple[String, String]]()
         self.covers = Dict[String, Float64]()
         self.covered = Dict[String, Bool]()
@@ -329,6 +336,7 @@ struct ConjectureData(Movable):
     var notes: List[String]
     var events: List[String]
     var comparisons: ArcPointer[ComparisonLog]
+    var features: List[UInt64]
     """Shared with the `Traced` values drawn in this test case, which record
     their comparisons in it."""
     var table_entries: List[Tuple[String, String]]
@@ -401,6 +409,7 @@ struct ConjectureData(Movable):
         self.notes = List[String]()
         self.events = List[String]()
         self.comparisons = ArcPointer(ComparisonLog())
+        self.features = List[UInt64]()
         self.table_entries = List[Tuple[String, String]]()
         self.covers = Dict[String, Float64]()
         self.covered = Dict[String, Bool]()
@@ -744,6 +753,9 @@ struct ConjectureData(Movable):
         log.int(len(self.arg_spans))
         for a in self.arg_spans:
             log.int(a)
+        log.int(len(self.features))
+        for f in self.features:
+            log.u64(f)
         ref cmps = self.comparisons[].entries
         log.int(len(cmps))
         for c in cmps:
@@ -846,6 +858,12 @@ struct ConjectureData(Movable):
                 self.arg_spans = []
                 for _ in range(r.int()):
                     self.arg_spans.append(r.int())
+                var n_features = r.int()
+                if n_features < 0 or n_features > MAX_FEATURES:
+                    raise Error("a bad number of features")
+                self.features = []
+                for _ in range(n_features):
+                    self.features.append(r.u64())
                 var n_cmps = r.int()
                 if n_cmps < 0 or n_cmps > MAX_COMPARISONS:
                     raise Error("a bad number of comparisons")
@@ -904,6 +922,16 @@ struct ConjectureData(Movable):
         that recorded each event (Hypothesis's `event`)."""
         self.events.append(msg)
 
+    def feature(mut self, x: UInt64):
+        """Record a coverage feature for the fuzz loop (`FuzzTarget.fuzz`):
+        a test case that records one no earlier test case did joins the
+        corpus, like one that records a new `event`, but without making a
+        string. Use it for abstract states the test reaches, e.g. a hash of
+        a coarse summary of a model's state: features that are almost
+        always new give no guidance. Ignored outside fuzzing."""
+        if len(self.features) < MAX_FEATURES:
+            self.features.append(x)
+
     def tabulate(mut self, table: String, value: String):
         """Add `value` to the table `table`. Run statistics show how often
         each value occurred (QuickCheck's `tabulate`)."""
@@ -933,6 +961,7 @@ struct ConjectureData(Movable):
         r.notes = self.notes.copy()
         r.events = self.events.copy()
         r.comparisons = self.comparisons[].entries.copy()
+        r.features = self.features.copy()
         r.table_entries = self.table_entries.copy()
         r.covers = self.covers.copy()
         r.covered = self.covered.copy()
