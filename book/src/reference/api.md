@@ -90,8 +90,27 @@ Fuzzes the test for `seconds` (or `max_inputs` test cases), keeping a
 corpus of test cases that covered something new and mutating them. It
 raises the shrunk failures, as `given` does, if it finds any, and returns
 a `FuzzReport` (`inputs`, `valid`, `corpus`, `features`, `seconds`)
-otherwise. With a database, the corpus is saved under
+otherwise. The corpus stays with the target, so calling `fuzz` again
+continues where it stopped (the report counts only the call's own test
+cases and time; `target.totals()` gives the totals so far). With a database, the corpus is saved under
 `<database_key>.fuzz`. See [Drive a test from a fuzzer](../how-to/fuzzing.md).
+
+### `fuzz_all`
+
+```mojo-sig
+fuzz_all(*targets, seconds=60, max_inputs=None, verbose=False) -> List[FuzzReport]
+```
+
+Fuzzes several targets for `seconds` between them (or `max_inputs` test
+cases in all), giving each 0.1 s slice (or 250 test cases; 50 for a
+target's first) to the target expected to cover new features fastest:
+one over the test cases since it last did, divided by its time per test
+case, as in HypoFuzz. One slice in ten goes to a target at random. A
+target that fails or runs out of test cases gets no more slices; its
+failure is shrunk at once, announced in one line (unless its verbosity is
+quiet), and raised with any others when the time is up. Returns a
+`FuzzReport` per target, in order. See
+[Fuzz many tests at once](../how-to/fuzzing.md#fuzz-many-tests-at-once).
 
 ## Inside a test
 

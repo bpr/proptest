@@ -355,6 +355,8 @@ arithmetic on them stays traced), and `commands()` takes a
 reach new states. `Settings(dictionary=["GET", "POST"])` (or
 `load_dictionary("http.dict")`, in the AFL++/libFuzzer format) gives
 tokens that `fuzz` inserts into strings and byte strings.
+`fuzz_all(t1, t2, ..., seconds=600)` fuzzes several targets, giving the
+time to those still finding new behavior, as HypoFuzz does.
 
 ```mojo
 var target = fuzz_target(lists(integers()), prop)

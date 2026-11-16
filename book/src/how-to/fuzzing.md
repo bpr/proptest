@@ -493,6 +493,74 @@ coverage from any test, call `data.feature(x)` with a `UInt64` that
 identifies what the test case reached; a new one counts like a new
 `event`.
 
+## Fuzz many tests at once
+
+A long fuzzing session is best spent on the tests that are still
+finding new behavior. `fuzz_all(target, ...)` fuzzes several targets in
+turn, in slices of a tenth of a second, and gives each slice to the
+target expected to cover something new soonest: the one with the fewest
+test cases since it last did, for its speed (HypoFuzz's approach). Tests
+that have stopped finding anything get a slice now and then, in case.
+A target that fails stops there; the rest go on until the time is up,
+and then every failure is raised together:
+
+```mojo
+from proptest import fuzz_all, fuzz_target, integers, lists, text, fail
+from proptest import Settings
+
+
+def main() raises:
+    def reverse_twice(xs: List[Int]) raises:
+        var ys = xs.copy()
+        ys.reverse()
+        ys.reverse()
+        if ys != xs:
+            fail("reversing twice changed the list")
+
+    def trim(s: String) raises:
+        if String(s.strip()).byte_length() > s.byte_length():
+            fail("strip made it longer")
+
+    def halve(x: Int) raises:
+        if x > 0 and x // 2 >= x:
+            fail("halving didn't shrink it")
+
+    def mean(xs: List[Int]) raises:
+        if len(xs) == 0:
+            return
+        var total = 0
+        for x in xs:
+            total += x
+        if total // len(xs) > 1000:
+            fail("mean too big")
+
+    var settings = Settings(database=None)
+    var a = fuzz_target(lists(integers()), reverse_twice, settings)
+    var b = fuzz_target(text(), trim, settings)
+    var c = fuzz_target(integers(), halve, settings)
+    var d = fuzz_target(lists(integers(0, 10_000)), mean, settings)
+    try:
+        var reports = fuzz_all(a, b, c, d, seconds=5)
+        for r in reports:
+            print(r)
+    except e:
+        print(e)
+```
+
+```text
+proptest: fuzz_all: campaign.mojo:34:24 failed (reported at the end)
+Falsifying example (campaign.mojo:34:24):
+    given([1001])
+At campaign.mojo:28:17: AssertionError: mean too big
+```
+
+Without a failure, `fuzz_all` returns each target's `FuzzReport`.
+`max_inputs=` caps the test cases across all the targets, and
+`verbose=True` prints each target's totals. Each target keeps its
+corpus (in the database too, as with `fuzz`), so a later `fuzz_all` or
+`fuzz` goes on from there. Unlike `fuzz`, a target doesn't go on
+looking for other bugs once it has failed.
+
 ## Crashes
 
 A fuzzer usually finds crashes, not errors. With `Settings(fork=True)`

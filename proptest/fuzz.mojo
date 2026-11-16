@@ -24,6 +24,8 @@ same `Settings.database_key` (each defaults to its call site).
 loop that keeps a corpus of choice sequences that covered something new
 and mutates them, then shrinks and reports any failures as `given` does.
 Hypothesis has no such loop (HypoFuzz, a separate project, is one).
+`fuzz_all(t1, t2, ...)` shares a time budget among several targets, as
+HypoFuzz does, favoring those still covering new features.
 """
 
 from std.collections import Set
@@ -660,96 +662,208 @@ struct FuzzReport(Copyable, Writable):
         )
 
 
-def _fuzz_loop[
-    F: def(mut ConjectureData) raises
-](
-    mut runner: ConjectureRunner[F], seconds: Float64, max_inputs: Int
-) raises -> FuzzReport:
-    var start = perf_counter_ns()
-    var stop_at = start + Int(seconds * 1e9)
-    var next_progress = start + 5_000_000_000
-    var calls0 = runner.call_count
-    var valid0 = runner.valid_count
-    var corpus = _Corpus()
-    var key = runner.db_key + ".fuzz"
-    var use_db = Bool(runner.db) and runner.db_key.byte_length() > 0
-    # failures saved by earlier runs (`given`'s, or fuzzing's)
-    runner.reuse_existing_examples()
-    if len(runner.interesting) > 0:
-        # report them now, as `given` does
-        return FuzzReport()
-    # seeds: the simplest test case, then the corpus saved by earlier runs
-    _ = corpus.add(
-        runner.cached_test_function(List[ChoiceValue](), extend_simplest=True)
-    )
-    if use_db:
-        for choices in runner.db.value().fetch(key):
-            if not corpus.add(runner.cached_test_function(choices)):
-                runner.db.value().delete(key, choices)
-            for r in corpus.dropped:
-                runner.db.value().delete(key, r[].choices())
-            corpus.dropped.clear()
-    var verbose = runner.settings.verbosity >= Verbosity.verbose
-    while _keep_looking(runner):
-        if runner.call_count - calls0 >= max_inputs:
-            break
-        var now = perf_counter_ns()
-        if now >= stop_at:
-            break
-        if verbose and now >= next_progress:
-            next_progress = now + 5_000_000_000
-            print(
-                String(
-                    "proptest: fuzzing: ",
-                    runner.call_count - calls0,
-                    " inputs, corpus of ",
-                    len(corpus.entries),
-                    ", ",
-                    len(corpus.freq),
-                    " features",
-                )
+struct _Fuzzer[F: def(mut ConjectureData) raises](Movable):
+    """A fuzz target's runner and its corpus, kept between calls so that
+    fuzzing resumes where it stopped (`fuzz` again, or `fuzz_all`'s
+    slices)."""
+
+    var runner: ConjectureRunner[Self.F]
+    var corpus: _Corpus
+    var started: Bool
+    var done: Bool
+    """Nothing more to do: the test failed (and doesn't look for other
+    bugs) or every test case has been tried."""
+    var ns: Int
+    """Time spent fuzzing."""
+    var next_progress: Int
+    var last_new: Int
+    """`runner.call_count` when the corpus last covered a new feature."""
+
+    def __init__(out self, var test_fn: Self.F, settings: Settings):
+        self.runner = ConjectureRunner[Self.F](test_fn^, settings)
+        self.corpus = _Corpus()
+        self.started = False
+        self.done = False
+        self.ns = 0
+        self.next_progress = 0
+        self.last_new = 0
+
+    def _db_key(self) -> String:
+        return self.runner.db_key + ".fuzz"
+
+    def _use_db(self) -> Bool:
+        return Bool(self.runner.db) and self.runner.db_key.byte_length() > 0
+
+    def start(mut self) raises:
+        """Replay saved failures, then seed the corpus: the simplest test
+        case, then the corpus saved by earlier runs."""
+        self.started = True
+        self.next_progress = perf_counter_ns() + 5_000_000_000
+        ref runner = self.runner
+        runner.reuse_existing_examples()
+        if len(runner.interesting) > 0:
+            # report them now, as `given` does
+            self.done = True
+            return
+        _ = self.corpus.add(
+            runner.cached_test_function(
+                List[ChoiceValue](), extend_simplest=True
             )
-        runner.check_flaky()
-        if runner.tree.is_exhausted():
-            break
-        if len(runner.tree.nodes) > _MAX_TREE_NODES:
-            runner.tree = DataTree()
-        var result: Result
-        if len(corpus.entries) == 0 or runner.random.below(10) == 0:
-            var prefix = runner.tree.generate_novel_prefix(runner.tree_provider)
-            var data = runner.new_data(prefix^)
-            result = runner.test_function(data)
-        else:
-            var parent = corpus.entries[corpus.pick(runner.random)].result
-            var attempt = _mutate(runner, corpus, parent)
-            result = runner.cached_test_function(attempt, extend=-1)
-        if corpus.add(result) and use_db:
-            runner.db.value().save(key, result[].choices())
-            for r in corpus.dropped:
-                runner.db.value().delete(key, r[].choices())
-        corpus.dropped.clear()
-    var report = FuzzReport()
-    report.inputs = runner.call_count - calls0
-    report.valid = runner.valid_count - valid0
-    report.corpus = len(corpus.entries)
-    report.features = len(corpus.freq)
-    report.seconds = Float64(perf_counter_ns() - start) / 1e9
-    if verbose:
-        print(String("proptest: fuzzed ", report))
-    return report^
+        )
+        if self._use_db():
+            var key = self._db_key()
+            for choices in runner.db.value().fetch(key):
+                if not self.corpus.add(runner.cached_test_function(choices)):
+                    runner.db.value().delete(key, choices)
+                for r in self.corpus.dropped:
+                    runner.db.value().delete(key, r[].choices())
+                self.corpus.dropped.clear()
+
+    def run(mut self, stop_at: Int, max_inputs: Int) raises:
+        """Fuzz until `stop_at` (`perf_counter_ns`), or for `max_inputs`
+        test cases, or until there's nothing more to do."""
+        var t0 = perf_counter_ns()
+        var calls0 = self.runner.call_count
+        if not self.started:
+            self.start()
+        ref runner = self.runner
+        var key = self._db_key()
+        var use_db = self._use_db()
+        var verbose = runner.settings.verbosity >= Verbosity.verbose
+        while not self.done:
+            if not _keep_looking(runner) or runner.tree.is_exhausted():
+                self.done = True
+                break
+            if runner.call_count - calls0 >= max_inputs:
+                break
+            var now = perf_counter_ns()
+            if now >= stop_at:
+                break
+            if verbose and now >= self.next_progress:
+                self.next_progress = now + 5_000_000_000
+                print(
+                    String(
+                        "proptest: fuzzing: ",
+                        runner.call_count,
+                        " inputs, corpus of ",
+                        len(self.corpus.entries),
+                        ", ",
+                        len(self.corpus.freq),
+                        " features",
+                    )
+                )
+            runner.check_flaky()
+            if len(runner.tree.nodes) > _MAX_TREE_NODES:
+                runner.tree = DataTree()
+            var result: Result
+            if len(self.corpus.entries) == 0 or runner.random.below(10) == 0:
+                var prefix = runner.tree.generate_novel_prefix(
+                    runner.tree_provider
+                )
+                var data = runner.new_data(prefix^)
+                result = runner.test_function(data)
+            else:
+                var parent = self.corpus.entries[
+                    self.corpus.pick(runner.random)
+                ].result
+                var attempt = _mutate(runner, self.corpus, parent)
+                result = runner.cached_test_function(attempt, extend=-1)
+            var known = len(self.corpus.freq)
+            if self.corpus.add(result) and use_db:
+                runner.db.value().save(key, result[].choices())
+                for r in self.corpus.dropped:
+                    runner.db.value().delete(key, r[].choices())
+            self.corpus.dropped.clear()
+            if len(self.corpus.freq) > known:
+                self.last_new = runner.call_count
+        self.ns += perf_counter_ns() - t0
+
+    def report(self) -> FuzzReport:
+        """Totals so far."""
+        var r = FuzzReport()
+        r.inputs = self.runner.call_count
+        r.valid = self.runner.valid_count
+        r.corpus = len(self.corpus.entries)
+        r.features = len(self.corpus.freq)
+        r.seconds = Float64(self.ns) / 1e9
+        return r^
+
+    def since_new(self) -> Int:
+        """Test cases run since the corpus last covered a new feature."""
+        return self.runner.call_count - self.last_new
+
+    def raise_failures(mut self, name: String) raises:
+        """Shrink and raise the failures found, if any, as `given` does."""
+        if len(self.runner.interesting) == 0:
+            return
+        var settings = self.runner.settings.copy()
+        var report = RunReport()
+        report.seed = self.runner.seed
+        shrink_and_replay(self.runner, report, settings, name)
+        _raise_failures(report, name, settings)
 
 
-struct FuzzTarget[P: Movable & Deinitable](Movable):
-    """A property to run once per input from a fuzzer; see `fuzz_target`.
+trait _Fuzzable:
+    """A `FuzzTarget`, whatever its type: what `fuzz_all` needs of it."""
+
+    def _handle(self) -> _Handle:
+        ...
+
+
+struct _Handle(Copyable):
+    """A fuzz target's type-erased state and operations, for `fuzz_all`
+    (valid while the target is)."""
+
+    var ptr: _ErasedPtr
+    var step: def(_ErasedPtr, Int, Int) thin raises
+    var report: def(_ErasedPtr) thin -> FuzzReport
+    var since_new: def(_ErasedPtr) thin -> Int
+    var done: def(_ErasedPtr) thin -> Bool
+    var raise_: def(_ErasedPtr, String) thin raises
+    var quiet: Bool
+    var name: String
+
+    def __init__(
+        out self,
+        ptr: _ErasedPtr,
+        step: def(_ErasedPtr, Int, Int) thin raises,
+        report: def(_ErasedPtr) thin -> FuzzReport,
+        since_new: def(_ErasedPtr) thin -> Int,
+        done: def(_ErasedPtr) thin -> Bool,
+        raise_: def(_ErasedPtr, String) thin raises,
+        quiet: Bool,
+        name: String,
+    ):
+        self.ptr = ptr
+        self.step = step
+        self.report = report
+        self.since_new = since_new
+        self.done = done
+        self.raise_ = raise_
+        self.quiet = quiet
+        self.name = name
+
+
+struct FuzzTarget[P: Movable & Deinitable](Movable, _Fuzzable):
+    """A property to run once per input from a fuzzer, or to fuzz; see
+    `fuzz_target`.
 
     `P` is the type of the test and its strategies, which the target owns:
-    it keeps alive whatever the test captures by reference.
+    it keeps alive whatever the test captures by reference. The target
+    keeps its corpus between calls to `fuzz`.
     """
 
     var _parts: Pointer[Self.P, MutUntrackedOrigin]
     var _ptr: _ErasedPtr
     var _run: def(_ErasedPtr, List[UInt8]) thin raises -> Optional[List[UInt8]]
-    var _loop: def(_ErasedPtr, Float64, Int, String) thin raises -> FuzzReport
+    var _step: def(_ErasedPtr, Int, Int) thin raises
+    var _report: def(_ErasedPtr) thin -> FuzzReport
+    var _since_new: def(_ErasedPtr) thin -> Int
+    var _done: def(_ErasedPtr) thin -> Bool
+    """Whether the target has failed or has nothing more to try."""
+    var _raise: def(_ErasedPtr, String) thin raises
+    var _verbose: Bool
+    var _quiet: Bool
     var _free: def(_ErasedPtr) thin
     var _name: String
 
@@ -764,25 +878,28 @@ struct FuzzTarget[P: Movable & Deinitable](Movable):
     ):
         """Take ownership of `parts` (a heap allocation), and run
         `test_fn`, which reads them through its pointer."""
-        comptime R = ConjectureRunner[F]
+        comptime R = _Fuzzer[F]
 
         def run_(
             p: _ErasedPtr, buffer: List[UInt8]
         ) raises -> Optional[List[UInt8]]:
-            return _fuzz_one(p.unsafe_bitcast[R]()[], buffer)
+            return _fuzz_one(p.unsafe_bitcast[R]()[].runner, buffer)
 
-        def loop_(
-            p: _ErasedPtr, seconds: Float64, max_inputs: Int, name: String
-        ) raises -> FuzzReport:
-            ref runner = p.unsafe_bitcast[R]()[]
-            var fr = _fuzz_loop(runner, seconds, max_inputs)
-            if len(runner.interesting) > 0:
-                var settings = runner.settings.copy()
-                var report = RunReport()
-                report.seed = runner.seed
-                shrink_and_replay(runner, report, settings, name)
-                _raise_failures(report, name, settings)
-            return fr^
+        def step_(p: _ErasedPtr, stop_at: Int, max_inputs: Int) raises:
+            p.unsafe_bitcast[R]()[].run(stop_at, max_inputs)
+
+        def report_(p: _ErasedPtr) -> FuzzReport:
+            return p.unsafe_bitcast[R]()[].report()
+
+        def since_new_(p: _ErasedPtr) -> Int:
+            return p.unsafe_bitcast[R]()[].since_new()
+
+        def done_(p: _ErasedPtr) -> Bool:
+            ref f = p.unsafe_bitcast[R]()[]
+            return f.done or len(f.runner.interesting) > 0
+
+        def raise_(p: _ErasedPtr, name: String) raises:
+            p.unsafe_bitcast[R]()[].raise_failures(name)
 
         def free_(p: _ErasedPtr):
             var q = p.unsafe_bitcast[R]()
@@ -794,7 +911,13 @@ struct FuzzTarget[P: Movable & Deinitable](Movable):
         self._parts = parts
         self._ptr = q.unsafe_bitcast[NoneType]()
         self._run = run_
-        self._loop = loop_
+        self._step = step_
+        self._report = report_
+        self._since_new = since_new_
+        self._done = done_
+        self._raise = raise_
+        self._verbose = settings.verbosity >= Verbosity.verbose
+        self._quiet = settings.verbosity == Verbosity.quiet
         self._free = free_
         self._name = name
 
@@ -802,6 +925,27 @@ struct FuzzTarget[P: Movable & Deinitable](Movable):
         self._free(self._ptr)
         _ = self._parts.unsafe_take_pointee()
         self._parts.unsafe_free()
+
+    def totals(self) -> FuzzReport:
+        """What fuzzing this target has done so far, over every `fuzz` and
+        `fuzz_all` call."""
+        return self._report(self._ptr)
+
+    def _handle(self) -> _Handle:
+        return _Handle(
+            self._ptr,
+            self._step,
+            self._report,
+            self._since_new,
+            self._done,
+            self._raise,
+            self._quiet,
+            self._name,
+        )
+
+    def name(self) -> String:
+        """The target's name: its call site, or `Settings.database_key`."""
+        return self._name
 
     def fuzz_one_input(
         mut self, buffer: Span[UInt8, _]
@@ -847,14 +991,160 @@ struct FuzzTarget[P: Movable & Deinitable](Movable):
         inserts the dictionary's tokens into strings and byte strings, and
         sets integers to the tokens that are numbers.
 
-        With a database, failures go to the test's `database_key` and the
-        corpus to `<database_key>.fuzz`, so the next run starts where this
-        one stopped. Raises the shrunk failures if it found any; returns
+        The corpus stays with the target, so calling `fuzz` again goes on
+        where it stopped. With a database, failures go to the test's
+        `database_key` and the corpus to `<database_key>.fuzz`, so the
+        next run starts where this one stopped too. Raises the shrunk failures if it found any; returns
         what it did otherwise.
         """
-        return self._loop(
-            self._ptr, seconds, max_inputs.or_else(Int.MAX), self._name
+        var before = self._report(self._ptr)
+        var stop_at = perf_counter_ns() + Int(seconds * 1e9)
+        self._step(self._ptr, stop_at, max_inputs.or_else(Int.MAX))
+        self._raise(self._ptr, self._name)
+        var r = self._report(self._ptr)
+        r.inputs -= before.inputs
+        r.valid -= before.valid
+        r.seconds -= before.seconds
+        if self._verbose:
+            print(String("proptest: fuzzed ", r))
+        return r^
+
+
+comptime _SLICE_NS = 100_000_000
+"""How long `fuzz_all` runs a target before choosing again."""
+comptime _SLICE_INPUTS = 250
+"""... or how many test cases, whichever comes first."""
+comptime _FIRST_SLICE_INPUTS = 50
+"""A target's first slice, enough to estimate its rate."""
+comptime _EXPLORE = 10
+"""One choice in this many is a target at random."""
+
+
+def _discovery_rate(r: FuzzReport, since_new: Int) -> Float64:
+    """New features a target is expected to find per second: the chance
+    that its next test case covers something new, estimated as one over
+    the number of test cases since it last did, divided by its time per
+    test case."""
+    var p_new = 1.0 / Float64(since_new + 1)
+    var per_input = r.seconds / Float64(max(r.inputs, 1))
+    return p_new / max(per_input, 1e-7)
+
+
+def fuzz_all[
+    *Ts: _Fuzzable
+](
+    mut *targets: *Ts,
+    seconds: Float64 = 60,
+    max_inputs: Optional[Int] = None,
+    verbose: Bool = False,
+) raises -> List[FuzzReport]:
+    """Fuzz several targets for `seconds` between them (or `max_inputs`
+    test cases in all), giving the time to those finding new behavior
+    fastest, as HypoFuzz does.
+
+    Time goes out in slices of 0.1 s (or 250 test cases; 50 for a
+    target's first). After each target has had one, each slice goes to the target with the highest
+    expected rate of new features: the chance that its next test case
+    covers a new one, estimated as one over the number of test cases
+    since it last did (HypoFuzz's "since new coverage"), divided by its
+    time per test case. One slice in ten goes to a target
+    at random, so none is starved by a bad estimate. A target that fails,
+    or has run every test case it can, gets no more slices (so, unlike
+    `fuzz`, it doesn't go on looking for other bugs).
+
+    Each target keeps its corpus (and saves it to the database) as with
+    `fuzz`. A failure is shrunk when found, with a line saying so (unless
+    the target's verbosity is quiet), and the failures are raised
+    together at the end, once the others have had their time. Returns what each
+    target did, in order; with `verbose`, prints each target's totals at
+    the end.
+    """
+    var hs = List[_Handle]()
+    comptime for i in range(targets.__len__()):
+        hs.append(targets[i]._handle())
+    var n = len(hs)
+    if n == 0:
+        return List[FuzzReport]()
+    var stop_at = perf_counter_ns() + Int(seconds * 1e9)
+    var budget = max_inputs.or_else(Int.MAX)
+    var rnd = Random(UInt64(perf_counter_ns()))
+    var before = List[FuzzReport]()
+    var stopped = List[Bool]()
+    var tried = List[Bool]()
+    for i in range(n):
+        before.append(hs[i].report(hs[i].ptr))
+        stopped.append(False)
+        tried.append(False)
+    var failures = List[String]()
+    var used = 0
+    while used < budget and perf_counter_ns() < stop_at:
+        var live = List[Int]()
+        for i in range(n):
+            if not stopped[i]:
+                live.append(i)
+        if len(live) == 0:
+            break
+        var pick = -1
+        for i in live:
+            if not tried[i]:
+                pick = i
+                break
+        if pick < 0:
+            if rnd.below(_EXPLORE) == 0:
+                pick = live[Int(rnd.below(UInt64(len(live))))]
+            else:
+                var best = -1.0
+                for i in live:
+                    ref h = hs[i]
+                    var rate = _discovery_rate(
+                        h.report(h.ptr), h.since_new(h.ptr)
+                    )
+                    if rate > best:
+                        best = rate
+                        pick = i
+        var slice = _SLICE_INPUTS if tried[pick] else _FIRST_SLICE_INPUTS
+        tried[pick] = True
+        ref h = hs[pick]
+        var calls0 = h.report(h.ptr).inputs
+        h.step(
+            h.ptr,
+            min(stop_at, perf_counter_ns() + _SLICE_NS),
+            min(slice, budget - used),
         )
+        used += h.report(h.ptr).inputs - calls0
+        if h.done(h.ptr):
+            stopped[pick] = True
+            try:
+                h.raise_(h.ptr, h.name)
+            except e:
+                var msg = String(e)
+                failures.append(msg)
+                if not h.quiet:
+                    print(
+                        String(
+                            "proptest: fuzz_all: ",
+                            h.name,
+                            " failed (reported at the end)",
+                        )
+                    )
+    var out = List[FuzzReport]()
+    for i in range(n):
+        ref h = hs[i]
+        var r = h.report(h.ptr)
+        r.inputs -= before[i].inputs
+        r.valid -= before[i].valid
+        r.seconds -= before[i].seconds
+        if verbose:
+            print(String("proptest: ", h.name, ": ", r))
+        out.append(r^)
+    if len(failures) > 0:
+        var msg = String()
+        for i in range(len(failures)):
+            if i > 0:
+                msg += "\n\n"
+            msg += failures[i]
+        raise Error(msg)
+    return out^
 
 
 @always_inline

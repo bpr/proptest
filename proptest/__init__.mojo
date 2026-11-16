@@ -41,7 +41,13 @@ from proptest.core import (
     run_test,
 )
 from proptest.dictionary import Dictionary, load_dictionary, parse_dictionary
-from proptest.fuzz import FuzzReport, FuzzTarget, fuzz_target, fuzz_target_data
+from proptest.fuzz import (
+    FuzzReport,
+    FuzzTarget,
+    fuzz_all,
+    fuzz_target,
+    fuzz_target_data,
+)
 from proptest.settings import (
     Settings,
     Phases,

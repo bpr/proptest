@@ -441,5 +441,78 @@ def test_fuzz_reports_a_crash_in_fork_mode() raises:
     assert_true("given([1, 0])" in msg, msg)
 
 
+def _long_chain(mut data: ConjectureData) raises:
+    # no bug, but new features for a long time
+    for i in range(1000):
+        if data.draw(integers(0, 3)) != 3:
+            return
+        data.feature(UInt64(i))
+
+
+def _nothing(x: Int) raises:
+    pass
+
+
+def test_fuzz_resumes_where_it_stopped() raises:
+    var target = fuzz_target_data(
+        _long_chain, Settings(database=None, seed=UInt64(1))
+    )
+    var first = target.fuzz(max_inputs=500)
+    var second = target.fuzz(max_inputs=500)
+    assert_equal(target.totals().inputs, 1000)
+    assert_equal(first.inputs, 500)
+    assert_equal(second.inputs, 500)  # this call's, not the total
+    assert_true(second.features > first.features, String(first, second))
+
+
+def test_fuzz_all_gives_its_time_to_targets_finding_new_things() raises:
+    var a = fuzz_target(integers(0, 10), _nothing, Settings(database=None))
+    var chain = fuzz_target_data(
+        _long_chain, Settings(database=None, seed=UInt64(2))
+    )
+    var c = fuzz_target(integers(), _nothing, Settings(database=None))
+    var reports = fuzz_all(a, chain, c, max_inputs=10_000)
+    assert_equal(len(reports), 3)
+    var total = 0
+    for r in reports:
+        total += r.inputs
+    assert_true(total >= 10_000 and total < 10_300, String(total))
+    assert_true(
+        reports[1].inputs > 3 * (reports[0].inputs + reports[2].inputs),
+        String(reports[0], "; ", reports[1], "; ", reports[2]),
+    )
+
+
+def test_fuzz_all_reports_every_failure_after_fuzzing_the_rest() raises:
+    def small(x: Int) raises:
+        if x > 1000:
+            fail("too big")
+
+    def short(s: String) raises:
+        if s.byte_length() > 3:
+            fail("too long")
+
+    var a = fuzz_target(integers(), small, Settings(database=None))
+    var bools = fuzz_target(booleans(), _bool_ok, Settings(database=None))
+    var c = fuzz_target(text(), short, Settings(database=None))
+    var chain = fuzz_target_data(
+        _long_chain, Settings(database=None, seed=UInt64(3))
+    )
+    var msg = String()
+    try:
+        _ = fuzz_all(a, bools, c, chain, max_inputs=3000)
+    except e:
+        msg = String(e)
+    assert_true("given(1001)" in msg and "too big" in msg, msg)
+    assert_true("too long" in msg, msg)
+    # the booleans target ran out of test cases; the chain had the rest
+    assert_true(chain.totals().inputs > 1000)
+    assert_true(bools.totals().inputs < 10)
+
+
+def _bool_ok(b: Bool) raises:
+    pass
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
