@@ -505,6 +505,66 @@ coverage from any test, call `data.feature(x)` with a `UInt64` that
 identifies what the test case reached; a new one counts like a new
 `event`.
 
+## Find slow inputs
+
+A test can ask the fuzz loop for inputs that make some code do a lot of
+work, as PerfFuzz does: `data.count(site, n)` adds `n` to a count for
+`site` (any `UInt64`), and the corpus keeps, for each site, the test
+case with the highest count, so mutations climb toward the worst case.
+Count what makes the code slow (loop iterations, probes, allocations)
+and assert a budget, so that an input over it is a failure that `fuzz`
+shrinks. Here insertion sort is fast on random lists, but the fuzz loop
+finds one that is nearly reversed, which random generation almost never
+produces:
+
+```mojo
+from proptest import fuzz_target_data, lists, integers, fail
+from proptest import ConjectureData, Settings
+
+
+def shifts(var xs: List[Int]) -> Int:
+    """Insertion sort `xs`; return how many elements it shifted."""
+    var n = 0
+    for i in range(1, len(xs)):
+        var x = xs[i]
+        var j = i
+        while j > 0 and xs[j - 1] > x:
+            xs[j] = xs[j - 1]
+            j -= 1
+            n += 1
+        xs[j] = x
+    return n
+
+
+def main() raises:
+    def fast_enough(mut data: ConjectureData) raises:
+        var xs = data.draw(lists(integers(0, 1000), max_size=12))
+        var n = shifts(xs^)
+        data.count(1, n)
+        if n >= 60:
+            fail(String(n, " shifts"))
+
+    var target = fuzz_target_data(
+        fast_enough, Settings(database=None, seed=UInt64(1))
+    )
+    try:
+        _ = target.fuzz(10)
+    except e:
+        print(e)
+```
+
+```text
+Falsifying example (slow_sort.mojo:27:34):
+    Draw 1: [6, 5, 4, 3, 3, 2, 2, 1, 1, 0, 0, 0]
+At slow_sort.mojo:25:17: AssertionError: 60 shifts
+```
+
+For a single count, `data.target(score)` does much the same. Counts
+are kept separately for each site, so with several hot spots the loop
+pushes each of them to its worst, where one `target` score for the total
+would favor whichever is easiest to grow. Without a failure,
+`FuzzReport.max_count` is the highest count reached at any site.
+
 ## Fuzz many tests at once
 
 A long fuzzing session is best spent on the tests that are still

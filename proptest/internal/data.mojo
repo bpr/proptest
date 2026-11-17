@@ -229,6 +229,9 @@ struct ErasedValue(Movable):
 comptime MAX_FEATURES = 4096
 """The most features `ConjectureData.feature` keeps per test case."""
 
+comptime MAX_COUNT_SITES = 4096
+"""The most sites `ConjectureData.count` counts per test case."""
+
 
 struct ConjectureResult(Copyable):
     """The frozen record of a finished test case."""
@@ -247,6 +250,8 @@ struct ConjectureResult(Copyable):
     """The comparisons made with `Traced` values (see `comparisons.mojo`)."""
     var features: List[UInt64]
     """Coverage features recorded with `ConjectureData.feature`."""
+    var counts: Dict[UInt64, Int]
+    """Counts by site, recorded with `ConjectureData.count`."""
     var table_entries: List[Tuple[String, String]]
     var covers: Dict[String, Float64]
     var covered: Dict[String, Bool]
@@ -273,6 +278,7 @@ struct ConjectureResult(Copyable):
         self.events = List[String]()
         self.comparisons = List[Comparison]()
         self.features = List[UInt64]()
+        self.counts = Dict[UInt64, Int]()
         self.table_entries = List[Tuple[String, String]]()
         self.covers = Dict[String, Float64]()
         self.covered = Dict[String, Bool]()
@@ -340,6 +346,8 @@ struct ConjectureData(Movable):
     var features: List[UInt64]
     """Shared with the `Traced` values drawn in this test case, which record
     their comparisons in it."""
+    var counts: Dict[UInt64, Int]
+    """Counts by site (`count`)."""
     var table_entries: List[Tuple[String, String]]
     """Values recorded with `tabulate`, as (table, value)."""
     var covers: Dict[String, Float64]
@@ -415,6 +423,7 @@ struct ConjectureData(Movable):
         self.events = List[String]()
         self.comparisons = ArcPointer(ComparisonLog())
         self.features = List[UInt64]()
+        self.counts = Dict[UInt64, Int]()
         self.table_entries = List[Tuple[String, String]]()
         self.covers = Dict[String, Float64]()
         self.covered = Dict[String, Bool]()
@@ -772,6 +781,10 @@ struct ConjectureData(Movable):
         log.int(len(self.features))
         for f in self.features:
             log.u64(f)
+        log.int(len(self.counts))
+        for item in self.counts.items():
+            log.u64(item.key)
+            log.int(item.value)
         ref cmps = self.comparisons[].entries
         log.int(len(cmps))
         for c in cmps:
@@ -880,6 +893,16 @@ struct ConjectureData(Movable):
                 self.features = []
                 for _ in range(n_features):
                     self.features.append(r.u64())
+                var n_counts = r.int()
+                if n_counts < 0 or n_counts > MAX_COUNT_SITES:
+                    raise Error("a bad number of counted sites")
+                self.counts = {}
+                for _ in range(n_counts):
+                    var site = r.u64()
+                    var n = r.int()
+                    if n < 0:
+                        raise Error("a bad count")
+                    self.counts[site] = n
                 var n_cmps = r.int()
                 if n_cmps < 0 or n_cmps > MAX_COMPARISONS:
                     raise Error("a bad number of comparisons")
@@ -948,6 +971,22 @@ struct ConjectureData(Movable):
         if len(self.features) < MAX_FEATURES:
             self.features.append(x)
 
+    def count(mut self, site: UInt64, n: Int = 1):
+        """Add `n` to the count at `site`, for the fuzz loop
+        (`FuzzTarget.fuzz`) to maximize, as PerfFuzz maximizes the hit
+        count of each branch: the corpus keeps, for each site, the test
+        case with the highest count. Count the work done at a hot spot
+        (loop iterations, probes, allocations) to look for the inputs that
+        make it slow; a budget the test asserts turns them into failures.
+        Ignored outside fuzzing."""
+        if n <= 0:
+            return
+        var c = self.counts.get(site)
+        if c:
+            self.counts[site] = c.value() + n
+        elif len(self.counts) < MAX_COUNT_SITES:
+            self.counts[site] = n
+
     def tabulate(mut self, table: String, value: String):
         """Add `value` to the table `table`. Run statistics show how often
         each value occurred (QuickCheck's `tabulate`)."""
@@ -978,6 +1017,7 @@ struct ConjectureData(Movable):
         r.events = self.events.copy()
         r.comparisons = self.comparisons[].entries.copy()
         r.features = self.features.copy()
+        r.counts = self.counts.copy()
         r.table_entries = self.table_entries.copy()
         r.covers = self.covers.copy()
         r.covered = self.covered.copy()

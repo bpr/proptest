@@ -837,6 +837,15 @@ special values are ignored. The differences:
   takes an optional `fingerprint` of the model state; each abstract
   state reached, and each (state, command type) pair, is a feature, as
   in state-coverage-guided fuzzing of protocol implementations (AFLNet).
+  `data.count(site, n)` adds to a count per site, and the corpus keeps
+  the valid test case with the highest count at each site (the simplest
+  on a tie), weighted as a `target` scorer is: PerfFuzz's per-edge
+  maxima (in JQF), with the test naming its hot spots since the loop
+  can't see branch counts. For one site this is close to a `target`
+  score; with several, each is pushed to its worst separately (two
+  insertion sorts that must both be nearly reversed took a median of
+  20k test cases with a count each, 33k with a `target` on the total;
+  `pixi run fuzz-bench`).
 - **`traced` comparison feedback** (no Hypothesis counterpart). A
   `Traced[T]` (integers or `String`) records the comparisons it takes
   part in, standing in for the comparison instrumentation of AFL++

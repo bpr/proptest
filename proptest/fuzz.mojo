@@ -194,8 +194,9 @@ frequencies change with every test case), or when the corpus changes."""
 
 struct _Corpus(Movable):
     """The test cases worth mutating: for each feature, the simplest valid
-    test case that covered it, and for each `target` label, the valid test
-    case with the best score.
+    test case that covered it, for each `target` label, the valid test
+    case with the best score, and for each `count` site, the valid test
+    case with the highest count (PerfFuzz).
 
     As in Zest's validity fuzzing, an invalid test case (rejected by
     `assume` or a filter) that covers a feature no valid one has joins
@@ -225,6 +226,11 @@ struct _Corpus(Movable):
     var best: Dict[String, Float64]
     """The best score seen for each `target` label."""
     var best_owner: Dict[String, Int]
+    var max_count: Dict[UInt64, Int]
+    """The highest count seen at each `count` site."""
+    var count_owner: Dict[UInt64, Int]
+    var raised: Int
+    """How many times a count reached a new high."""
     var dropped: List[Result]
     """Entries dropped since the caller last cleared this (to delete from
     the database)."""
@@ -239,6 +245,9 @@ struct _Corpus(Movable):
         self.seen = 0
         self.best = Dict[String, Float64]()
         self.best_owner = Dict[String, Int]()
+        self.max_count = Dict[UInt64, Int]()
+        self.count_owner = Dict[UInt64, Int]()
+        self.raised = 0
         self.dropped = List[Result]()
         self._cumulative = List[Float64]()
         self._picks = 0
@@ -286,7 +295,24 @@ struct _Corpus(Movable):
             if not best or item.value > best.value():
                 self.best[item.key] = item.value
                 labels.append(item.key)
-        if len(claims) == 0 and len(labels) == 0:
+        # PerfFuzz: the test case with the highest count at each site (the
+        # simplest, on a tie)
+        var sites = List[UInt64]()
+        for item in r[].counts.items():
+            if not valid:
+                break
+            var best = self.max_count.get(item.key, 0)
+            if item.value > best:
+                self.max_count[item.key] = item.value
+                self.raised += 1
+                sites.append(item.key)
+            elif item.value == best:
+                var o = self.count_owner.get(item.key)
+                if o and sort_key_less(
+                    r[].nodes, self.entries[o.value()].result[].nodes
+                ):
+                    sites.append(item.key)
+        if len(claims) == 0 and len(labels) == 0 and len(sites) == 0:
             return False
         var idx = len(self.entries)
         self.entries.append(_Entry(r, features^))
@@ -304,6 +330,13 @@ struct _Corpus(Movable):
                 self.entries[o.value()].owns -= 1
                 losers.append(o.value())
             self.best_owner[label] = idx
+            self.entries[idx].owns += 1
+        for site in sites:
+            var o = self.count_owner.get(site)
+            if o:
+                self.entries[o.value()].owns -= 1
+                losers.append(o.value())
+            self.count_owner[site] = idx
             self.entries[idx].owns += 1
         # drop the entries now kept for nothing, highest index first, so
         # that each removal moves only entries not yet looked at
@@ -332,6 +365,12 @@ struct _Corpus(Movable):
                     moved.append(item.key)
             for label in moved:
                 self.best_owner[label] = k
+            var moved_sites = List[UInt64]()
+            for item in self.count_owner.items():
+                if item.value == last:
+                    moved_sites.append(item.key)
+            for site in moved_sites:
+                self.count_owner[site] = k
         _ = self.entries.pop()
 
     def pick(mut self, mut rnd: Random) -> Int:
@@ -375,12 +414,15 @@ struct _Corpus(Movable):
                 w *= _INVALID_WEIGHT
             weights.append(w)
             sum += w
-        # an entry kept for a target score gets an average entry's weight
-        # per label, so hill climbing goes on as coverage grows
+        # an entry kept for a target score or a highest count gets an
+        # average entry's weight per label or site, so hill climbing goes
+        # on as coverage grows
         var mean = sum / Float64(max(len(self.entries), 1))
         if mean <= 0:
             mean = 1.0
         for item in self.best_owner.items():
+            weights[item.value] += mean
+        for item in self.count_owner.items():
             weights[item.value] += mean
         var acc = 0.0
         for w in weights:
@@ -797,6 +839,9 @@ struct FuzzReport(Copyable, Writable):
     """Test cases kept for covering something new."""
     var features: Int
     """Distinct features covered (see `fuzz`)."""
+    var max_count: Int
+    """The highest count at any `count` site (0 if the test counts
+    nothing)."""
     var seconds: Float64
 
     def __init__(out self):
@@ -804,6 +849,7 @@ struct FuzzReport(Copyable, Writable):
         self.valid = 0
         self.corpus = 0
         self.features = 0
+        self.max_count = 0
         self.seconds = 0
 
     def write_to(self, mut writer: Some[Writer]):
@@ -819,6 +865,8 @@ struct FuzzReport(Copyable, Writable):
             self.features,
             " features",
         )
+        if self.max_count > 0:
+            writer.write("; highest count ", self.max_count)
 
 
 struct _Fuzzer[F: def(mut ConjectureData) raises](Movable):
@@ -944,13 +992,13 @@ struct _Fuzzer[F: def(mut ConjectureData) raises](Movable):
                     result = runner.test_function(data)
                 else:
                     result = runner.cached_test_function(attempt, extend=-1)
-            var known = self.corpus.seen
+            var known = self.corpus.seen + self.corpus.raised
             if self.corpus.add(result) and use_db:
                 runner.db.value().save(key, result[].choices())
                 for r in self.corpus.dropped:
                     runner.db.value().delete(key, r[].choices())
             self.corpus.dropped.clear()
-            if self.corpus.seen > known:
+            if self.corpus.seen + self.corpus.raised > known:
                 self.last_new = runner.call_count
         self.ns += perf_counter_ns() - t0
 
@@ -961,6 +1009,8 @@ struct _Fuzzer[F: def(mut ConjectureData) raises](Movable):
         r.valid = self.runner.valid_count
         r.corpus = len(self.corpus.entries)
         r.features = len(self.corpus.freq)
+        for item in self.corpus.max_count.items():
+            r.max_count = max(r.max_count, item.value)
         r.seconds = Float64(self.ns) / 1e9
         return r^
 
@@ -1163,7 +1213,8 @@ struct FuzzTarget[P: Movable & Deinitable](Movable, _Fuzzable):
         how often, and each `event`. Improving a `target` score counts too.
 
         The corpus keeps, for each feature, the simplest test case that
-        covered it (and for each `target` label, the best scorer), and
+        covered it (and for each `target` label, the best scorer, and for
+        each `data.count` site, the highest count, as PerfFuzz does), and
         picks entries to mutate by the rarity of their features, so the
         test cases that reach rarely covered code get most of the work.
         A test case rejected by `assume` or a filter is kept too if it

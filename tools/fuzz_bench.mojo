@@ -131,6 +131,76 @@ def closeness(mut data: ConjectureData) raises:
         fail("sum")
 
 
+def _insertion_sort(var xs: List[Int]) -> Int:
+    """Sort `xs`, returning how many elements were shifted."""
+    var shifts = 0
+    for i in range(1, len(xs)):
+        var x = xs[i]
+        var j = i
+        while j > 0 and xs[j - 1] > x:
+            xs[j] = xs[j - 1]
+            j -= 1
+            shifts += 1
+        xs[j] = x
+    return shifts
+
+
+comptime _SORT_MAX = 24
+comptime _SORT_LIMIT = _SORT_MAX * (_SORT_MAX - 1) // 2 * 95 // 100
+"""Near the worst case (a reversed list): 262 of 276 shifts."""
+
+
+def _sort(mut data: ConjectureData, how: Int) raises:
+    # PerfFuzz's kind of bug: an input that makes the sort slow.
+    # how: 0 no guidance, 1 data.count, 2 data.target
+    var xs = data.draw(lists(integers(0, 1000), max_size=_SORT_MAX))
+    var shifts = _insertion_sort(xs^)
+    if how == 1:
+        data.count(1, shifts)
+    elif how == 2:
+        data.target(Float64(shifts))
+    if shifts >= _SORT_LIMIT:
+        fail("slow")
+
+
+def sort_none(mut data: ConjectureData) raises:
+    _sort(data, 0)
+
+
+def sort_count(mut data: ConjectureData) raises:
+    _sort(data, 1)
+
+
+def sort_target(mut data: ConjectureData) raises:
+    _sort(data, 2)
+
+
+def _two_sorts(mut data: ConjectureData, per_site: Bool) raises:
+    # both sorts near their worst case: one count per sort (PerfFuzz's
+    # per-site maxima), or one target score for the total
+    var a = _insertion_sort(
+        data.draw(lists(integers(0, 1000), max_size=_SORT_MAX))
+    )
+    var b = _insertion_sort(
+        data.draw(lists(integers(0, 1000), max_size=_SORT_MAX))
+    )
+    if per_site:
+        data.count(1, a)
+        data.count(2, b)
+    else:
+        data.target(Float64(a + b))
+    if a >= _SORT_LIMIT and b >= _SORT_LIMIT:
+        fail("slow")
+
+
+def two_sorts_count(mut data: ConjectureData) raises:
+    _two_sorts(data, True)
+
+
+def two_sorts_target(mut data: ConjectureData) raises:
+    _two_sorts(data, False)
+
+
 def find[
     F: def(mut ConjectureData) raises
 ](var f: F, seed: Int, cap: Int, guided: Bool) raises -> Int:
@@ -193,6 +263,11 @@ def main() raises:
         "closeness",
         "parser",
         "parser_nock",
+        "sort_none",
+        "sort_count",
+        "sort_target",
+        "two_sorts_count",
+        "two_sorts_target",
     ]
     for name in names:
         if only != "all" and only != name:
@@ -210,6 +285,16 @@ def main() raises:
                 results.append(find(checksum, s, CAP, guided))
             elif name == "closeness":
                 results.append(find(closeness, s, CAP, guided))
+            elif name == "sort_none":
+                results.append(find(sort_none, s, CAP, guided))
+            elif name == "sort_count":
+                results.append(find(sort_count, s, CAP, guided))
+            elif name == "sort_target":
+                results.append(find(sort_target, s, CAP, guided))
+            elif name == "two_sorts_count":
+                results.append(find(two_sorts_count, s, CAP, guided))
+            elif name == "two_sorts_target":
+                results.append(find(two_sorts_target, s, CAP, guided))
             elif name == "parser":
                 results.append(features(parser, s, FEATURE_INPUTS, guided))
             else:

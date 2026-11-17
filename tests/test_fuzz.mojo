@@ -468,6 +468,62 @@ def test_replaying_by_key_keeps_later_draws_in_place() raises:
     assert_true(checked > 10, String(checked))
 
 
+def _shifts(var xs: List[Int]) -> Int:
+    """How many elements insertion sort shifts to sort `xs`."""
+    var n = 0
+    for i in range(1, len(xs)):
+        var x = xs[i]
+        var j = i
+        while j > 0 and xs[j - 1] > x:
+            xs[j] = xs[j - 1]
+            j -= 1
+            n += 1
+        xs[j] = x
+    return n
+
+
+def test_fuzz_maximizes_counts() raises:
+    # PerfFuzz: keeping the test case with the highest count climbs to a
+    # nearly reversed list (60 of the 66 possible shifts), which random
+    # generation doesn't reach.
+    def prop(mut data: ConjectureData) raises:
+        var n = _shifts(data.draw(lists(integers(0, 1000), max_size=12)))
+        data.count(7, n)
+        if n >= 60:
+            fail("slow")
+
+    var target = fuzz_target_data(prop, Settings(database=None, seed=UInt64(1)))
+    var msg = String()
+    try:
+        _ = target.fuzz(max_inputs=30_000)
+    except e:
+        msg = String(e)
+    assert_true("slow" in msg, msg)
+
+
+def test_fuzz_reports_the_highest_count() raises:
+    def prop(mut data: ConjectureData) raises:
+        var xs = data.draw(lists(booleans(), max_size=10))
+        data.count(1, len(xs))
+        data.count(2, 0)  # ignored
+
+    var target = fuzz_target_data(prop, Settings(database=None, seed=UInt64(1)))
+    var report = target.fuzz(max_inputs=5000)
+    assert_equal(report.max_count, 10)
+    assert_true("highest count 10" in String(report), String(report))
+
+
+def test_counts_survive_fork_mode() raises:
+    def prop(mut data: ConjectureData) raises:
+        data.count(1, len(data.draw(lists(booleans(), max_size=5))))
+
+    var target = fuzz_target_data(
+        prop, Settings(database=None, fork=True, seed=UInt64(1))
+    )
+    var report = target.fuzz(max_inputs=300)
+    assert_equal(report.max_count, 5)
+
+
 def test_features_survive_fork_mode() raises:
     # a shorter chain: each input runs in a child process
     def prop(mut data: ConjectureData) raises:

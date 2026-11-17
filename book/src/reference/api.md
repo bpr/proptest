@@ -89,7 +89,7 @@ target.fuzz(seconds=60, *, max_inputs=None, guided=True) -> FuzzReport
 Fuzzes the test for `seconds` (or `max_inputs` test cases), keeping a
 corpus of test cases that covered something new and mutating them. It
 raises the shrunk failures, as `given` does, if it finds any, and returns
-a `FuzzReport` (`inputs`, `valid`, `corpus`, `features`, `seconds`)
+a `FuzzReport` (`inputs`, `valid`, `corpus`, `features`, `max_count`, `seconds`)
 otherwise. The corpus stays with the target, so calling `fuzz` again
 continues where it stopped (the report counts only the call's own test
 cases and time; `target.totals()` gives the totals so far). With a database, the corpus is saved under
@@ -146,6 +146,7 @@ In `given_data` tests, `composite` functions, state machine rules, and
 | `data.note(msg)` | Add a line to the report of the final, shrunk example. |
 | `data.event(label)` | Record an event, counted in the run's statistics. |
 | `data.feature(x: UInt64)` | Record a coverage feature for `FuzzTarget.fuzz`: a test case with a new one joins the corpus. Ignored outside fuzzing. |
+| `data.count(site: UInt64, n: Int = 1)` | Add `n` to the count at `site`; `FuzzTarget.fuzz` keeps the test case with the highest count at each site (PerfFuzz), to find slow inputs. Ignored outside fuzzing. |
 | `data.tabulate(table, value)` | Record a value in a statistics table. |
 | `data.cover(percent, condition, label)` | Declare a coverage requirement. |
 | `data.target(score, label="")` | Report a score for targeted search to maximize. |
