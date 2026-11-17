@@ -7,6 +7,11 @@ from std.os import abort, getenv
 from std.testing import TestSuite, assert_equal, assert_true, assert_false
 
 from proptest import *
+from proptest.fuzz import _choice_keys
+from proptest.internal.choice import BOOLEAN, ChoiceValue
+from proptest.internal.data import Result
+from proptest.internal.engine import ConjectureRunner
+from proptest.internal.exec_index import ExecIndex
 
 
 struct Bytes(Movable):
@@ -401,6 +406,66 @@ def test_unguided_fuzzing_only_generates() raises:
     var report = target.fuzz(max_inputs=20_000, guided=False)
     assert_equal(report.inputs, 20_000)
     assert_true(report.features > 0, String(report))
+
+
+def _nested(mut data: ConjectureData) raises:
+    var a = data.draw(lists(lists(integers(0, 9), max_size=4), max_size=4))
+    var s = data.draw(text(max_size=5))
+    var b = data.draw(integers(0, 1000))
+    data.note(String(len(a), " ", s, " ", b))
+
+
+def _replay_by_key[
+    F: def(mut ConjectureData) raises
+](mut runner: ConjectureRunner[F], values: Dict[UInt64, ChoiceValue]) -> Result:
+    var data = runner.new_data(List[ChoiceValue]())
+    data.exec_index = ExecIndex(values.copy())
+    return runner.test_function(data)
+
+
+def test_replaying_by_key_reproduces_the_test_case() raises:
+    # the keys computed from a finished test case are the keys its draws
+    # had while it ran
+    var runner = ConjectureRunner(
+        _nested, Settings(database=None, seed=UInt64(1))
+    )
+    for _ in range(50):
+        var data = runner.new_data(List[ChoiceValue]())
+        var r = runner.test_function(data)
+        var keys = _choice_keys(r[])
+        assert_equal(len(keys), len(r[].nodes))
+        var values = Dict[UInt64, ChoiceValue]()
+        for k in range(len(keys)):
+            values[keys[k]] = r[].nodes[k].value.copy()
+        assert_equal(len(values), len(keys))  # no two choices share a key
+        var again = _replay_by_key(runner, values)
+        assert_true(again[].choices() == r[].choices())
+
+
+def test_replaying_by_key_keeps_later_draws_in_place() raises:
+    # Ending the first list early shifts every later choice when replayed
+    # by position; by key, the integer drawn last keeps its value.
+    var runner = ConjectureRunner(
+        _nested, Settings(database=None, seed=UInt64(2))
+    )
+    var checked = 0
+    for _ in range(50):
+        var data = runner.new_data(List[ChoiceValue]())
+        var r = runner.test_function(data)
+        ref nodes = r[].nodes
+        if nodes[0].constraints.kind != BOOLEAN or nodes[0].value.i == 0:
+            continue  # the list is empty already
+        var keys = _choice_keys(r[])
+        var values = Dict[UInt64, ChoiceValue]()
+        for k in range(len(keys)):
+            values[keys[k]] = nodes[k].value.copy()
+        values[keys[0]] = ChoiceValue(boolean=False)
+        var again = _replay_by_key(runner, values)
+        ref last = again[].nodes[len(again[].nodes) - 1].value
+        assert_equal(last.i, nodes[len(nodes) - 1].value.i)
+        assert_true(len(again[].nodes) < len(nodes))
+        checked += 1
+    assert_true(checked > 10, String(checked))
 
 
 def test_features_survive_fork_mode() raises:

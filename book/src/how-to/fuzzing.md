@@ -160,7 +160,10 @@ values (0, -1, the bounds of the range, powers of two near the limits of
 machine integers, infinities, NaN) or to their simplest values,
 overwriting runs of bytes or characters within a string, and copying a
 strategy's choices from one test case into another, or deleting,
-duplicating or cutting them off. It keeps only the simplest test case for
+duplicating or cutting them off. A mutation that only changes values is
+replayed by where each value was drawn (which strategy, which element)
+rather than by its position, so making a list shorter doesn't shift the
+values drawn after it onto other draws. It keeps only the simplest test case for
 each thing covered, and mutates the entries that cover rarely seen things
 most often, so a test whose common paths produce many variants doesn't
 bury the few that got further. A test case that `assume` or a filter

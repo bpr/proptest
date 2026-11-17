@@ -811,8 +811,22 @@ special values are ignored. The differences:
   strings, with a run of elements (mean 4) overwritten; one mutation in
   ten sets its runs to their simplest choices (Zest zeroes its bytes).
   Zest's means are 8 runs of 4 bytes; a choice is coarser than a byte.
+  A mutation that only changes values is replayed by execution index,
+  as in Zest's `ExecutionIndexingGuidance` (`internal/exec_index.mojo`):
+  each choice is keyed by its path of span labels, with how many
+  siblings with the same label came before at each level, and its
+  position among its span's own choices. A draw takes the value its key
+  had in the mutated parent, or a fresh one if the parent had none, so
+  a change to a list's length or a `one_of` branch doesn't shift the
+  choices after it onto other draws, as replaying by position does.
+  Zest gets the keys from the call stack, by instrumenting bytecode;
+  the spans give them to proptest for free. (A chain of six values
+  after a list of any length took a median of 3.5k test cases instead
+  of 10.8k, over 60 seeds; `pixi run fuzz-bench`.) Zest also splices
+  subtrees by key; the span splices below already copy a whole span.
   Half the mutations also splice in a span from another entry with the
-  same label, or delete, duplicate, or cut off and redraw a span.
+  same label, or delete, duplicate, or cut off and redraw a span (these
+  are replayed by position).
   `fuzz(guided=False)` generates every test case afresh, as a baseline
   (JQF's blind mode).
   Failures are shrunk and reported as `given` reports them. Without

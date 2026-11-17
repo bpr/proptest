@@ -62,6 +62,7 @@ from proptest.internal.data import (
     Result,
     Status,
 )
+from proptest.internal.exec_index import ExecIndex, KeyTracker
 from proptest.internal.provider import Constants, _boundary_byte
 from proptest.internal.datatree import DataTree
 from proptest.internal.engine import ConjectureRunner, RunReport
@@ -170,12 +171,16 @@ struct _Entry(Copyable):
     var features: List[UInt64]
     var owns: Int
     var valid: Bool
+    var keys: List[UInt64]
+    """Its choices' execution-index keys, once it has been mutated
+    (`_choice_keys`)."""
 
     def __init__(out self, result: Result, var features: List[UInt64]):
         self.valid = result[].status == Status.VALID
         self.result = result
         self.features = features^
         self.owns = 0
+        self.keys = List[UInt64]()
 
 
 comptime _INVALID_WEIGHT = 0.25
@@ -381,6 +386,30 @@ struct _Corpus(Movable):
         for w in weights:
             acc += max(w, mean * 1e-3)
             self._cumulative.append(acc)
+
+
+def _choice_keys(r: ConjectureResult) -> List[UInt64]:
+    """The key of each of `r`'s choices, as `ExecIndex` computes them while
+    the test runs (`internal/exec_index.mojo`)."""
+    var t = KeyTracker()
+    for s in range(1, len(r.spans)):
+        t.start_span(max(r.spans[s].parent, 0), r.spans[s].label)
+    # the innermost span open at each choice: spans start in index order,
+    # each before any choice it holds, so keep a stack of open spans
+    var out = List[UInt64](capacity=len(r.nodes))
+    var stack: List[Int] = [0]
+    var next = 1
+    for k in range(len(r.nodes)):
+        while next < len(r.spans) and r.spans[next].start <= k:
+            var p = r.spans[next].parent
+            while len(stack) > 1 and stack[len(stack) - 1] != p:
+                _ = stack.pop()
+            stack.append(next)
+            next += 1
+        while len(stack) > 1 and r.spans[stack[len(stack) - 1]].end <= k:
+            _ = stack.pop()
+        out.append(t.choice(stack[len(stack) - 1]))
+    return out^
 
 
 def _boundary(mut rnd: Random, c: Constraints, v: ChoiceValue) -> ChoiceValue:
@@ -664,13 +693,23 @@ def _havoc[
 
 def _mutate[
     F: def(mut ConjectureData) raises
-](mut runner: ConjectureRunner[F], corpus: _Corpus, parent: Result) -> List[
-    ChoiceValue
-]:
+](
+    mut runner: ConjectureRunner[F],
+    corpus: _Corpus,
+    parent: Result,
+    mut by_key: Bool,
+) -> List[ChoiceValue]:
     """A variant of `parent`'s choices: runs of values replaced (Zest's
     havoc, see `_havoc`), and maybe a span spliced in from another corpus
     entry, deleted, duplicated, or cut off (the rest is then drawn at
-    random)."""
+    random).
+
+    Sets `by_key` if the variant only changes values: it is then replayed
+    by execution index (`internal/exec_index.mojo`): each choice
+    goes to the draw with the key its parent's choice at that position
+    had, so that a changed list length or branch doesn't shift the
+    choices after it onto other draws."""
+    by_key = False
     ref p = parent[]
     if len(runner.constants[].dict_bytes) > 0 and runner.random.below(4) == 0:
         var used = _dictionary_mutation(runner.random, p, runner.constants[])
@@ -692,6 +731,7 @@ def _mutate[
     var runs = _geometric(runner.random, _MEAN_MUTATIONS)
     _havoc(runner, p, free, choices, runs - 1 if structural else runs)
     if not structural or len(p.spans) == 0:
+        by_key = True
         return choices^
     ref s = p.spans[Int(runner.random.below(UInt64(len(p.spans))))]
     var op = runner.random.below(4)
@@ -888,11 +928,22 @@ struct _Fuzzer[F: def(mut ConjectureData) raises](Movable):
                 var data = runner.new_data(prefix^)
                 result = runner.test_function(data)
             else:
-                var parent = self.corpus.entries[
-                    self.corpus.pick(runner.random)
-                ].result
-                var attempt = _mutate(runner, self.corpus, parent)
-                result = runner.cached_test_function(attempt, extend=-1)
+                var i = self.corpus.pick(runner.random)
+                var parent = self.corpus.entries[i].result
+                var by_key = False
+                var attempt = _mutate(runner, self.corpus, parent, by_key)
+                if by_key:
+                    ref keys = self.corpus.entries[i].keys
+                    if len(keys) != len(parent[].nodes):
+                        keys = _choice_keys(parent[])
+                    var values = Dict[UInt64, ChoiceValue]()
+                    for k in range(len(attempt)):
+                        values[keys[k]] = attempt[k].copy()
+                    var data = runner.new_data(List[ChoiceValue]())
+                    data.exec_index = ExecIndex(values^)
+                    result = runner.test_function(data)
+                else:
+                    result = runner.cached_test_function(attempt, extend=-1)
             var known = self.corpus.seen
             if self.corpus.add(result) and use_db:
                 runner.db.value().save(key, result[].choices())

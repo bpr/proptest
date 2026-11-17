@@ -62,6 +62,13 @@ and RapidCheck (see `docs/ideas.md`).
   `ConjectureData`. `freeze()` and `__deinit__` revoke its liveness token
   (`data.live_tokens`); never move a `ConjectureData` while a test runs.
 
+### Execution indexing
+- The fuzz loop replays value-only mutations by key, not position
+  (`internal/exec_index.mojo`, after Zest): `ConjectureData.exec_index`
+  tracks keys in `start_span` and `_draw`, and `fuzz._choice_keys`
+  computes the same keys from a finished result. Keep the two in step
+  (`test_replaying_by_key_reproduces_the_test_case` checks it).
+
 ### Forked test cases
 - With `Settings(fork=True)` (or `timeout=`), `ConjectureRunner.execute`
   runs each test case in a `fork()`ed child (`internal/fork.mojo`). The

@@ -58,6 +58,7 @@ from proptest.internal.fork import (
 from proptest.internal.random import Random
 from proptest.internal.provider import Provider
 from proptest.internal.bytestring import ByteReader
+from proptest.internal.exec_index import ExecIndex
 from proptest.internal.comparisons import (
     Comparison,
     ComparisonLog,
@@ -376,6 +377,10 @@ struct ConjectureData(Movable):
     var byte_reader: Optional[ByteReader]
     """With `fuzz_one_input`, the bytes new choices are read from, in place
     of the provider."""
+    var exec_index: Optional[ExecIndex]
+    """Values to replay by execution index (the fuzz loop's mutations; see
+    `exec_index.mojo`): a choice past the end of `prefix` takes the value
+    recorded for its key, if any, before drawing a new one."""
     var fork_log: Optional[ForkLog]
     """In a forked child (`Settings(fork=True)`), where to record the test
     case as it runs, for the parent to rebuild if the child crashes."""
@@ -431,6 +436,7 @@ struct ConjectureData(Movable):
         self.shared_values = Dict[String, ErasedValue]()
         self.live_tokens = List[ArcPointer[Bool]]()
         self.byte_reader = None
+        self.exec_index = None
         self.fork_log = None
         # the top span (depth 0)
         self.depth = 0
@@ -451,6 +457,12 @@ struct ConjectureData(Movable):
         if self.max_choices >= 0 and len(self.nodes) >= self.max_choices:
             self.hit_max_choices = True
             self.mark_overrun()
+        var replayed = Optional[ChoiceValue]()
+        if self.exec_index:
+            # every choice takes a key, forced or not
+            replayed = self.exec_index.value().lookup(
+                self.span_stack[len(self.span_stack) - 1], constraints
+            )
         var value: ChoiceValue
         if self.index < len(self.prefix):
             value = self._pop_choice(constraints)
@@ -458,6 +470,8 @@ struct ConjectureData(Movable):
                 value = forced.value().copy()
         elif forced:
             value = forced.value().copy()
+        elif replayed:
+            value = replayed.take()
         elif self.extend_simplest:
             value = choice_simplest(constraints)
         elif self.byte_reader:
@@ -641,6 +655,8 @@ struct ConjectureData(Movable):
             self.span_stack[len(self.span_stack) - 1] if len(self.span_stack)
             > 0 else -1
         )
+        if self.exec_index:
+            self.exec_index.value().start_span(max(parent, 0), label)
         self.span_stack.append(len(self.spans))
         self.spans.append(Span(label, len(self.nodes), parent, self.depth))
         if self.fork_log:

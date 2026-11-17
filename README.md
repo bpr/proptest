@@ -675,6 +675,7 @@ The engine is a port of Hypothesis's Conjecture
 | `internal/pareto.mojo` | `pareto.py` | the Pareto front of targeted examples |
 | `internal/fork.mojo` | (none; Rust proptest's `fork`) | running test cases in child processes |
 | `internal/bytestring.mojo`, `fuzz.mojo` | `providers.py` (`BytestringProvider`), `core.py` (`fuzz_one_input`) | choices read from bytes; fuzz targets |
+| `internal/exec_index.mojo` | (none; JQF's Zest `ExecutionIndexingGuidance`) | replaying the fuzz loop's mutations by execution index |
 | `dictionary.mojo` | (none; AFL++'s and libFuzzer's dictionaries) | `Dictionary`, `load_dictionary` |
 | `internal/comparisons.mojo`, `strategies/traced.mojo` | (none; AFL++'s CmpLog, libFuzzer's value profile) | `traced` values and the comparisons they record |
 | `strategies/regex.mojo` | `strategies/_internal/regex.py` | `from_regex` |
