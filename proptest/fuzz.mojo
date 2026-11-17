@@ -30,6 +30,7 @@ HypoFuzz does, favoring those still covering new features.
 
 from std.collections import Set
 from std.hash import hash
+from std.math import ceil, log
 from std.memory.alloc import unsafe_alloc
 from std.reflection import call_location, SourceLocation
 from std.time import perf_counter_ns
@@ -168,12 +169,18 @@ struct _Entry(Copyable):
     var result: Result
     var features: List[UInt64]
     var owns: Int
+    var valid: Bool
 
     def __init__(out self, result: Result, var features: List[UInt64]):
+        self.valid = result[].status == Status.VALID
         self.result = result
         self.features = features^
         self.owns = 0
 
+
+comptime _INVALID_WEIGHT = 0.25
+"""An invalid entry's weight as a parent, relative to a valid entry with
+the same features."""
 
 comptime _REWEIGH_EVERY = 256
 """Parent weights are recomputed after this many picks (feature
@@ -181,9 +188,16 @@ frequencies change with every test case), or when the corpus changes."""
 
 
 struct _Corpus(Movable):
-    """The valid test cases worth mutating: for each feature, the simplest
-    test case that covered it, and for each `target` label, the test case
-    with the best score.
+    """The test cases worth mutating: for each feature, the simplest valid
+    test case that covered it, and for each `target` label, the valid test
+    case with the best score.
+
+    As in Zest's validity fuzzing, an invalid test case (rejected by
+    `assume` or a filter) that covers a feature no valid one has joins
+    too, as a stepping stone: its features are often a step toward a
+    valid test case that covers them. A valid test case covering the
+    feature takes it over, and an invalid entry is mutated a quarter as
+    often as a valid one with the same features.
 
     As in libFuzzer, a test case that covers only features already seen
     still joins the corpus if it is simpler than the entry kept for one
@@ -199,6 +213,10 @@ struct _Corpus(Movable):
     """The entry kept for each feature (an index into `entries`)."""
     var freq: Dict[UInt64, Int]
     """How many valid test cases covered each feature."""
+    var invalid_freq: Dict[UInt64, Int]
+    """How many invalid test cases covered each feature."""
+    var seen: Int
+    """Features covered by any test case, valid or not."""
     var best: Dict[String, Float64]
     """The best score seen for each `target` label."""
     var best_owner: Dict[String, Int]
@@ -212,6 +230,8 @@ struct _Corpus(Movable):
         self.entries = List[_Entry]()
         self.owner = Dict[UInt64, Int]()
         self.freq = Dict[UInt64, Int]()
+        self.invalid_freq = Dict[UInt64, Int]()
+        self.seen = 0
         self.best = Dict[String, Float64]()
         self.best_owner = Dict[String, Int]()
         self.dropped = List[Result]()
@@ -221,8 +241,10 @@ struct _Corpus(Movable):
     def add(mut self, r: Result) -> Bool:
         """Count `r`'s features, and keep `r` if it covers a new feature,
         is simpler than the entry kept for one, or improves a target
-        score."""
-        if r[].status != Status.VALID:
+        score. An invalid `r` can only take features that no valid test
+        case has covered."""
+        var valid = r[].status == Status.VALID
+        if not valid and r[].status != Status.INVALID:
             return False
         var features = List[UInt64]()
         var unique = Set[UInt64]()
@@ -232,14 +254,29 @@ struct _Corpus(Movable):
                 features.append(f)
         var claims = List[UInt64]()
         for f in features:
-            self.freq[f] = self.freq.get(f, 0) + 1
+            var n = self.freq.get(f, 0)
+            if n == 0 and f not in self.invalid_freq:
+                self.seen += 1
+            if valid:
+                self.freq[f] = n + 1
+            else:
+                self.invalid_freq[f] = self.invalid_freq.get(f, 0) + 1
+                if n > 0:
+                    continue  # a valid entry keeps it
             var o = self.owner.get(f)
-            if not o or sort_key_less(
-                r[].nodes, self.entries[o.value()].result[].nodes
+            if (
+                not o
+                or valid
+                and not self.entries[o.value()].valid
+                or sort_key_less(
+                    r[].nodes, self.entries[o.value()].result[].nodes
+                )
             ):
                 claims.append(f)
         var labels = List[String]()
         for item in r[].target_observations.items():
+            if not valid:
+                break
             var best = self.best.get(item.key)
             if not best or item.value > best.value():
                 self.best[item.key] = item.value
@@ -320,8 +357,17 @@ struct _Corpus(Movable):
         var sum = 0.0
         for e in self.entries:
             var w = 0.0
-            for f in e.features:
-                w += 1.0 / Float64(self.freq.get(f, 1))
+            if e.valid:
+                for f in e.features:
+                    w += 1.0 / Float64(self.freq.get(f, 1))
+            else:
+                for f in e.features:
+                    w += 1.0 / Float64(
+                        max(
+                            self.freq.get(f, 0) + self.invalid_freq.get(f, 0), 1
+                        )
+                    )
+                w *= _INVALID_WEIGHT
             weights.append(w)
             sum += w
         # an entry kept for a target score gets an average entry's weight
@@ -533,13 +579,96 @@ def _dictionary_mutation(
     return choices^
 
 
+comptime _MEAN_MUTATIONS = 2.0
+"""How many runs of choices a mutation changes, on average (geometric)."""
+comptime _MEAN_RUN = 1.5
+"""How many consecutive choices a run changes, on average (geometric)."""
+comptime _MEAN_SEQ_RUN = 4.0
+"""How many consecutive elements of a string or byte string a change
+within it overwrites, on average (geometric)."""
+
+
+def _geometric(mut rnd: Random, mean: Float64) -> Int:
+    """A geometrically distributed count, at least 1, with mean `mean`
+    (> 1), as Zest samples its mutation counts and sizes."""
+    var u = rnd.random()
+    return max(1, Int(ceil(log(1.0 - u) / log(1.0 - 1.0 / mean))))
+
+
+def _seq_run[
+    F: def(mut ConjectureData) raises
+](
+    mut runner: ConjectureRunner[F], c: Constraints, v: ChoiceValue, zero: Bool
+) -> ChoiceValue:
+    """`v`, a string or byte string, with a run of its elements overwritten:
+    with zeros (byte strings, when `zero`) or with elements of a fresh
+    draw, so that a string keeps to its alphabet."""
+    if len(v.seq) == 0:
+        return runner.tree_provider.draw(c)
+    var seq = v.seq.copy()
+    var fresh = runner.tree_provider.draw(c)
+    var start = Int(runner.random.below(UInt64(len(seq))))
+    var end = min(start + _geometric(runner.random, _MEAN_SEQ_RUN), len(seq))
+    for i in range(start, end):
+        if zero and c.kind == BYTES:
+            seq[i] = 0
+        elif len(fresh.seq) > 0:
+            seq[i] = fresh.seq[Int(runner.random.below(UInt64(len(fresh.seq))))]
+        elif c.kind == BYTES:
+            seq[i] = UInt32(runner.random.below(256))
+    var out = ChoiceValue(bytes=seq^) if c.kind == BYTES else ChoiceValue(
+        string=seq^
+    )
+    if not choice_permitted(out, c):
+        return v.copy()
+    return out^
+
+
+def _havoc[
+    F: def(mut ConjectureData) raises
+](
+    mut runner: ConjectureRunner[F],
+    p: ConjectureResult,
+    free: List[Int],
+    mut choices: List[ChoiceValue],
+    runs: Int,
+):
+    """Zest's havoc: change `runs` runs of consecutive free choices, each
+    of geometric length. Each choice is redrawn, set to a boundary value,
+    or (strings and byte strings) has a run of its elements overwritten.
+    One time in ten, every run is set to its simplest choices instead
+    (Zest sets its bytes to zero)."""
+    if len(free) == 0:
+        return
+    var zero = runner.random.below(10) == 0
+    for _ in range(runs):
+        var start = Int(runner.random.below(UInt64(len(free))))
+        var end = min(start + _geometric(runner.random, _MEAN_RUN), len(free))
+        for j in range(start, end):
+            var k = free[j]
+            ref c = p.nodes[k].constraints
+            var seq = c.kind == BYTES or c.kind == STRING
+            if zero:
+                choices[k] = _seq_run(
+                    runner, c, choices[k], True
+                ) if seq and c.kind == BYTES else choice_simplest(c)
+                continue
+            var op = runner.random.below(UInt64(3) if seq else UInt64(2))
+            if op == 0:
+                choices[k] = runner.tree_provider.draw(c)
+            elif op == 1:
+                choices[k] = _boundary(runner.random, c, choices[k])
+            else:
+                choices[k] = _seq_run(runner, c, choices[k], False)
+
+
 def _mutate[
     F: def(mut ConjectureData) raises
 ](mut runner: ConjectureRunner[F], corpus: _Corpus, parent: Result) -> List[
     ChoiceValue
 ]:
-    """A variant of `parent`'s choices: a few values replaced (by random or
-    boundary values), and maybe a span spliced in from another corpus
+    """A variant of `parent`'s choices: runs of values replaced (Zest's
+    havoc, see `_havoc`), and maybe a span spliced in from another corpus
     entry, deleted, duplicated, or cut off (the rest is then drawn at
     random)."""
     ref p = parent[]
@@ -559,19 +688,9 @@ def _mutate[
     var structural = (
         len(free) == 0 or len(p.spans) > 0 and runner.random.below(2) == 0
     )
-    var n_values = 0
-    if len(free) > 0:
-        n_values = Int(runner.random.below(4)) if structural else 1 + Int(
-            runner.random.below(3)
-        )
     # value changes keep every choice in place, so `p.spans` still apply
-    for _ in range(n_values):
-        var k = free[Int(runner.random.below(UInt64(len(free))))]
-        ref c = p.nodes[k].constraints
-        if runner.random.below(2) == 0:
-            choices[k] = runner.tree_provider.draw(c)
-        else:
-            choices[k] = _boundary(runner.random, c, choices[k])
+    var runs = _geometric(runner.random, _MEAN_MUTATIONS)
+    _havoc(runner, p, free, choices, runs - 1 if structural else runs)
     if not structural or len(p.spans) == 0:
         return choices^
     ref s = p.spans[Int(runner.random.below(UInt64(len(p.spans))))]
@@ -719,9 +838,11 @@ struct _Fuzzer[F: def(mut ConjectureData) raises](Movable):
                     runner.db.value().delete(key, r[].choices())
                 self.corpus.dropped.clear()
 
-    def run(mut self, stop_at: Int, max_inputs: Int) raises:
+    def run(mut self, stop_at: Int, max_inputs: Int, guided: Bool) raises:
         """Fuzz until `stop_at` (`perf_counter_ns`), or for `max_inputs`
-        test cases, or until there's nothing more to do."""
+        test cases, or until there's nothing more to do. Unless `guided`,
+        every test case is generated afresh (the corpus only counts
+        features)."""
         var t0 = perf_counter_ns()
         var calls0 = self.runner.call_count
         if not self.started:
@@ -756,7 +877,11 @@ struct _Fuzzer[F: def(mut ConjectureData) raises](Movable):
             if len(runner.tree.nodes) > _MAX_TREE_NODES:
                 runner.tree = DataTree()
             var result: Result
-            if len(self.corpus.entries) == 0 or runner.random.below(10) == 0:
+            if (
+                not guided
+                or len(self.corpus.entries) == 0
+                or runner.random.below(10) == 0
+            ):
                 var prefix = runner.tree.generate_novel_prefix(
                     runner.tree_provider
                 )
@@ -768,13 +893,13 @@ struct _Fuzzer[F: def(mut ConjectureData) raises](Movable):
                 ].result
                 var attempt = _mutate(runner, self.corpus, parent)
                 result = runner.cached_test_function(attempt, extend=-1)
-            var known = len(self.corpus.freq)
+            var known = self.corpus.seen
             if self.corpus.add(result) and use_db:
                 runner.db.value().save(key, result[].choices())
                 for r in self.corpus.dropped:
                     runner.db.value().delete(key, r[].choices())
             self.corpus.dropped.clear()
-            if len(self.corpus.freq) > known:
+            if self.corpus.seen > known:
                 self.last_new = runner.call_count
         self.ns += perf_counter_ns() - t0
 
@@ -815,7 +940,7 @@ struct _Handle(Copyable):
     (valid while the target is)."""
 
     var ptr: _ErasedPtr
-    var step: def(_ErasedPtr, Int, Int) thin raises
+    var step: def(_ErasedPtr, Int, Int, Bool) thin raises
     var report: def(_ErasedPtr) thin -> FuzzReport
     var since_new: def(_ErasedPtr) thin -> Int
     var done: def(_ErasedPtr) thin -> Bool
@@ -826,7 +951,7 @@ struct _Handle(Copyable):
     def __init__(
         out self,
         ptr: _ErasedPtr,
-        step: def(_ErasedPtr, Int, Int) thin raises,
+        step: def(_ErasedPtr, Int, Int, Bool) thin raises,
         report: def(_ErasedPtr) thin -> FuzzReport,
         since_new: def(_ErasedPtr) thin -> Int,
         done: def(_ErasedPtr) thin -> Bool,
@@ -856,7 +981,7 @@ struct FuzzTarget[P: Movable & Deinitable](Movable, _Fuzzable):
     var _parts: Pointer[Self.P, MutUntrackedOrigin]
     var _ptr: _ErasedPtr
     var _run: def(_ErasedPtr, List[UInt8]) thin raises -> Optional[List[UInt8]]
-    var _step: def(_ErasedPtr, Int, Int) thin raises
+    var _step: def(_ErasedPtr, Int, Int, Bool) thin raises
     var _report: def(_ErasedPtr) thin -> FuzzReport
     var _since_new: def(_ErasedPtr) thin -> Int
     var _done: def(_ErasedPtr) thin -> Bool
@@ -885,8 +1010,10 @@ struct FuzzTarget[P: Movable & Deinitable](Movable, _Fuzzable):
         ) raises -> Optional[List[UInt8]]:
             return _fuzz_one(p.unsafe_bitcast[R]()[].runner, buffer)
 
-        def step_(p: _ErasedPtr, stop_at: Int, max_inputs: Int) raises:
-            p.unsafe_bitcast[R]()[].run(stop_at, max_inputs)
+        def step_(
+            p: _ErasedPtr, stop_at: Int, max_inputs: Int, guided: Bool
+        ) raises:
+            p.unsafe_bitcast[R]()[].run(stop_at, max_inputs, guided)
 
         def report_(p: _ErasedPtr) -> FuzzReport:
             return p.unsafe_bitcast[R]()[].report()
@@ -964,17 +1091,22 @@ struct FuzzTarget[P: Movable & Deinitable](Movable, _Fuzzable):
         return self._run(self._ptr, List[UInt8](buffer))
 
     def fuzz(
-        mut self, seconds: Float64 = 60, *, max_inputs: Optional[Int] = None
+        mut self,
+        seconds: Float64 = 60,
+        *,
+        max_inputs: Optional[Int] = None,
+        guided: Bool = True,
     ) raises -> FuzzReport:
         """Fuzz the test for `seconds` (or `max_inputs` test cases, if
         that comes first), then shrink and report any failures as `given`
         does.
 
         Like a coverage-guided fuzzer, it keeps a corpus of the test cases
-        that covered something new, and runs variants of them: some values
-        replaced (at random, or by boundary values such as 0, -1, 2**31 or
-        NaN), and spans of choices spliced from one test case into another,
-        deleted, duplicated, or cut off. Proptest can't see the test's code
+        that covered something new, and runs variants of them: runs of
+        values replaced (at random, by boundary values such as 0, -1, 2**31
+        or NaN, or by their simplest values), runs of bytes or characters
+        overwritten within a string, and spans of choices spliced from one
+        test case into another, deleted, duplicated, or cut off. Proptest can't see the test's code
         coverage, so a test case's coverage is what its strategies did:
         each pair of strategies (one drawing from the other), with roughly
         how often, and each `event`. Improving a `target` score counts too.
@@ -983,6 +1115,13 @@ struct FuzzTarget[P: Movable & Deinitable](Movable, _Fuzzable):
         covered it (and for each `target` label, the best scorer), and
         picks entries to mutate by the rarity of their features, so the
         test cases that reach rarely covered code get most of the work.
+        A test case rejected by `assume` or a filter is kept too if it
+        covered a feature no valid test case has (Zest's validity
+        fuzzing).
+
+        With `guided=False`, every test case is generated afresh and the
+        corpus only counts features: a baseline for how much the guidance
+        helps.
 
         Values drawn with `traced(...)` record what they're compared
         with: the loop tries setting a choice to the value its traced
@@ -999,7 +1138,7 @@ struct FuzzTarget[P: Movable & Deinitable](Movable, _Fuzzable):
         """
         var before = self._report(self._ptr)
         var stop_at = perf_counter_ns() + Int(seconds * 1e9)
-        self._step(self._ptr, stop_at, max_inputs.or_else(Int.MAX))
+        self._step(self._ptr, stop_at, max_inputs.or_else(Int.MAX), guided)
         self._raise(self._ptr, self._name)
         var r = self._report(self._ptr)
         r.inputs -= before.inputs
@@ -1110,6 +1249,7 @@ def fuzz_all[
             h.ptr,
             min(stop_at, perf_counter_ns() + _SLICE_NS),
             min(slice, budget - used),
+            True,
         )
         used += h.report(h.ptr).inputs - calls0
         if h.done(h.ptr):

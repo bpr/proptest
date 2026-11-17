@@ -83,7 +83,7 @@ and raises the test's error if it failed, after saving the example to the
 database. The target owns the test and its strategies.
 
 ```mojo-sig
-target.fuzz(seconds=60, *, max_inputs=None) -> FuzzReport
+target.fuzz(seconds=60, *, max_inputs=None, guided=True) -> FuzzReport
 ```
 
 Fuzzes the test for `seconds` (or `max_inputs` test cases), keeping a
@@ -93,7 +93,8 @@ a `FuzzReport` (`inputs`, `valid`, `corpus`, `features`, `seconds`)
 otherwise. The corpus stays with the target, so calling `fuzz` again
 continues where it stopped (the report counts only the call's own test
 cases and time; `target.totals()` gives the totals so far). With a database, the corpus is saved under
-`<database_key>.fuzz`. See [Drive a test from a fuzzer](../how-to/fuzzing.md).
+`<database_key>.fuzz`. With `guided=False`, every test case is generated
+afresh (a baseline for measuring the guidance). See [Drive a test from a fuzzer](../how-to/fuzzing.md).
 
 ### `fuzz_all`
 

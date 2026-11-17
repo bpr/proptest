@@ -794,16 +794,27 @@ special values are ignored. The differences:
   adds one, or is simpler (`sort_key_less`) than the entry kept for one,
   joins the corpus, saved under `<database_key>.fuzz`; an entry kept for
   no feature or `target` label any more is dropped (libFuzzer's input
-  reduction). Parents are picked with weight sum(1 / count) over their
+  reduction). As in Zest's validity fuzzing (JQF), an invalid test case
+  (rejected by `assume` or a filter) joins too if it covers a feature no
+  valid one has, as a stepping stone; a valid test case covering the
+  feature takes it over, and invalid entries are picked as parents a
+  quarter as often. Parents are picked with weight sum(1 / count) over their
   features, the count being how many valid test cases covered the
   feature (a simplified form of libFuzzer's Entropic schedule); an
   entry holding a best `target` score gets an average entry's weight
   more per label. Each
   new test case is either generated fresh (one in ten) or a mutation of
-  a corpus entry: one to three values replaced by random or boundary
-  values (0, +-1, the bounds, powers of two near machine-type limits,
-  infinities, NaN, subnormals), and/or a span spliced from another entry
-  with the same label, deleted, duplicated, or cut off and redrawn.
+  a corpus entry: Zest's havoc, a geometric number (mean 2) of runs of
+  consecutive choices (geometric length, mean 1.5) each redrawn, set to
+  a boundary value (0, +-1, the bounds, powers of two near machine-type
+  limits, infinities, NaN, subnormals), or, for strings and byte
+  strings, with a run of elements (mean 4) overwritten; one mutation in
+  ten sets its runs to their simplest choices (Zest zeroes its bytes).
+  Zest's means are 8 runs of 4 bytes; a choice is coarser than a byte.
+  Half the mutations also splice in a span from another entry with the
+  same label, or delete, duplicate, or cut off and redraw a span.
+  `fuzz(guided=False)` generates every test case afresh, as a baseline
+  (JQF's blind mode).
   Failures are shrunk and reported as `given` reports them. Without
   coverage, a test that branches on values its strategies don't
   distinguish gets no guidance unless it calls `event` or `target`, or

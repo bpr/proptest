@@ -155,14 +155,18 @@ slowly even when the same bug is hit millions of times.
 shrinks and reports any failures as `given` does. It works on choices,
 not bytes. Like a coverage-guided fuzzer, it keeps a *corpus* of the test
 cases that did something new, and makes most new test cases by mutating
-corpus entries: changing a few values, to random values or to boundary
+corpus entries: changing runs of values, to random values, to boundary
 values (0, -1, the bounds of the range, powers of two near the limits of
-machine integers, infinities, NaN), and copying a strategy's choices from
-one test case into another, or deleting, duplicating or cutting them off.
-It keeps only the simplest test case for each thing covered, and mutates
-the entries that cover rarely seen things most often, so a test whose
-common paths produce many variants doesn't bury the few that got
-further.
+machine integers, infinities, NaN) or to their simplest values,
+overwriting runs of bytes or characters within a string, and copying a
+strategy's choices from one test case into another, or deleting,
+duplicating or cutting them off. It keeps only the simplest test case for
+each thing covered, and mutates the entries that cover rarely seen things
+most often, so a test whose common paths produce many variants doesn't
+bury the few that got further. A test case that `assume` or a filter
+rejects is kept too if it covered something no valid test case has, as a
+step toward one that does (it is mutated less often, and dropped once a
+valid test case covers the same things).
 
 proptest can't see which lines of the test ran, so "something new" means
 something the strategies or the test reported: a strategy drawing from
@@ -217,6 +221,11 @@ which prints as `N inputs (V valid) in Ts; corpus of C covering F
 features`. With a database, the corpus is saved under
 `<database_key>.fuzz`, and the next run starts from it, and failures are
 saved under the test's key, as `given` saves them.
+
+`fuzz(..., guided=False)` turns the guidance off: every test case is
+generated afresh, as `given` generates them, and the report still counts
+the features covered. Comparing the two shows how much the guidance
+helps a given test.
 
 ## Get past magic values
 

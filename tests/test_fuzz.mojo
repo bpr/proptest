@@ -281,7 +281,7 @@ def test_fuzz_is_guided_by_events() raises:
 def test_fuzz_favors_entries_with_rare_features() raises:
     # The noise list's (position, value) events fill the corpus with
     # entries covering common features. Picking parents by the rarity of
-    # their features finds the chain in about 35_000 inputs with this seed;
+    # their features finds the chain in about 33_000 inputs with this seed;
     # picking them uniformly mostly doesn't within 200_000.
     def prop(mut data: ConjectureData) raises:
         var noise = data.draw(lists(integers(0, 15), max_size=12))
@@ -294,7 +294,9 @@ def test_fuzz_favors_entries_with_rare_features() raises:
             data.event(String("matched ", i + 1))
         fail("found it")
 
-    var target = fuzz_target_data(prop, Settings(database=None, seed=UInt64(1)))
+    var target = fuzz_target_data(
+        prop, Settings(database=None, seed=UInt64(14))
+    )
     var msg = String()
     try:
         _ = target.fuzz(max_inputs=100_000)
@@ -340,6 +342,65 @@ def test_fuzz_is_guided_by_features() raises:
     except e:
         msg = String(e)
     assert_true("found it" in msg, msg)
+
+
+def test_fuzz_keeps_invalid_test_cases_as_stepping_stones() raises:
+    # The features come before an `assume` that passes one time in 64.
+    # Keeping the invalid test cases that reach a new feature (Zest's
+    # validity fuzzing) finds the bug in about 10_000 inputs with this
+    # seed; keeping only valid ones found it with 2 seeds in 30 within
+    # 100_000.
+    def prop(mut data: ConjectureData) raises:
+        var xs = data.draw(lists(integers(0, 15), min_size=6, max_size=6))
+        var c = data.draw(integers(0, 63))
+        var k = 0
+        while k < 6 and xs[k] == k + 1:
+            data.feature(UInt64(k))
+            k += 1
+        var s = 0
+        for x in xs:
+            s += x
+        assume(c == (s * 7) % 64)
+        if k == 6:
+            fail("found it")
+
+    var target = fuzz_target_data(prop, Settings(database=None, seed=UInt64(3)))
+    var msg = String()
+    try:
+        _ = target.fuzz(max_inputs=50_000)
+    except e:
+        msg = String(e)
+    assert_true("found it" in msg, msg)
+
+
+def test_fuzz_overwrites_runs_of_bytes() raises:
+    # A byte string is one choice; havoc overwrites runs of its bytes.
+    def prop(mut data: ConjectureData) raises:
+        var b = data.draw(binary(max_size=16))
+        if len(b) >= 2 and b[0] == UInt8(ord("P")):
+            data.feature(1)
+            if b[1] == UInt8(ord("T")):
+                fail("found it")
+
+    var target = fuzz_target_data(prop, Settings(database=None, seed=UInt64(1)))
+    var msg = String()
+    try:
+        _ = target.fuzz(max_inputs=20_000)
+    except e:
+        msg = String(e)
+    assert_true("found it" in msg, msg)
+
+
+def test_unguided_fuzzing_only_generates() raises:
+    # guided=False is a baseline: every test case is generated afresh, so
+    # the chain that guided fuzzing finds (test_fuzz_is_guided_by_features)
+    # is out of reach, but features are still counted.
+    var target = fuzz_target_data(
+        _feature_chain, Settings(database=None, seed=UInt64(3))
+    )
+    var report = target.fuzz(max_inputs=20_000, guided=False)
+    assert_equal(report.inputs, 20_000)
+    assert_true(report.features > 0, String(report))
 
 
 def test_features_survive_fork_mode() raises:
