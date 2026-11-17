@@ -15,6 +15,7 @@ pixi run examples
 pixi run package                                # build/proptest.mojoc
 pixi run test-numojo                            # extras/ (needs NuMojo; see extras/run_tests.sh)
 pixi run gen-unicode                            # regenerate the Unicode tables in internal/
+pixi run fuzz-bench guided all 1 30             # benchmark the fuzz loop (tools/fuzz_bench.mojo)
 pixi run format                                 # format / lint
 pixi run book                                   # build the mdbook in book/build
 pixi run book-test                              # compile and run the book's examples

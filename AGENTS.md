@@ -32,7 +32,7 @@ and RapidCheck (see `docs/ideas.md`).
 | `internal/charmap_data.mojo`, `internal/decomposition_data.mojo` | **Generated** by `tools/gen_unicode.mojo` (`pixi run gen-unicode`) |
 | `tests/` | `test_*.mojo` suites and `run_all.sh` |
 | `extras/` | NuMojo integration and its tests |
-| `tools/` | The Unicode table generator (Mojo) |
+| `tools/` | The Unicode table generator and the fuzz loop benchmark (`fuzz_bench.mojo`), in Mojo |
 | `docs/` | Design notes, including the differences doc |
 | `book/` | The mdbook user guide (`book/src/`); `book/check-examples.sh` runs its complete examples |
 
