@@ -12,7 +12,7 @@ from proptest.internal.charmap_data import CATEGORY_DATA
 from proptest.internal.intervals import IntervalSet
 
 
-def _parse_hex(s: StringSlice) raises -> UInt32:
+def _parse_hex(s: StringSpan) raises -> UInt32:
     var v = UInt32(0)
     for b in s.as_bytes():
         var d: UInt32
@@ -81,11 +81,12 @@ def category_intervals(cats: List[String]) raises -> IntervalSet:
                 continue
             if tok.byte_length() == 0:
                 continue
-            var dash = tok.find("-")
-            if dash < 0:
+            var found = tok.find("-")
+            if not found:
                 var v = _parse_hex(tok)
                 ivs.append((v, v))
             else:
+                var dash = found.value()
                 ivs.append(
                     (
                         _parse_hex(tok[byte=0:dash]),

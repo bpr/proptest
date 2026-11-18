@@ -153,8 +153,10 @@ def test_a_crash_reproduces_from_its_blob() raises:
     var settings = forked()
     settings.print_blob = True
     var msg = failure(prop, settings)
-    var start = msg.find('reproduce="') + 11
-    var blob = String(msg[byte = start : msg.find('"', start)])
+    var found = msg.find('reproduce="')
+    assert_true(Bool(found), msg)
+    var start = found.value() + 11
+    var blob = String(msg[byte = start : msg.find('"', start).value()])
     settings.reproduce = blob
     var again = failure(prop, settings)
     assert_true("given(1000)" in again, again)

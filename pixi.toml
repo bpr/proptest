@@ -28,4 +28,4 @@ env = { UNICODE_VERSION = "17.0.0" }
 cmd = "mkdir -p build/ucd && curl -fsSL -o build/ucd/UnicodeData.txt https://www.unicode.org/Public/$UNICODE_VERSION/ucd/UnicodeData.txt && curl -fsSL -o build/ucd/CaseFolding.txt https://www.unicode.org/Public/$UNICODE_VERSION/ucd/CaseFolding.txt && mojo run tools/gen_unicode.mojo build/ucd && mojo format --quiet proptest/internal/charmap_data.mojo proptest/internal/decomposition_data.mojo"
 
 [dependencies]
-mojo = ">=1.3.0.dev2026110305,<2"
+mojo = ">=1.3.0.dev2026111705,<2"

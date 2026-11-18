@@ -24,7 +24,7 @@ comptime _N_COUNT: UInt32 = 588  # V_COUNT * T_COUNT
 comptime _S_COUNT: UInt32 = 11172
 
 
-def _hex(s: StringSlice) -> UInt32:
+def _hex(s: StringSpan) -> UInt32:
     var v = UInt32(0)
     for b in s.as_bytes():
         var d = UInt32(b)
@@ -48,7 +48,7 @@ struct Decompositions(Movable):
         for entry in DECOMPOSITION_DATA.split(" "):
             if entry.byte_length() == 0:
                 continue
-            var colon = entry.find(":")
+            var colon = entry.find(":").value()
             var comps = List[UInt32]()
             for part in entry[byte = colon + 1 :].split(","):
                 comps.append(_hex(part))

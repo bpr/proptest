@@ -48,7 +48,7 @@ def _seq_to_string(seq: List[UInt32]) -> String:
     return s^
 
 
-def _parse_seq(s: StringSlice) raises -> List[UInt32]:
+def _parse_seq(s: StringSpan) raises -> List[UInt32]:
     var out = List[UInt32]()
     if s.byte_length() == 0:
         return out^
@@ -74,7 +74,7 @@ def choices_to_string(choices: List[ChoiceValue]) -> String:
     return out^
 
 
-def _parse_int128(s: StringSlice) raises -> Int128:
+def _parse_int128(s: StringSpan) raises -> Int128:
     var neg = False
     var start = 0
     var bytes = s.as_bytes()

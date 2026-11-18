@@ -451,9 +451,10 @@ def test_reproduce_blob_replays_failure() raises:
             fail("big")
 
     var msg = failure_message(prop, Settings(database=None, print_blob=True))
-    var start = msg.find('reproduce="')
-    assert_true(start >= 0, msg)
-    var blob = String(msg[byte = start + 11 : msg.find('")')])
+    var found = msg.find('reproduce="')
+    assert_true(Bool(found), msg)
+    var start = found.value()
+    var blob = String(msg[byte = start + 11 : msg.find('")').value()])
     var calls = 0
 
     def counted(x: Int) raises {mut calls}:

@@ -118,7 +118,7 @@ struct Status(
             writer.write("INTERESTING")
 
 
-def calc_label_from_name(name: StringSlice) -> UInt64:
+def calc_label_from_name(name: StringSpan) -> UInt64:
     """A label for a span, derived from a name."""
     return hash(String(name))
 
