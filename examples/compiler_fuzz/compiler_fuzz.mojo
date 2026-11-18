@@ -29,7 +29,10 @@
 #
 # Each test case takes about half a minute, nearly all of it compiling.
 # The compiler under test is $MOJO (default `mojo`); see
-# build_and_compare.sh. COMPILER_FUZZ_NO_SHRINK=1 skips shrinking, and
+# build_and_compare.sh. COMPILER_FUZZ_NO_SHRINK=1 skips shrinking,
+# COMPILER_FUZZ_NO_7593_WORKAROUND=1 lets `range` loops overwrite tracked
+# values without reading them first (compilers before 1.3.0.dev2026111605
+# then fail with UNBALANCED), and
 # PROPTEST_SEED and PROPTEST_MAX_EXAMPLES set the seed and the number of
 # programs. The failing program is kept as failing_program.mojo in the
 # work directory.
@@ -130,6 +133,9 @@ struct ProgramGenerator(Movable):
     """Whether expressions may read tracked values here. Off in the
     arguments of anything that mutates one, to avoid exclusivity errors."""
     var try_depth: Int
+    var touch_loops: Bool
+    """Whether `range` loops read the tracked values first (the #7593
+    workaround; see `block`)."""
 
     def __init__(out self, function_index: Int):
         self.loop_variables = []
@@ -143,6 +149,7 @@ struct ProgramGenerator(Movable):
         self.tracked = ["t0", "t1"]
         self.tracked_ok = True
         self.try_depth = 0
+        self.touch_loops = getenv("COMPILER_FUZZ_NO_7593_WORKAROUND") == ""
 
     @staticmethod
     def pick(
@@ -829,13 +836,22 @@ struct ProgramGenerator(Movable):
             # Reading the tracked values first works around a bug: a
             # value overwritten in a range loop, unread before, isn't
             # destroyed at -O2/-O3
-            # (https://github.com/modular/modular/issues/7593).
-            var touch = String(inner, "_ = Bool(ot)\n", inner, "_ = len(lst)\n")
-            for name in self.tracked:
-                touch += String(inner, "_ = ", name, ".val\n")
+            # (https://github.com/modular/modular/issues/7593), fixed on
+            # nightly 1.3.0.dev2026111605.
+            # COMPILER_FUZZ_NO_7593_WORKAROUND=1 leaves the reads out.
+            var touch = String()
+            if self.touch_loops:
+                touch = String(inner, "_ = Bool(ot)\n", inner, "_ = len(lst)\n")
+                for name in self.tracked:
+                    touch += String(inner, "_ = ", name, ".val\n")
             self.loop_variables.append(index)
             self.loop_depth += 1
-            var body = self.block(data, inner, depth + 1)
+            var body = String()
+            # #7593's shape: a value overwritten before anything in the
+            # loop reads it
+            if data.draw(integers(0, 3)) == 0:
+                body += self.overwrite_statement(data, inner)
+            body += self.block(data, inner, depth + 1)
             self.loop_depth -= 1
             _ = self.loop_variables.pop()
             return String(
@@ -1150,6 +1166,33 @@ struct ProgramGenerator(Movable):
         if j >= i:
             j += 1
         return (self.tracked[i], self.tracked[j])
+
+    def overwrite_statement(
+        mut self, mut data: ConjectureData, indent: String
+    ) raises -> String:
+        """Overwrites a tracked value without reading it first."""
+        var t = Self.pick(data, self.tracked.copy())
+        var fresh = String("Tracked(", self.plain_expr(data, 0), ", L)")
+        var kind = data.draw(integers(0, 3))
+        if kind == 0:
+            return String(indent, t, " = ", fresh, "\n")
+        if kind == 1:
+            return String(indent, "ot = ", fresh, "\n")
+        if kind == 2:
+            return String(indent, "ot = ", t, ".copy()\n")
+        var pair = self.two_tracked(data)
+        return String(
+            indent,
+            pair[0],
+            " = ",
+            pair[1],
+            "^\n",
+            indent,
+            pair[1],
+            " = ",
+            fresh,
+            "\n",
+        )
 
     def ownership_statement(
         mut self,

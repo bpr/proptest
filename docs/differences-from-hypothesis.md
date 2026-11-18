@@ -877,7 +877,11 @@ special values are ignored. The differences:
   each to the target with the highest estimated rate of new features:
   one over the test cases since its corpus last grew, over its time per
   test case (HypoFuzz's dashboard tracks "since new coverage"; its
-  scheduler's details differ). One slice in ten is random. HypoFuzz runs
+  scheduler's details differ). The time per test case leaves out time
+  spent waiting for a CPU (from Linux's `/proc/thread-self/schedstat`),
+  so under load a target whose slices run long enough to be preempted
+  doesn't look slower than one whose slices don't. One slice in ten is
+  random. HypoFuzz runs
   tests from a pytest session in worker processes with a web dashboard;
   `fuzz_all` runs the targets it's given in one process, and raises
   their failures when the time is up. A target's corpus persists across

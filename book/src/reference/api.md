@@ -106,7 +106,8 @@ Fuzzes several targets for `seconds` between them (or `max_inputs` test
 cases in all), giving each 0.1 s slice (or 250 test cases; 50 for a
 target's first) to the target expected to cover new features fastest:
 one over the test cases since it last did, divided by its time per test
-case, as in HypoFuzz. One slice in ten goes to a target at random. A
+case (not counting time spent waiting for a CPU, on Linux), as in
+HypoFuzz. One slice in ten goes to a target at random. A
 target that fails or runs out of test cases gets no more slices; its
 failure is shrunk at once, announced in one line (unless its verbosity is
 quiet), and raised with any others when the time is up. Returns a

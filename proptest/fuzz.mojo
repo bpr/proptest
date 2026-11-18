@@ -1261,14 +1261,28 @@ comptime _EXPLORE = 10
 """One choice in this many is a target at random."""
 
 
-def _discovery_rate(r: FuzzReport, since_new: Int) -> Float64:
+def _discovery_rate(since_new: Int, busy_ns: Int, inputs: Int) -> Float64:
     """New features a target is expected to find per second: the chance
     that its next test case covers something new, estimated as one over
     the number of test cases since it last did, divided by its time per
     test case."""
     var p_new = 1.0 / Float64(since_new + 1)
-    var per_input = r.seconds / Float64(max(r.inputs, 1))
+    var per_input = Float64(busy_ns) / 1e9 / Float64(max(inputs, 1))
     return p_new / max(per_input, 1e-7)
+
+
+def _run_delay_ns() -> Int:
+    """How long this thread has spent waiting for a CPU, in ns: the second
+    field of Linux's `/proc/thread-self/schedstat`, or 0 where there's no
+    such file."""
+    try:
+        with open("/proc/thread-self/schedstat", "r") as f:
+            var fields = f.read().split()
+            if len(fields) >= 2:
+                return Int(String(fields[1]))
+    except:
+        pass
+    return 0
 
 
 def fuzz_all[
@@ -1288,7 +1302,9 @@ def fuzz_all[
     expected rate of new features: the chance that its next test case
     covers a new one, estimated as one over the number of test cases
     since it last did (HypoFuzz's "since new coverage"), divided by its
-    time per test case. One slice in ten goes to a target
+    time per test case. That time leaves out time spent waiting for a
+    CPU (on Linux), so a target whose slices the OS preempts under load
+    doesn't look slow. One slice in ten goes to a target
     at random, so none is starved by a bad estimate. A target that fails,
     or has run every test case it can, gets no more slices (so, unlike
     `fuzz`, it doesn't go on looking for other bugs).
@@ -1312,6 +1328,8 @@ def fuzz_all[
     var before = List[FuzzReport]()
     var stopped = List[Bool]()
     var tried = List[Bool]()
+    var busy_ns = List[Int](length=n, fill=0)
+    var ran = List[Int](length=n, fill=0)
     for i in range(n):
         before.append(hs[i].report(hs[i].ptr))
         stopped.append(False)
@@ -1338,7 +1356,7 @@ def fuzz_all[
                 for i in live:
                     ref h = hs[i]
                     var rate = _discovery_rate(
-                        h.report(h.ptr), h.since_new(h.ptr)
+                        h.since_new(h.ptr), busy_ns[i], ran[i]
                     )
                     if rate > best:
                         best = rate
@@ -1347,13 +1365,19 @@ def fuzz_all[
         tried[pick] = True
         ref h = hs[pick]
         var calls0 = h.report(h.ptr).inputs
+        var t0 = perf_counter_ns()
+        var waited0 = _run_delay_ns()
         h.step(
             h.ptr,
             min(stop_at, perf_counter_ns() + _SLICE_NS),
             min(slice, budget - used),
             True,
         )
-        used += h.report(h.ptr).inputs - calls0
+        var waited = _run_delay_ns() - waited0
+        busy_ns[pick] += max(perf_counter_ns() - t0 - waited, 0)
+        var calls = h.report(h.ptr).inputs - calls0
+        ran[pick] += calls
+        used += calls
         if h.done(h.ptr):
             stopped[pick] = True
             try:
