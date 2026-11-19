@@ -15,8 +15,15 @@
 # A program has up to six functions `fN(a, b, c) -> Int`. Each one works
 # on four Int variables, an `Array` that it also writes through a raw
 # pointer, an `Optional[Int]`, and a pool of four heap-allocated doubly linked
-# nodes, reached through `Optional[Pointer]` cursors. It returns a hash of
-# all of them. `main` prints each function's result on constant arguments
+# nodes, reached through `Optional[Pointer]` cursors. It also has narrow and
+# wide integers (8 to 256 bits, with the `std.bit` functions), SIMD
+# vectors, and `Tracked` values, which count their copies and destructions:
+# in variables, struct fields, a `List`, an `Optional`, a `Dict`, a
+# `Variant`, an `__enum`, and two heap cells that are written, taken and
+# destroyed in place, plus a `Set[Int]`. Statements reach them through `ref`
+# bindings, functions returning `ref`, and `match` and `if case` bindings
+# (`match` also takes Ints, tuples and Optionals). It returns a hash of all
+# of them. `main` prints each function's result on constant arguments
 # (lines starting with "c") and on the same arguments hidden behind
 # `black_box` ("b"). A second file, comptime.mojo, computes the "c" lines
 # with `comptime` and prints them.
@@ -76,6 +83,10 @@ comptime NARROW_TYPES: List[String] = [
     "Int32",
     "UInt32",
     "UInt64",
+    "Int128",
+    "UInt128",
+    "Int256",
+    "UInt256",
 ]
 """The type of each narrow variable: `n0: Int8`, `n1: UInt8`, ..."""
 comptime NARROW_DTYPES: List[String] = [
@@ -86,9 +97,13 @@ comptime NARROW_DTYPES: List[String] = [
     "int32",
     "uint32",
     "uint64",
+    "int128",
+    "uint128",
+    "int256",
+    "uint256",
 ]
-comptime NARROW_BITS: List[Int] = [8, 8, 16, 16, 32, 32, 64]
-comptime N_NARROW = 7
+comptime NARROW_BITS: List[Int] = [8, 8, 16, 16, 32, 32, 64, 128, 128, 256, 256]
+comptime N_NARROW = 11
 comptime VEC_DTYPES: List[String] = [
     "int32",
     "uint16",
@@ -146,7 +161,7 @@ struct ProgramGenerator(Movable):
         self.calls = 0
         self.guards = 0
         self.budget = 30
-        self.tracked = ["t0", "t1"]
+        self.tracked = ["t0", "t1", "pr.x", "pr.y"]
         self.tracked_ok = True
         self.try_depth = 0
         self.touch_loops = getenv("COMPILER_FUZZ_NO_7593_WORKAROUND") == ""
@@ -255,7 +270,17 @@ struct ProgramGenerator(Movable):
         if choice == 11:
             return String("pool.at(", self.int_expr(data, d), ")[].val")
         if choice == 12 and self.tracked_ok:
-            var kind = data.draw(integers(0, 3))
+            var kind = data.draw(integers(0, 8))
+            if kind == 4:
+                return String("cells.at(", self.int_expr(data, d), ")[].val")
+            if kind == 5:
+                return "len(d)"
+            if kind == 6:
+                return "len(st)"
+            if kind == 7:
+                return "_tmix(en)"
+            if kind == 8:
+                return "_varmix(vr)"
             if kind == 0:
                 return String(Self.pick(data, self.tracked.copy()), ".val")
             if kind == 1:
@@ -323,7 +348,7 @@ struct ProgramGenerator(Movable):
         """An expression of type `NARROW_TYPES[k]`, the type of `nk`."""
         var t = materialize[NARROW_TYPES]()[k]
         var bits = materialize[NARROW_BITS]()[k]
-        var choice = data.draw(integers(0, 10 if depth < 3 else 1))
+        var choice = data.draw(integers(0, 11 if depth < 3 else 1))
         var d = depth + 1
         if choice == 0:
             return String("n", k)
@@ -404,6 +429,24 @@ struct ProgramGenerator(Movable):
         if choice == 9:
             var op = "~" if data.draw(booleans()) else "-"
             return String("(", op, self.narrow_expr(data, k, d), ")")
+        if choice == 10:
+            # std.bit functions: LLVM intrinsics (ctpop, ctlz, cttz, bswap,
+            # bitreverse, fshl/fshr)
+            var x = self.narrow_expr(data, k, d)
+            var f = data.draw(integers(0, 6))
+            if f == 5 or f == 6:
+                var name = "rotate_bits_left" if f == 5 else "rotate_bits_right"
+                return String(
+                    name, "[", data.draw(integers(0, bits - 1)), "](", x, ")"
+                )
+            var names: List[String] = [
+                "pop_count",
+                "count_leading_zeros",
+                "count_trailing_zeros",
+                "byte_swap",
+                "bit_reverse",
+            ]
+            return String(names[f], "(", x, ")")
         return String("n", k)
 
     # ---- SIMD vector expressions
@@ -468,12 +511,16 @@ struct ProgramGenerator(Movable):
                 ")))",
             )
         if choice == 6:
+            # The condition goes through _cond: when it folds to a constant,
+            # `V(x)` in the dead branch is typed as a scalar, which can
+            # reject valid code or change the result's type
+            # (https://github.com/modular/modular/issues/7664).
             return String(
                 "(",
                 self.vec_expr(data, k, d),
-                " if ",
+                " if _cond(",
                 self.condition(data, d),
-                " else ",
+                ") else ",
                 self.vec_expr(data, k, d),
                 ")",
             )
@@ -655,8 +702,11 @@ struct ProgramGenerator(Movable):
     def condition(
         mut self, mut data: ConjectureData, depth: Int
     ) raises -> String:
-        var choice = data.draw(integers(0, 12 if depth < 3 else 0))
+        var choice = data.draw(integers(0, 13 if depth < 3 else 0))
         var d = depth + 1
+        if choice == 13 and self.tracked_ok:
+            var coll = "d" if data.draw(booleans()) else "st"
+            return String("((", self.int_expr(data, d), " & 7) in ", coll, ")")
         if choice == 0:
             var op = Self.pick(data, ["<", "==", "!=", ">="])
             return String(
@@ -783,7 +833,7 @@ struct ProgramGenerator(Movable):
     def statement(
         mut self, mut data: ConjectureData, indent: String, depth: Int
     ) raises -> String:
-        var choice = data.draw(integers(0, 26))
+        var choice = data.draw(integers(0, 40))
         var inner = indent + "    "
         if choice == 0:
             return String(
@@ -1138,6 +1188,14 @@ struct ProgramGenerator(Movable):
                 self.int_expr(data, 0),
                 ")\n",
             )
+        if choice >= 37:
+            # more weight on Dict, __enum and match statements
+            var c = [32, 32, 35, 36][choice - 37]
+            return self.collection_statement(data, c, indent, depth)
+        if choice >= 32:
+            return self.collection_statement(data, choice, indent, depth)
+        if choice >= 27:
+            return self.place_statement(data, choice, indent)
         if choice >= 16:
             return self.ownership_statement(data, choice, indent, depth)
         return String(
@@ -1269,7 +1327,41 @@ struct ProgramGenerator(Movable):
             )
         if choice == 18:
             # the list owns its elements
-            var kind = data.draw(integers(0, 7))
+            var kind = data.draw(integers(0, 11))
+            if kind == 8:
+                return String(
+                    indent,
+                    "if len(lst) > 1:\n",
+                    inner,
+                    "lst.swap_elements((",
+                    self.plain_expr(data, 1),
+                    " & 1023) % len(lst), (",
+                    self.plain_expr(data, 1),
+                    " & 1023) % len(lst))\n",
+                )
+            if kind == 9:
+                return String(indent, "lst.reverse()\n")
+            if kind == 10:
+                return String(
+                    indent,
+                    "if lst:\n",
+                    inner,
+                    t,
+                    " = _pop_at(lst, ",
+                    self.plain_expr(data, 1),
+                    ")\n",
+                )
+            if kind == 11:
+                return String(
+                    indent,
+                    "if lst:\n",
+                    inner,
+                    "lst[(",
+                    self.plain_expr(data, 1),
+                    " & 1023) % len(lst)] = ",
+                    fresh,
+                    "\n",
+                )
             if kind == 0:
                 return String(
                     indent,
@@ -1298,7 +1390,14 @@ struct ProgramGenerator(Movable):
             if kind == 5:
                 return String(indent, "lst.clear()\n")
             if kind == 6:
-                return String(indent, "lst.insert(0, ", t, ".copy())\n")
+                return String(
+                    indent,
+                    "_insert(lst, ",
+                    self.plain_expr(data, 1),
+                    ", ",
+                    t,
+                    ".copy())\n",
+                )
             var k = String("k", self.guards)
             self.guards += 1
             return String(
@@ -1346,7 +1445,13 @@ struct ProgramGenerator(Movable):
             self.tracked.append(name)
             return String(indent, "var ", name, " = Tracked(", init, ", L)\n")
         if choice == 21:
-            # a closure that captures a tracked value by reference
+            # a closure that captures a tracked value by reference (a
+            # variable, not a field)
+            var plain = List[String]()
+            for name in self.tracked:
+                if "." not in name:
+                    plain.append(name)
+            t = Self.pick(data, plain^)
             var name = String("cl", self.guards)
             self.guards += 1
             var s = String(
@@ -1415,11 +1520,901 @@ struct ProgramGenerator(Movable):
             )
         return String(indent, t, ".val += ", self.plain_expr(data, 0), "\n")
 
+    def place_statement(
+        mut self, mut data: ConjectureData, choice: Int, indent: String
+    ) raises -> String:
+        """References (`ref` bindings and functions returning `ref`), heap
+        cells of tracked values, and tuple assignment."""
+        var inner = indent + "    "
+        var t = Self.pick(data, self.tracked.copy())
+        var fresh = String("Tracked(", self.plain_expr(data, 0), ", L)")
+        var r = String("r", self.guards)
+        self.guards += 1
+        if choice == 27:
+            # a reference to a buf element, used across a write through
+            # the raw pointer p, which may alias it
+            var target = String("buf[", self.int_expr(data, 1), " & 7]")
+            if data.draw(booleans()):
+                target = String("_elem(buf, ", self.int_expr(data, 1), ")")
+            if data.draw(integers(0, 3)) == 0:
+                var op = Self.pick(data, ["+=", "^=", "*="])
+                return String(
+                    indent, target, " ", op, " ", self.int_expr(data, 0), "\n"
+                )
+            var s = String(indent, "ref ", r, " = ", target, "\n")
+            if data.draw(booleans()):
+                s += String(
+                    indent,
+                    "p[unsafe_offset=",
+                    self.int_expr(data, 1),
+                    " & 7] = ",
+                    self.int_expr(data, 0),
+                    "\n",
+                )
+            if data.draw(booleans()):
+                s += String(
+                    indent, r, " = ", r, " * 3 + ", self.int_expr(data, 0), "\n"
+                )
+            else:
+                s += String(indent, r, " += ", self.int_expr(data, 0), "\n")
+            if data.draw(booleans()):
+                s += String(indent, self.variable(data), " ^= ", r, "\n")
+            return s
+        if choice == 28:
+            # a reference to a tracked value
+            var kind = data.draw(integers(0, 3))
+            var s: String
+            if kind == 0:
+                var pair = self.two_tracked(data)
+                var saved = self.tracked_ok
+                self.tracked_ok = False
+                var cond = self.condition(data, 1)
+                self.tracked_ok = saved
+                s = String(
+                    indent,
+                    "ref ",
+                    r,
+                    " = _pick(",
+                    cond,
+                    ", ",
+                    pair[0],
+                    ", ",
+                    pair[1],
+                    ")\n",
+                )
+            elif kind == 1:
+                s = String(indent, "ref ", r, " = ", t, "\n")
+            elif kind == 2:
+                s = String(
+                    indent,
+                    "ref ",
+                    r,
+                    " = cells.at(",
+                    self.plain_expr(data, 1),
+                    ")[]\n",
+                )
+            else:
+                var k = String("k", self.guards)
+                self.guards += 1
+                return String(
+                    indent,
+                    "if lst:\n",
+                    inner,
+                    "var ",
+                    k,
+                    " = (",
+                    self.plain_expr(data, 1),
+                    " & 1023) % len(lst)\n",
+                    inner,
+                    "ref ",
+                    r,
+                    " = lst[",
+                    k,
+                    "]\n",
+                    inner,
+                    r,
+                    ".val = ",
+                    r,
+                    ".val * 5 + ",
+                    self.plain_expr(data, 0),
+                    "\n",
+                )
+            if data.draw(booleans()):
+                s += String(
+                    indent,
+                    r,
+                    ".val = ",
+                    r,
+                    ".val * 5 + ",
+                    self.plain_expr(data, 0),
+                    "\n",
+                )
+            else:
+                s += String(
+                    indent, "_bump(", r, ", ", self.plain_expr(data, 0), ")\n"
+                )
+            if data.draw(booleans()):
+                s += String(indent, self.variable(data), " += ", r, ".val\n")
+            return s
+        if choice == 29:
+            # heap cells: values written, taken and destroyed in place
+            var i = String("ci", self.guards)
+            self.guards += 1
+            var at = String("cells.at(", i, ")")
+            var s = String(
+                indent, "var ", i, " = ", self.plain_expr(data, 1), "\n"
+            )
+            var kind = data.draw(integers(0, 7))
+            if kind == 0:
+                return s + String(indent, at, "[] = ", fresh, "\n")
+            if kind == 1:
+                return s + String(indent, at, "[] = ", t, ".copy()\n")
+            if kind == 2:
+                return s + String(indent, t, " = ", at, "[].copy()\n")
+            if kind == 3:
+                var x = String("tk", self.guards)
+                self.guards += 1
+                return s + String(
+                    indent,
+                    "var ",
+                    x,
+                    " = ",
+                    at,
+                    ".unsafe_take_pointee()\n",
+                    indent,
+                    at,
+                    ".unsafe_write(Tracked(",
+                    x,
+                    ".val * 3 + ",
+                    self.plain_expr(data, 0),
+                    ", L))\n",
+                )
+            if kind == 4:
+                return s + String(
+                    indent,
+                    at,
+                    ".unsafe_deinit_pointee()\n",
+                    indent,
+                    at,
+                    ".unsafe_write(",
+                    t,
+                    ".copy())\n",
+                )
+            if kind == 5:
+                return s + String(
+                    indent,
+                    at,
+                    ".swap_pointees(cells.at(",
+                    self.plain_expr(data, 1),
+                    "))\n",
+                )
+            if kind == 6:
+                # rotate: take one, move the other into it, put it back
+                var x = String("tk", self.guards)
+                self.guards += 1
+                return s + String(
+                    indent,
+                    "var ",
+                    x,
+                    " = ",
+                    at,
+                    ".unsafe_take_pointee()\n",
+                    indent,
+                    at,
+                    ".unsafe_write_move_from(cells.at(",
+                    i,
+                    " + 1))\n",
+                    indent,
+                    "cells.at(",
+                    i,
+                    " + 1).unsafe_write(",
+                    x,
+                    "^)\n",
+                )
+            return s + String(indent, "swap(", at, "[], ", t, ")\n")
+        if choice == 30:
+            # a node through a reference
+            var s = String(
+                indent,
+                "ref ",
+                r,
+                " = pool.at(",
+                self.int_expr(data, 1),
+                ")[]\n",
+            )
+            s += String(
+                indent,
+                r,
+                ".val = ",
+                r,
+                ".val * 5 + ",
+                self.int_expr(data, 0),
+                "\n",
+            )
+            if data.draw(booleans()):
+                s += String(
+                    indent,
+                    r,
+                    ".",
+                    Self.link(data),
+                    " = ",
+                    self.cursor_expr(data, 0),
+                    "\n",
+                )
+            return s
+        # tuple assignment
+        if data.draw(booleans()):
+            var pair = self.two_tracked(data)
+            if data.draw(booleans()):
+                return String(
+                    indent,
+                    pair[0],
+                    ", ",
+                    pair[1],
+                    " = ",
+                    pair[1],
+                    "^, ",
+                    pair[0],
+                    "^\n",
+                )
+            return String(
+                indent,
+                pair[0],
+                ", ",
+                pair[1],
+                " = ",
+                pair[1],
+                ".copy(), ",
+                pair[0],
+                "^\n",
+            )
+        var x = self.variable(data)
+        var y = self.variable(data)
+        if x == y:
+            return String(indent, x, " = ", self.int_expr(data, 0), "\n")
+        return String(
+            indent, x, ", ", y, " = ", y, ", ", self.int_expr(data, 0), "\n"
+        )
+
+    def arm(
+        mut self,
+        mut data: ConjectureData,
+        indent: String,
+        depth: Int,
+        var bound: List[String],
+    ) raises -> String:
+        """A `case` body. `bound` names Int bindings to an rvalue subject,
+        which the body may read like loop indices."""
+        var n = len(self.loop_variables)
+        self.loop_variables += bound^
+        var body = self.block(data, indent, depth + 1) if depth < 3 else String(
+            indent, self.variable(data), " += ", self.atom(data), "\n"
+        )
+        while len(self.loop_variables) > n:
+            _ = self.loop_variables.pop()
+        return body
+
+    def collection_statement(
+        mut self,
+        mut data: ConjectureData,
+        choice: Int,
+        indent: String,
+        depth: Int,
+    ) raises -> String:
+        """A `Dict` and a `Set`, a `Variant`, and `match` on an `__enum`,
+        Optionals, Ints and tuples."""
+        var inner = indent + "    "
+        var t = Self.pick(data, self.tracked.copy())
+        var fresh = String("Tracked(", self.plain_expr(data, 0), ", L)")
+        var n = self.guards
+        self.guards += 1
+        var key = String("dk", n)
+        var r = String("r", n)
+        var bx = String("x", n)
+        var by = String("y", n)
+        var s = String(
+            indent, "var ", key, " = ", self.plain_expr(data, 1), " & 7\n"
+        )
+        if choice == 32:
+            # a Dict of tracked values
+            var kind = data.draw(integers(0, 13))
+            if kind == 0:
+                return s + String(indent, "d[", key, "] = ", fresh, "\n")
+            if kind == 1:
+                return s + String(indent, "d[", key, "] = ", t, ".copy()\n")
+            if kind == 2:
+                return s + String(
+                    indent,
+                    "if ",
+                    key,
+                    " in d:\n",
+                    inner,
+                    "try:\n",
+                    inner,
+                    "    d[",
+                    key,
+                    "].val += ",
+                    self.plain_expr(data, 0),
+                    "\n",
+                    inner,
+                    "except:\n",
+                    inner,
+                    "    pass\n",
+                )
+            if kind == 3:
+                return s + String(
+                    indent, t, " = d.pop(", key, ", ", fresh, ")\n"
+                )
+            if kind == 4:
+                # the default is the value it replaces
+                return s + String(indent, t, " = d.pop(", key, ", ", t, "^)\n")
+            if kind == 5:
+                return s + String(
+                    indent,
+                    "try:\n",
+                    inner,
+                    t,
+                    " = d.pop(",
+                    key,
+                    ")\n",
+                    indent,
+                    "except:\n",
+                    inner,
+                    self.variable(data),
+                    " += 1\n",
+                )
+            if kind == 6:
+                var g = String("dg", n)
+                return s + String(
+                    indent,
+                    "var ",
+                    g,
+                    " = d.get(",
+                    key,
+                    ")\n",
+                    indent,
+                    "if ",
+                    g,
+                    ":\n",
+                    inner,
+                    self.variable(data),
+                    " += ",
+                    g,
+                    ".value().val\n",
+                )
+            if kind == 7:
+                return s + String(
+                    indent,
+                    "try:\n",
+                    inner,
+                    "ref ",
+                    r,
+                    " = d[",
+                    key,
+                    "]\n",
+                    inner,
+                    r,
+                    ".val = ",
+                    r,
+                    ".val * 5 + ",
+                    self.plain_expr(data, 0),
+                    "\n",
+                    indent,
+                    "except:\n",
+                    inner,
+                    "pass\n",
+                )
+            if kind == 8:
+                return s + String(
+                    indent,
+                    "ref ",
+                    r,
+                    " = d.setdefault(",
+                    key,
+                    ", ",
+                    fresh,
+                    ")\n",
+                    indent,
+                    r,
+                    ".val += ",
+                    self.plain_expr(data, 0),
+                    "\n",
+                )
+            if kind == 9:
+                var e = String("de", n)
+                return s + String(
+                    indent,
+                    "try:\n",
+                    inner,
+                    "var ",
+                    e,
+                    " = d.popitem()\n",
+                    inner,
+                    self.variable(data),
+                    " += ",
+                    e,
+                    ".key * 3 + ",
+                    e,
+                    ".value.val\n",
+                    indent,
+                    "except:\n",
+                    inner,
+                    "pass\n",
+                )
+            if kind == 10:
+                return s + String(indent, "d.clear()\n")
+            if kind == 11:
+                var v = self.variable(data)
+                return s + String(
+                    indent,
+                    "for e in d.items():\n",
+                    inner,
+                    v,
+                    " = ",
+                    v,
+                    " * 7 + e.key + e.value.val\n",
+                )
+            if kind == 12:
+                return s + String(
+                    indent,
+                    "for ref x in d.values():\n",
+                    inner,
+                    "x.val = x.val * 3 + ",
+                    key,
+                    "\n",
+                )
+            # a modified copy swapped in; the old dict dies here
+            var dc = String("dc", n)
+            return s + String(
+                indent,
+                "var ",
+                dc,
+                " = d.copy()\n",
+                indent,
+                dc,
+                "[",
+                key,
+                "] = ",
+                fresh,
+                "\n",
+                indent,
+                "swap(d, ",
+                dc,
+                ")\n",
+            )
+        if choice == 33:
+            # a Set of Ints
+            var kind = data.draw(integers(0, 7))
+            if kind == 0:
+                return s + String(indent, "st.add(", key, ")\n")
+            if kind == 1:
+                return s + String(indent, "st.discard(", key, ")\n")
+            if kind == 2:
+                return s + String(
+                    indent,
+                    "try:\n",
+                    inner,
+                    "st.remove(",
+                    key,
+                    ")\n",
+                    indent,
+                    "except:\n",
+                    inner,
+                    self.variable(data),
+                    " += 1\n",
+                )
+            if kind == 3:
+                var op = Self.pick(data, ["|", "&", "-", "^"])
+                var other = String(
+                    "Set[Int](",
+                    key,
+                    ", (",
+                    self.plain_expr(data, 1),
+                    ") & 7, ",
+                    data.draw(integers(0, 7)),
+                    ")",
+                )
+                if data.draw(booleans()):
+                    return s + String(indent, "st ", op, "= ", other, "\n")
+                return s + String(indent, "st = st ", op, " ", other, "\n")
+            if kind == 4:
+                return s + String(
+                    indent,
+                    "try:\n",
+                    inner,
+                    self.variable(data),
+                    " += st.pop()\n",
+                    indent,
+                    "except:\n",
+                    inner,
+                    "pass\n",
+                )
+            if kind == 5:
+                var v = self.variable(data)
+                return s + String(
+                    indent, "for k in st:\n", inner, v, " = ", v, " * 3 + k\n"
+                )
+            if kind == 6:
+                return s + String(indent, "st.clear()\n")
+            return s + String(
+                indent,
+                "if ",
+                key,
+                " in st:\n",
+                inner,
+                self.variable(data),
+                " += ",
+                key,
+                "\n",
+            )
+        if choice == 34:
+            # a Variant[Int, Tracked]
+            var kind = data.draw(integers(0, 7))
+            var e = self.plain_expr(data, 0)
+            if kind == 0:
+                return String(indent, "vr = TV(Int(", e, "))\n")
+            if kind == 1:
+                return String(indent, "vr.set[Tracked](", fresh, ")\n")
+            if kind == 2:
+                return String(indent, "vr = TV(", t, ".copy())\n")
+            if kind == 3:
+                return String(
+                    indent,
+                    "if vr.isa[Tracked]():\n",
+                    inner,
+                    "vr[Tracked].val += ",
+                    e,
+                    "\n",
+                )
+            if kind == 4:
+                return String(
+                    indent,
+                    "if vr.isa[Tracked]():\n",
+                    inner,
+                    t,
+                    " = vr.replace[Int, Tracked](",
+                    e,
+                    ")\n",
+                )
+            if kind == 5:
+                return String(
+                    indent,
+                    "if vr.isa[Int]():\n",
+                    inner,
+                    self.variable(data),
+                    " += vr[Int]\n",
+                    inner,
+                    "vr[Int] = ",
+                    e,
+                    "\n",
+                )
+            if kind == 6:
+                return String(
+                    indent,
+                    "if vr.isa[Tracked]():\n",
+                    inner,
+                    "swap(vr[Tracked], ",
+                    t,
+                    ")\n",
+                )
+            return String(
+                indent,
+                "if vr.isa[Int]():\n",
+                inner,
+                self.variable(data),
+                " ^= vr.replace[Tracked, Int](",
+                fresh,
+                ")\n",
+            )
+        if choice == 35:
+            # the __enum Tok
+            var kind = data.draw(integers(0, 4))
+            var e = self.plain_expr(data, 0)
+            if kind == 0:
+                var value = Self.pick(
+                    data,
+                    [
+                        "materialize[Tok.empty]()",
+                        String(".num(", e, ")"),
+                        String(".two(", e, ", ", self.plain_expr(data, 0), ")"),
+                        String(".tr(", fresh, ")"),
+                        String(".tr(", t, ".copy())"),
+                        String(".both(", e, ", ", fresh, ")"),
+                    ],
+                )
+                return String(indent, "en = ", value, "\n")
+            if kind == 1:
+                # bindings into the subject, then a body that may assign it
+                var v = self.variable(data)
+                var cases = List[String]()
+                cases.append(
+                    String(
+                        indent,
+                        "case .tr(ref ",
+                        r,
+                        "):\n",
+                        inner,
+                        r,
+                        ".val = ",
+                        r,
+                        ".val * 5 + ",
+                        e,
+                        "\n",
+                    )
+                )
+                cases.append(
+                    String(
+                        indent,
+                        "case .both(",
+                        bx,
+                        ", ref ",
+                        r,
+                        ") if ",
+                        bx,
+                        " < ",
+                        self.plain_expr(data, 1),
+                        ":\n",
+                        inner,
+                        r,
+                        ".val += ",
+                        bx,
+                        "\n",
+                    )
+                )
+                cases.append(
+                    String(
+                        indent,
+                        "case .num(",
+                        bx,
+                        ") | .two(",
+                        bx,
+                        ", _) | .both(",
+                        bx,
+                        ", _):\n",
+                        inner,
+                        v,
+                        " = ",
+                        v,
+                        " * 3 + ",
+                        bx,
+                        "\n",
+                    )
+                )
+                cases.append(
+                    String(
+                        indent,
+                        "case .two(",
+                        bx,
+                        ", ",
+                        by,
+                        ") if ",
+                        bx,
+                        " < ",
+                        by,
+                        ":\n",
+                        inner,
+                        v,
+                        " += ",
+                        by,
+                        " - ",
+                        bx,
+                        "\n",
+                    )
+                )
+                cases.append(String(indent, "case .empty:\n", inner, "pass\n"))
+                var out = String(indent, "match en:\n")
+                # a random subset in a random order, then a catch-all
+                var m = data.draw(integers(1, len(cases)))
+                for _ in range(m):
+                    var j = data.draw(integers(0, len(cases) - 1))
+                    out += cases.pop(j)
+                    if data.draw(integers(0, 2)) == 0:
+                        out += self.arm(data, inner, depth, [])
+                out += String(indent, "case _:\n")
+                out += self.arm(data, inner, depth, [])
+                return out
+            if kind == 2:
+                # var bindings of Int payloads only: one of a Tracked
+                # payload is destroyed twice
+                # (https://github.com/modular/modular/issues/7418), and
+                # two or an or-pattern copy it (issue 7659). The subject is
+                # a copy, not `en^`: a var binding on a moved subject and
+                # any other binding on it in the same function fail to
+                # compile (issue 7649).
+                var v = self.variable(data)
+                return String(
+                    indent,
+                    "match en.copy():\n",
+                    indent,
+                    "case .num(var ",
+                    bx,
+                    ") | .two(_, var ",
+                    bx,
+                    ") | .both(var ",
+                    bx,
+                    ", _):\n",
+                    inner,
+                    bx,
+                    " = ",
+                    bx,
+                    " * 3 + ",
+                    e,
+                    "\n",
+                    inner,
+                    v,
+                    " ^= ",
+                    bx,
+                    "\n",
+                    indent,
+                    "case _:\n",
+                    inner,
+                    "pass\n",
+                )
+            if kind == 3:
+                return String(
+                    indent,
+                    "if case .tr(ref ",
+                    r,
+                    ") = en:\n",
+                    inner,
+                    "swap(",
+                    r,
+                    ", ",
+                    t,
+                    ")\n",
+                    indent,
+                    "elif case .num(",
+                    bx,
+                    ") = en:\n",
+                    inner,
+                    "en = .two(",
+                    bx,
+                    ", ",
+                    e,
+                    ")\n",
+                )
+            return String(
+                indent,
+                self.variable(data),
+                " += _tmix(en)\n",
+            )
+        # match on Ints, tuples and Optionals
+        var kind = data.draw(integers(0, 4))
+        if kind == 0:
+            # an rvalue subject: the body can read the bindings
+            var x = String("m", n)
+            var out = String(
+                indent, "match ", self.int_expr(data, 1), " & 7:\n"
+            )
+            out += String(
+                indent,
+                "case ",
+                data.draw(integers(0, 7)),
+                " | ",
+                data.draw(integers(0, 7)),
+                ":\n",
+            )
+            out += self.arm(data, inner, depth, [])
+            out += String(
+                indent, "case ", x, " if ", x, " > ", data.draw(integers(0, 7))
+            )
+            out += ":\n"
+            out += self.arm(data, inner, depth, [x])
+            out += String(indent, "case _:\n")
+            out += self.arm(data, inner, depth, [])
+            return out
+        if kind == 1:
+            # an lvalue subject that the arms may change
+            var v = self.variable(data)
+            var out = String(indent, "match ", v, ":\n")
+            for _ in range(data.draw(integers(1, 3))):
+                var lit = Self.pick(data, materialize[CONSTANTS]())
+                if lit.startswith("(") or "." in lit:
+                    lit = String(data.draw(integers(-3, 9)))
+                out += String(indent, "case ", lit, ":\n")
+                out += self.arm(data, inner, depth, [])
+            out += String(indent, "case _:\n")
+            out += self.arm(data, inner, depth, [])
+            return out
+        if kind == 2:
+            var x = String("m", n)
+            var y = String("u", n)
+            var out = String(
+                indent,
+                "match (",
+                self.int_expr(data, 1),
+                " & 3, ",
+                self.int_expr(data, 1),
+                " & 1):\n",
+            )
+            out += String(indent, "case (0, 0) | (1, 1):\n")
+            out += self.arm(data, inner, depth, [])
+            out += String(indent, "case (2, ", y, ") | (", y, ", 0):\n")
+            out += self.arm(data, inner, depth, [y])
+            out += String(indent, "case (", x, ", ", y, ") if ", x, " > ", y)
+            out += ":\n"
+            out += self.arm(data, inner, depth, [x, y])
+            out += String(indent, "case _:\n")
+            out += self.arm(data, inner, depth, [])
+            return out
+        if kind == 3:
+            var v = self.variable(data)
+            var out = String(indent, "match opt:\n")
+            out += String(
+                indent,
+                "case .Some(",
+                bx,
+                ") if ",
+                bx,
+                " < ",
+                self.plain_expr(data, 1),
+                ":\n",
+                inner,
+                v,
+                " += ",
+                bx,
+                "\n",
+            )
+            out += String(
+                indent, "case .Some(", bx, "):\n", inner, v, " ^= ", bx, "\n"
+            )
+            out += String(indent, "case .None:\n")
+            out += self.arm(data, inner, depth, [])
+            out += String(indent, "match ot:\n")
+            out += String(
+                indent,
+                "case .Some(ref ",
+                r,
+                "):\n",
+                inner,
+                r,
+                ".val += ",
+                self.plain_expr(data, 0),
+                "\n",
+            )
+            out += self.arm(data, inner, depth, [])
+            out += String(indent, "case .None:\n")
+            out += self.arm(data, inner, depth, [])
+            return out
+        # while case, bounded
+        var g = String("g", n)
+        return String(
+            indent,
+            "var ",
+            g,
+            " = 0\n",
+            indent,
+            "while case .Some(",
+            bx,
+            ") = opt:\n",
+            inner,
+            g,
+            " += 1\n",
+            inner,
+            "if ",
+            g,
+            " > ",
+            data.draw(integers(0, 4)),
+            ":\n",
+            inner,
+            "    opt = None\n",
+            inner,
+            "else:\n",
+            inner,
+            "    opt = Optional[Int](",
+            bx,
+            " * 3 + ",
+            self.plain_expr(data, 1),
+            ")\n",
+        )
+
     @staticmethod
     def checksum() -> String:
         return (
             "_mix(v0, v1, v2, v3, buf, opt, pool, q0, q1, t0, t1, lst, ot)"
-            " * 31 + _nmix(n0, n1, n2, n3, n4, n5, n6)"
+            " * 31 + _nmix(n0, n1, n2, n3, n4, n5, n6, n7, n8, n9, n10)"
+            " * 31 + _pmix(pr, cells)"
+            " * 31 + _cmix(d, st, vr, en)"
             " * 31 + _vmix(s0, s1, s2, s3, s4, s5)"
         )
 
@@ -1440,6 +2435,12 @@ struct ProgramGenerator(Movable):
         s += "    var t1 = Tracked(b, L)\n"
         s += "    var lst = List[Tracked]()\n"
         s += "    var ot = Optional[Tracked](None)\n"
+        s += "    var pr = Pair(Tracked(c, L), Tracked(a, L))\n"
+        s += "    var cells = Cells(b, c, L)\n"
+        s += "    var d = Dict[Int, Tracked]()\n"
+        s += "    var st = Set[Int]()\n"
+        s += "    var vr = TV(Int(c))\n"
+        s += "    var en: Tok = .num(b)\n"
         var types = materialize[NARROW_TYPES]()
         for k in range(len(types)):
             s += String(
@@ -1479,8 +2480,19 @@ struct ProgramGenerator(Movable):
 
 
 comptime PRELUDE = """from std.benchmark import black_box
+from std.bit import (
+    pop_count, count_leading_zeros, count_trailing_zeros, byte_swap,
+    bit_reverse, rotate_bits_left, rotate_bits_right,
+)
+from std.collections import Set
 from std.memory import Pointer
 from std.memory.alloc import unsafe_alloc
+from std.utils import Variant
+
+
+@always_inline
+def _cond(c: Bool) -> Bool:
+    return c
 
 
 @always_inline
@@ -1512,14 +2524,19 @@ def _nmod[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
 @always_inline
 def _nmix(
     n0: Int8, n1: UInt8, n2: Int16, n3: UInt16, n4: Int32, n5: UInt32,
-    n6: UInt64,
+    n6: UInt64, n7: Int128, n8: UInt128, n9: Int256, n10: UInt256,
 ) -> Int:
     var h = Int(n0) * 31 + Int(n1)
     h = h * 31 + Int(n2)
     h = h * 31 + Int(n3)
     h = h * 31 + Int(n4)
     h = h * 31 + Int(n5)
-    return h * 31 + Int(n6)
+    h = h * 31 + Int(n6)
+    h = h * 31 + Int(n7) + Int(n7 >> 64)
+    h = h * 31 + Int(n8) + Int(n8 >> 64)
+    for i in range(4):
+        h = h * 31 + Int(n9 >> Int256(64 * i)) + Int(n10 >> UInt256(64 * i))
+    return h
 
 
 comptime V0 = SIMD[DType.int32, 4]
@@ -1665,6 +2682,95 @@ struct Ledger(Movable):
         return h
 
 
+comptime CellPtr = Pointer[Tracked, MutUntrackedOrigin]
+
+
+struct Cells(Movable):
+    # Two tracked values on the heap, managed by hand.
+    var ptr: CellPtr
+
+    def __init__(out self, a: Int, b: Int, L: LedgerPtr):
+        self.ptr = unsafe_alloc[Tracked](2)
+        self.ptr.unsafe_write(Tracked(a, L))
+        self.ptr.unsafe_offset(1).unsafe_write(Tracked(b, L))
+
+    def __deinit__(deinit self):
+        self.ptr.unsafe_deinit_pointee()
+        self.ptr.unsafe_offset(1).unsafe_deinit_pointee()
+        self.ptr.unsafe_free()
+
+    @always_inline
+    def at(self, i: Int) -> CellPtr:
+        return self.ptr.unsafe_offset(i & 1)
+
+
+struct Pair(Copyable):
+    var x: Tracked
+    var y: Tracked
+
+    def __init__(out self, var x: Tracked, var y: Tracked):
+        self.x = x^
+        self.y = y^
+
+
+def _pmix(pr: Pair, cells: Cells) -> Int:
+    var h = pr.x.val * 31 + pr.y.val
+    return (h * 31 + cells.at(0)[].val) * 31 + cells.at(1)[].val
+
+
+__enum Tok(Copyable):
+    case empty
+    case num(Int)
+    case two(Int, Int)
+    case tr(Tracked)
+    case both(Int, Tracked)
+
+
+comptime TV = Variant[Int, Tracked]
+
+
+def _tmix(t: Tok) -> Int:
+    match t:
+        case .empty:
+            return -3
+        case .num(x):
+            return x
+        case .two(x, y):
+            return x * 7 + y
+        case .tr(r):
+            return r.val * 11
+        case .both(x, r):
+            return x * 13 + r.val
+
+
+def _varmix(v: TV) -> Int:
+    if v.isa[Int]():
+        return v[Int]
+    return v[Tracked].val * 3 + 1
+
+
+def _cmix(d: Dict[Int, Tracked], st: Set[Int], v: TV, t: Tok) -> Int:
+    var h = len(d)
+    for e in d.items():
+        h = (h * 31 + e.key) * 31 + e.value.val
+    h = h * 31 + len(st)
+    for k in st:
+        h = h * 31 + k
+    return (h * 31 + _varmix(v)) * 31 + _tmix(t)
+
+
+@always_inline
+def _elem(ref arr: Array[Int, 8], i: Int) -> ref[arr] Int:
+    return arr[i & 7]
+
+
+@always_inline
+def _pick(c: Bool, mut x: Tracked, mut y: Tracked) -> ref[x, y] Tracked:
+    if c:
+        return x
+    return y
+
+
 def _consume(var t: Tracked) -> Int:
     return t.val
 
@@ -1723,6 +2829,14 @@ def _check_balance(f: Int, live: Int):
         print("UNBALANCED", f, live)
 
 
+def _insert(mut lst: List[Tracked], i: Int, var t: Tracked):
+    lst.insert((i & 1023) % (len(lst) + 1), t^)
+
+
+def _pop_at(mut lst: List[Tracked], i: Int) -> Tracked:
+    return lst.pop((i & 1023) % len(lst))
+
+
 @always_inline
 def _rotl[dt: DType, n: SIMDLength, //, s: Int](v: SIMD[dt, n]) -> SIMD[dt, n]:
     return v.rotate_left[s]()
@@ -1775,6 +2889,25 @@ def _max(a: Int, b: Int) -> Int:
 
 def _check_balance(f: Int, live: Int):
     pass  # the live count is part of run_fN's result
+
+
+# At compile time, List.insert and List.pop(i) on Tracked values fail
+# ("write clobbers a pointer region"; unsafe_memmove copies bytes, see
+# unfiled-mojo-issue-comptime-memmove.md), so these move by swaps.
+def _insert(mut lst: List[Tracked], i: Int, var t: Tracked):
+    var k = (i & 1023) % (len(lst) + 1)
+    lst.append(t^)
+    var j = len(lst) - 1
+    while j > k:
+        lst.swap_elements(j, j - 1)
+        j -= 1
+
+
+def _pop_at(mut lst: List[Tracked], i: Int) -> Tracked:
+    var k = (i & 1023) % len(lst)
+    for j in range(k, len(lst) - 1):
+        lst.swap_elements(j, j + 1)
+    return lst.pop()
 
 
 # Lane loops for the operations that are LLVM intrinsics, which compile
