@@ -22,10 +22,15 @@
 # `Variant`, an `__enum`, and two heap cells that are written, taken and
 # destroyed in place, plus a `Set[Int]`. Statements reach them through `ref`
 # bindings, functions returning `ref`, and `match` and `if case` bindings
-# (`match` also takes Ints, tuples and Optionals). It returns a hash of all
-# of them. `main` prints each function's result on constant arguments
-# (lines starting with "c") and on the same arguments hidden behind
-# `black_box` ("b"). A second file, comptime.mojo, computes the "c" lines
+# (`match` also takes Ints, tuples and Optionals). Generic code runs
+# through a trait `Op` (an associated constant, a default method, a static
+# constructor) and generic structs nested over it, generic functions over
+# `Copyable` values (Ints, narrow integers, `Tracked`), and a trait with an
+# associated type. Closures get random capture lists (`imm`, `mut`, `var`,
+# `var x^`, `{var^}`), may nest or raise, and go to generic higher-order
+# functions. Each function returns a hash of all of them. `main` prints
+# each function's result on constant arguments (lines starting with "c")
+# and on the same arguments hidden behind `black_box` ("b"). A second file, comptime.mojo, computes the "c" lines
 # with `comptime` and prints them.
 #
 # Build and run from the repository root:
@@ -34,7 +39,7 @@
 #       examples/compiler_fuzz/compiler_fuzz.mojo
 #   pixi run build/compiler_fuzz build/compiler_fuzz_work
 #
-# Each test case takes about half a minute, nearly all of it compiling.
+# Each test case takes a second or two, nearly all of it compiling.
 # The compiler under test is $MOJO (default `mojo`); see
 # build_and_compare.sh. COMPILER_FUZZ_NO_SHRINK=1 skips shrinking,
 # COMPILER_FUZZ_NO_7593_WORKAROUND=1 lets `range` loops overwrite tracked
@@ -184,9 +189,11 @@ struct ProgramGenerator(Movable):
     def int_expr(
         mut self, mut data: ConjectureData, depth: Int
     ) raises -> String:
-        var choice = data.draw(integers(0, 16 if depth < 3 else 1))
+        var choice = data.draw(integers(0, 18 if depth < 3 else 1))
         if choice == 0:
             return self.atom(data)
+        if choice >= 17:
+            return self.generic_expr(data, depth + 1)
         if choice == 1:
             return Self.pick(data, materialize[CONSTANTS]())
         var d = depth + 1
@@ -833,8 +840,10 @@ struct ProgramGenerator(Movable):
     def statement(
         mut self, mut data: ConjectureData, indent: String, depth: Int
     ) raises -> String:
-        var choice = data.draw(integers(0, 40))
+        var choice = data.draw(integers(0, 46))
         var inner = indent + "    "
+        if choice >= 41:
+            return self.generic_statement(data, choice, indent, depth)
         if choice == 0:
             return String(
                 indent, self.variable(data), " = ", self.int_expr(data, 0), "\n"
@@ -2408,6 +2417,553 @@ struct ProgramGenerator(Movable):
             ")\n",
         )
 
+    # ---- generics and closures
+
+    def op_arg(
+        mut self, mut data: ConjectureData, names: List[String]
+    ) raises -> String:
+        if len(names) > 0:
+            return self.closure_expr(data, names, 2)
+        return self.plain_expr(data, 2)
+
+    def op_value(
+        mut self, mut data: ConjectureData, depth: Int, names: List[String]
+    ) raises -> Tuple[String, String]:
+        """A value of a type that conforms to `Op`, as (type, expression).
+        With `names` (in a closure), its Int arguments read only those."""
+        var choice = data.draw(integers(0, 6 if depth < 2 else 3))
+        if choice == 0:
+            return (
+                String("AddOp"),
+                String("AddOp(", self.op_arg(data, names), ")"),
+            )
+        if choice == 1:
+            return (
+                String("MulOp"),
+                String("MulOp(", self.op_arg(data, names), ")"),
+            )
+        if choice == 2:
+            var t = String("ShiftOp[", data.draw(integers(1, 62)), "]")
+            return (t, String(t, "()"))
+        if choice == 3:
+            if len(names) > 0:
+                # closures don't capture the ledger here
+                return (String("AddOp"), String("AddOp(1)"))
+            return (
+                String("TrackedOp"),
+                String("TrackedOp(Tracked(", self.plain_expr(data, 2), ", L))"),
+            )
+        var a = self.op_value(data, depth + 1, names)
+        if choice == 6:
+            var t = String(
+                "Repeat[", a[0], ", ", data.draw(integers(0, 3)), "]"
+            )
+            return (t, String(t, "(", a[1], ")"))
+        var b = self.op_value(data, depth + 1, names)
+        var t: String
+        if choice == 4:
+            t = String("Compose[", a[0], ", ", b[0], "]")
+        else:
+            var flag = "True" if data.draw(booleans()) else "False"
+            t = String("Pick[", a[0], ", ", b[0], ", ", flag, "]")
+        return (t, String(t, "(", a[1], ", ", b[1], ")"))
+
+    def op_expr(mut self, mut data: ConjectureData) raises -> String:
+        """An `Op` value, built directly or by its static `make`."""
+        var op = self.op_value(data, 0, [])
+        if data.draw(integers(0, 3)) == 0:
+            return String(op[0], ".make(", self.plain_expr(data, 2), ", L)")
+        return op[1]
+
+    def generic_expr(
+        mut self, mut data: ConjectureData, depth: Int
+    ) raises -> String:
+        """An Int expression that instantiates generic functions."""
+        var kind = data.draw(integers(0, 7))
+        if kind <= 2:
+            var fs: List[String] = ["_gapply", "_gtwice", "_gcopy"]
+            var f = fs[kind]
+            return String(
+                f,
+                "(",
+                self.op_expr(data),
+                ", ",
+                self.int_expr(data, depth),
+                ")",
+            )
+        if kind == 3:
+            var t = self.op_value(data, 0, [])[0]
+            return String(
+                "_gmake[",
+                t,
+                "](",
+                self.int_expr(data, depth),
+                ", ",
+                self.int_expr(data, depth),
+                ", L)",
+            )
+        if kind == 4:
+            return String(self.op_value(data, 0, [])[0], ".K")
+        if kind == 5:
+            return String(
+                "_gpick[Int](",
+                self.condition(data, depth),
+                ", ",
+                self.int_expr(data, depth),
+                ", ",
+                self.int_expr(data, depth),
+                ")",
+            )
+        if kind == 6:
+            var k = data.draw(integers(0, N_NARROW - 1))
+            return String(
+                "Int(_gpick[",
+                materialize[NARROW_TYPES]()[k],
+                "](",
+                self.condition(data, depth),
+                ", ",
+                self.narrow_expr(data, k, depth),
+                ", ",
+                self.narrow_expr(data, k, depth),
+                "))",
+            )
+        if self.tracked_ok:
+            if data.draw(booleans()):
+                var pair = self.two_tracked(data)
+                return String(
+                    "_gpick[Tracked](",
+                    self.condition(data, depth),
+                    ", ",
+                    pair[0],
+                    ", ",
+                    pair[1],
+                    ").val",
+                )
+            return String(
+                "len(_gdup(",
+                Self.pick(data, self.tracked.copy()),
+                ", ",
+                self.int_expr(data, depth),
+                "))",
+            )
+        return String("_gapply(", self.op_expr(data), ", 0)")
+
+    def closure_expr(
+        mut self, mut data: ConjectureData, names: List[String], depth: Int
+    ) raises -> String:
+        """An Int expression that reads only `names` (a closure's
+        parameters and captures, or what a call may read beside one)."""
+        var choice = data.draw(integers(0, 7 if depth < 3 else 1))
+        var d = depth + 1
+        if choice == 0:
+            return Self.pick(data, names.copy())
+        if choice == 1:
+            return Self.pick(data, materialize[CONSTANTS]())
+        if choice == 2:
+            var op = Self.pick(data, ["+", "-", "*", "&", "|", "^"])
+            return String(
+                "(",
+                self.closure_expr(data, names, d),
+                " ",
+                op,
+                " ",
+                self.closure_expr(data, names, d),
+                ")",
+            )
+        if choice == 3:
+            var f = Self.pick(data, ["_div", "_mod", "_min", "_max"])
+            return String(
+                f,
+                "(",
+                self.closure_expr(data, names, d),
+                ", ",
+                self.closure_expr(data, names, d),
+                ")",
+            )
+        if choice == 4:
+            var op = "<<" if data.draw(booleans()) else ">>"
+            return String(
+                "(",
+                self.closure_expr(data, names, d),
+                " ",
+                op,
+                " (",
+                self.closure_expr(data, names, d),
+                " & 63))",
+            )
+        if choice == 5:
+            var cmp = Self.pick(data, ["<", "==", "!=", ">="])
+            return String(
+                "(",
+                self.closure_expr(data, names, d),
+                " if (",
+                self.closure_expr(data, names, d),
+                " ",
+                cmp,
+                " ",
+                self.closure_expr(data, names, d),
+                ") else ",
+                self.closure_expr(data, names, d),
+                ")",
+            )
+        if choice == 6:
+            return Self.pick(data, names.copy())
+        var f = Self.pick(data, ["_gapply", "_gtwice", "_gcopy"])
+        var op = self.op_value(data, 1, names)
+        return String(
+            f, "(", op[1], ", ", self.closure_expr(data, names, d), ")"
+        )
+
+    def generic_statement(
+        mut self,
+        mut data: ConjectureData,
+        choice: Int,
+        indent: String,
+        depth: Int,
+    ) raises -> String:
+        if choice == 43:
+            var kind = data.draw(integers(0, 2))
+            if kind == 0:
+                var pair = self.two_tracked(data)
+                return String(indent, "_gswap(", pair[0], ", ", pair[1], ")\n")
+            if kind == 1:
+                var i = data.draw(integers(0, N_VARIABLES - 1))
+                var j = (
+                    i + data.draw(integers(1, N_VARIABLES - 1))
+                ) % N_VARIABLES
+                return String(indent, "_gswap(v", i, ", v", j, ")\n")
+            var pair = self.two_tracked(data)
+            return String(
+                indent,
+                Self.pick(data, self.tracked.copy()),
+                " = _gpick[Tracked](",
+                self.condition(data, 1),
+                ", ",
+                pair[0],
+                ", ",
+                pair[1],
+                ")\n",
+            )
+        if choice == 44:
+            var call = String(
+                self.variable(data),
+                " += _graise(",
+                self.op_expr(data),
+                ", ",
+                self.plain_expr(data, 1),
+                ", L)\n",
+            )
+            if self.try_depth > 0:
+                return String(indent, call)
+            return String(
+                indent,
+                "try:\n",
+                indent,
+                "    ",
+                call,
+                indent,
+                "except:\n",
+                indent,
+                "    ",
+                self.variable(data),
+                " -= 1\n",
+            )
+        if choice == 45:
+            # an Op in a local, used several times
+            var name = String("g", self.guards)
+            self.guards += 1
+            var s = String(
+                indent, "var ", name, " = ", self.op_expr(data), "\n"
+            )
+            for _ in range(data.draw(integers(1, 3))):
+                var use = data.draw(integers(0, 3))
+                var e = self.plain_expr(data, 1)
+                var call: String
+                if use == 0:
+                    call = String("_gapply(", name, ", ", e, ")")
+                elif use == 1:
+                    call = String(name, ".twice(", e, ")")
+                elif use == 2:
+                    call = String("type_of(", name, ").K")
+                else:
+                    call = String("_gcopy(", name, ", ", e, ")")
+                s += String(indent, self.variable(data), " ^= ", call, "\n")
+            return s
+        return self.closure_statement(data, indent, depth)
+
+    def closure_statement(
+        mut self,
+        mut data: ConjectureData,
+        indent: String,
+        depth: Int,
+        forced_mode: Int = -1,
+    ) raises -> String:
+        """A closure with a generated capture list and body, passed to
+        generic higher-order functions or called directly."""
+        var inner = indent + "    "
+        var mode = forced_mode if forced_mode >= 0 else data.draw(
+            integers(0, 3)
+        )
+        # 0, 1: an explicit capture list; 2: {var^}, which moves every
+        # captured value into the closure; 3: an explicit list, raising
+        if mode == 3 and self.try_depth == 0:
+            self.try_depth += 1
+            var body = self.closure_statement(data, inner, depth, 3)
+            self.try_depth -= 1
+            return String(
+                indent,
+                "try:\n",
+                body,
+                indent,
+                "except:\n",
+                inner,
+                self.variable(data),
+                " += 1\n",
+            )
+        var name = String("h", self.guards)
+        self.guards += 1
+        var result = self.variable(data)
+        var transfer_all = mode == 2
+        var raising = mode == 3
+        var param = 0 if raising else data.draw(integers(0, 3))
+        # 0, 1: (x: Int); 2: (t: Tracked) for _hsum; 3: (i: Int, t: Tracked)
+        var captures = List[String]()
+        var reads = List[String]()
+        var mut_ints = List[String]()
+        var mut_tracked = List[String]()
+        var moved = List[String]()
+        var moved_tracked = List[String]()
+        # names that a call beside the closure must not read
+        var mutated = List[String]()
+        var copyable = transfer_all
+        # half the {var^} closures capture only Ints, which keeps them
+        # copyable (a Tracked capture doesn't: see
+        # unfiled-mojo-issue-var-caret-copyable.md)
+        var ints_only = transfer_all and data.draw(booleans())
+        var signature: String
+        if param <= 1:
+            signature = "(x: Int)"
+            reads.append("x")
+        elif param == 2:
+            signature = "(t: Tracked)"
+            reads.append("t.val")
+        else:
+            signature = "(i: Int, t: Tracked)"
+            reads.append("i")
+            reads.append("t.val")
+        for i in range(N_VARIABLES):
+            var v = String("v", i)
+            if v == result:
+                continue
+            var how = data.draw(integers(0, 4))
+            if how <= 1:
+                continue
+            reads.append(v)
+            if transfer_all:
+                moved.append(v)
+            elif how == 2:
+                captures.append(String("imm ", v))
+            elif how == 3:
+                captures.append(String("mut ", v))
+                mut_ints.append(v)
+                mutated.append(v)
+            else:
+                captures.append(String("var ", v))
+        if not transfer_all:
+            var args: List[String] = ["a", "b", "c"]
+            for v in args:
+                if data.draw(integers(0, 3)) == 0:
+                    captures.append(String("imm ", v))
+                    reads.append(v)
+            for v in self.loop_variables:
+                if data.draw(booleans()):
+                    captures.append(String("imm ", v))
+                    reads.append(v)
+        for t in self.tracked:
+            if "." in t or ints_only:
+                continue
+            var how = data.draw(integers(0, 6))
+            if how <= 2:
+                continue
+            reads.append(String(t, ".val"))
+            if transfer_all:
+                moved.append(t)
+                moved_tracked.append(t)
+            elif how == 3 or how == 4:
+                captures.append(String("imm ", t))
+            elif how == 5:
+                captures.append(String("mut ", t))
+                mut_tracked.append(t)
+                mutated.append(t)
+            else:
+                captures.append(String("var ", t, "^"))
+                moved.append(t)
+                moved_tracked.append(t)
+        var ledger = len(mut_tracked) > 0 and data.draw(booleans())
+        if ledger:
+            captures.append("imm L")
+        var capture_list: String
+        if transfer_all:
+            capture_list = "{var^}"
+        else:
+            capture_list = "{"
+            for i in range(len(captures)):
+                if i > 0:
+                    capture_list += ", "
+                capture_list += captures[i]
+            capture_list += "}"
+        var s = String(
+            indent,
+            "def ",
+            name,
+            signature,
+            " raises " if raising else " ",
+            capture_list,
+            " -> Int:\n",
+        )
+        for m in mut_ints:
+            var op = Self.pick(data, ["=", "+=", "^=", "*="])
+            s += String(
+                inner, m, " ", op, " ", self.closure_expr(data, reads, 1), "\n"
+            )
+        for t in mut_tracked:
+            if ledger and data.draw(booleans()):
+                s += String(
+                    inner,
+                    t,
+                    " = Tracked(",
+                    self.closure_expr(data, reads, 1),
+                    ", L)\n",
+                )
+            else:
+                s += String(
+                    inner,
+                    t,
+                    ".val += ",
+                    self.closure_expr(data, reads, 1),
+                    "\n",
+                )
+        if raising:
+            s += String(
+                inner,
+                "if (",
+                self.closure_expr(data, reads, 1),
+                " & 3) == 0:\n",
+                inner,
+                '    raise Error("k")\n',
+            )
+        if param <= 1 and not transfer_all and data.draw(integers(0, 2)) == 0:
+            # a nested closure over the parameter and the mutable captures
+            var nested = String(name, "_in")
+            var nested_captures = String("{imm x")
+            var nested_reads: List[String] = ["y", "x"]
+            for m in mut_ints:
+                nested_captures += String(", mut ", m)
+                nested_reads.append(m)
+            nested_captures += "}"
+            s += String(
+                inner,
+                "def ",
+                nested,
+                "(y: Int) ",
+                nested_captures,
+                " -> Int:\n",
+            )
+            for m in mut_ints:
+                s += String(inner, "    ", m, " += y\n")
+            s += String(
+                inner,
+                "    return ",
+                self.closure_expr(data, nested_reads, 1),
+                "\n",
+                inner,
+                "return _hiter(",
+                nested,
+                ", x, ",
+                self.closure_expr(data, reads, 1),
+                ")\n",
+            )
+        else:
+            s += String(
+                inner, "return ", self.closure_expr(data, reads, 0), "\n"
+            )
+        # {var^} captures only what the body uses
+        for t in moved_tracked:
+            if transfer_all and String(t, ".val") in s:
+                copyable = False
+        # the moved-from variables are reinitialized at once
+        for v in moved:
+            var value = Self.pick(data, materialize[CONSTANTS]())
+            if v in moved_tracked:
+                s += String(indent, v, " = Tracked(", value, ", L)\n")
+            else:
+                s += String(indent, v, " = ", value, "\n")
+        # what the calls may read
+        var outside: List[String] = ["a", "b", "c"]
+        outside += self.loop_variables.copy()
+        for i in range(N_VARIABLES):
+            var v = String("v", i)
+            if v != result and v not in mutated:
+                outside.append(v)
+        for t in self.tracked:
+            if t not in mutated and "." not in t:
+                outside.append(String(t, ".val"))
+        for n_call in range(data.draw(integers(1, 2))):
+            var arg = self.closure_expr(data, outside, 1)
+            var call: String
+            if raising:
+                if data.draw(booleans()):
+                    call = String("_hraise(", name, ", ", arg, ")")
+                else:
+                    call = String(name, "(", arg, ")")
+            elif param == 2:
+                var elems = String("Tracked(", arg, ", L)")
+                var plain = List[String]()
+                for t in self.tracked:
+                    if t not in mutated:
+                        plain.append(t)
+                if len(plain) > 0 and data.draw(booleans()):
+                    elems = String(Self.pick(data, plain^), ".copy(), ", elems)
+                call = String(
+                    "_hsum(ListHolder[Tracked]([", elems, "]), ", name, ")"
+                )
+            elif param == 3:
+                call = String("_hlist(", name, ", lst)")
+            else:
+                var kind = data.draw(integers(0, 5))
+                if copyable and (n_call == 0 or data.draw(booleans())):
+                    call = String("_hcall(_hcopy(", name, "), ", arg, ")")
+                elif kind == 1:
+                    call = String(
+                        "_hiter(",
+                        name,
+                        ", ",
+                        self.closure_expr(data, outside, 2),
+                        ", ",
+                        arg,
+                        ")",
+                    )
+                elif kind == 2 and len(mut_ints) + len(mut_tracked) == 0:
+                    # twice: aliasing if it captures anything mutably
+                    call = String("_hcomp(", name, ", ", name, ", ", arg, ")")
+                elif kind == 3:
+                    call = String(name, "(", arg, ")")
+                elif kind == 4:
+                    call = String(
+                        "_hsum(IntHolder(",
+                        arg,
+                        ", ",
+                        self.closure_expr(data, outside, 2),
+                        "), ",
+                        name,
+                        ")",
+                    )
+                else:
+                    call = String("_hcall(", name, ", ", arg, ")")
+            var op = Self.pick(data, ["=", "+=", "^="])
+            s += String(indent, result, " ", op, " ", call, "\n")
+        return s
+
     @staticmethod
     def checksum() -> String:
         return (
@@ -2809,6 +3365,264 @@ def _mix(
     h = h * 31 + len(lst)
     h = h * 31 + _sum(lst)
     return h * 31 + (ot.value().val if ot else -5)
+
+
+# ---- generics: a trait with an associated constant, a default method
+# and a static constructor; generic structs over it (value parameters,
+# comptime if, comptime for); a trait with an associated type
+
+
+trait Op(Copyable, Deinitable):
+    comptime K: Int
+
+    def apply(self, x: Int) -> Int:
+        ...
+
+    def twice(self, x: Int) -> Int:
+        return self.apply(self.apply(x))
+
+    @staticmethod
+    def make(seed: Int, L: LedgerPtr) -> Self:
+        ...
+
+
+struct AddOp(Op):
+    comptime K = 3
+    var k: Int
+
+    def __init__(out self, k: Int):
+        self.k = k
+
+    def apply(self, x: Int) -> Int:
+        return x + self.k
+
+    @staticmethod
+    def make(seed: Int, L: LedgerPtr) -> Self:
+        return AddOp(seed * 7)
+
+
+struct MulOp(Op):
+    comptime K = 5
+    var k: Int
+
+    def __init__(out self, k: Int):
+        self.k = k
+
+    def apply(self, x: Int) -> Int:
+        return x * (self.k | 1)
+
+    def twice(self, x: Int) -> Int:
+        return x * (self.k | 1) * (self.k | 1) + 1
+
+    @staticmethod
+    def make(seed: Int, L: LedgerPtr) -> Self:
+        return MulOp(seed ^ 0x55)
+
+
+struct ShiftOp[s: Int](Op):
+    comptime K = Self.s * 2 + 1
+
+    def __init__(out self):
+        pass
+
+    def apply(self, x: Int) -> Int:
+        return x ^ (x >> Self.s) ^ (x << (63 - Self.s))
+
+    @staticmethod
+    def make(seed: Int, L: LedgerPtr) -> Self:
+        return ShiftOp[Self.s]()
+
+
+struct TrackedOp(Op):
+    comptime K = 7
+    var t: Tracked
+
+    def __init__(out self, var t: Tracked):
+        self.t = t^
+
+    def apply(self, x: Int) -> Int:
+        return x * 3 + self.t.val
+
+    @staticmethod
+    def make(seed: Int, L: LedgerPtr) -> Self:
+        return TrackedOp(Tracked(seed, L))
+
+
+struct Compose[A: Op, B: Op](Op):
+    comptime K = Self.A.K * 31 + Self.B.K
+    var a: Self.A
+    var b: Self.B
+
+    def __init__(out self, var a: Self.A, var b: Self.B):
+        self.a = a^
+        self.b = b^
+
+    def apply(self, x: Int) -> Int:
+        return self.b.apply(self.a.apply(x))
+
+    @staticmethod
+    def make(seed: Int, L: LedgerPtr) -> Self:
+        return Compose(Self.A.make(seed, L), Self.B.make(seed + 1, L))
+
+
+struct Pick[A: Op, B: Op, flag: Bool](Op):
+    comptime K = Self.A.K if Self.flag else Self.B.K
+    var a: Self.A
+    var b: Self.B
+
+    def __init__(out self, var a: Self.A, var b: Self.B):
+        self.a = a^
+        self.b = b^
+
+    def apply(self, x: Int) -> Int:
+        comptime if Self.flag:
+            return self.a.twice(x)
+        else:
+            return self.b.apply(x) - 1
+
+    @staticmethod
+    def make(seed: Int, L: LedgerPtr) -> Self:
+        return Pick[Self.A, Self.B, Self.flag](
+            Self.A.make(seed * 3, L), Self.B.make(seed - 2, L)
+        )
+
+
+struct Repeat[A: Op, n: Int](Op):
+    comptime K = Self.A.K * Self.n
+    var a: Self.A
+
+    def __init__(out self, var a: Self.A):
+        self.a = a^
+
+    def apply(self, x: Int) -> Int:
+        var r = x
+        comptime for i in range(Self.n):
+            r = self.a.apply(r) + i
+        return r
+
+    @staticmethod
+    def make(seed: Int, L: LedgerPtr) -> Self:
+        return Repeat[Self.A, Self.n](Self.A.make(seed, L))
+
+
+def _gapply[T: Op](op: T, x: Int) -> Int:
+    return op.apply(x) * 31 + T.K
+
+
+def _gtwice[T: Op](op: T, x: Int) -> Int:
+    return op.twice(x)
+
+
+def _gmake[T: Op](seed: Int, x: Int, L: LedgerPtr) -> Int:
+    return T.make(seed, L).apply(x)
+
+
+def _gcopy[T: Op](op: T, x: Int) -> Int:
+    var c = op.copy()
+    var lst: List[T] = [op.copy(), c^]
+    return lst[0].apply(x) ^ lst[1].twice(x)
+
+
+def _graise[T: Op](op: T, x: Int, L: LedgerPtr) raises -> Int:
+    var t = Tracked(x, L)
+    var r = op.apply(x)
+    if (r & 3) == 0:
+        raise Error("g")
+    return r + t.val
+
+
+def _gpick[T: Copyable](c: Bool, a: T, b: T) -> T:
+    return a.copy() if c else b.copy()
+
+
+def _gswap[T: Movable](mut a: T, mut b: T):
+    swap(a, b)
+
+
+def _gdup[T: Copyable & Deinitable](x: T, n: Int) -> List[T]:
+    var out = List[T]()
+    for _ in range(n & 3):
+        out.append(x.copy())
+    return out^
+
+
+trait Holder:
+    comptime Item: Copyable & Deinitable
+
+    def size(self) -> Int:
+        ...
+
+    def get(self, i: Int) -> Self.Item:
+        ...
+
+
+struct IntHolder(Holder):
+    comptime Item = Int
+    var xs: List[Int]
+
+    def __init__(out self, a: Int, b: Int):
+        self.xs = [a, b, a ^ b]
+
+    def size(self) -> Int:
+        return len(self.xs)
+
+    def get(self, i: Int) -> Int:
+        return self.xs[i]
+
+
+struct ListHolder[T: Copyable & Deinitable](Holder):
+    comptime Item = Self.T
+    var xs: List[Self.T]
+
+    def __init__(out self, var xs: List[Self.T]):
+        self.xs = xs^
+
+    def size(self) -> Int:
+        return len(self.xs)
+
+    def get(self, i: Int) -> Self.T:
+        return self.xs[i].copy()
+
+
+# ---- higher-order functions over closure types
+
+
+def _hcall[F: def(Int) -> Int](f: F, x: Int) -> Int:
+    return f(x)
+
+
+def _hiter[F: def(Int) -> Int](f: F, n: Int, x: Int) -> Int:
+    var r = x
+    for _ in range(n & 7):
+        r = f(r)
+    return r
+
+
+def _hcomp[F: def(Int) -> Int, G: def(Int) -> Int](f: F, g: G, x: Int) -> Int:
+    return g(f(x)) * 3 + f(g(x))
+
+
+def _hraise[F: def(Int) raises -> Int](f: F, x: Int) raises -> Int:
+    return f(x) + f(x + 1)
+
+
+def _hlist[F: def(Int, Tracked) -> Int](f: F, lst: List[Tracked]) -> Int:
+    var h = 0
+    for i in range(len(lst)):
+        h = h * 7 + f(i, lst[i])
+    return h
+
+
+def _hsum[H: Holder, F: def(H.Item) -> Int](h: H, f: F) -> Int:
+    var r = 0
+    for i in range(h.size()):
+        r = r * 7 + f(h.get(i))
+    return r
+
+
+def _hcopy[F: Copyable](f: F) -> F:
+    # not f.copy(): https://github.com/modular/modular/issues/7554
+    return F(copy=f)
 
 
 """
