@@ -17,7 +17,9 @@
 # pointer, an `Optional[Int]`, and a pool of four heap-allocated doubly linked
 # nodes, reached through `Optional[Pointer]` cursors. It also has narrow and
 # wide integers (8 to 256 bits, with the `std.bit` functions), SIMD
-# vectors, and `Tracked` values, which count their copies and destructions:
+# vectors, and `Tracked` values, which count their copies and destructions
+# and keep their value in a heap cell of their own (so that a build with
+# `--sanitize address` reports any use of a destroyed one):
 # in variables, struct fields, a `List`, an `Optional`, a `Dict`, a
 # `Variant`, an `__enum`, and two heap cells that are written, taken and
 # destroyed in place, plus a `Set[Int]`. Statements reach them through `ref`
@@ -38,6 +40,9 @@
 #   pixi run mojo build -I . -o build/compiler_fuzz \
 #       examples/compiler_fuzz/compiler_fuzz.mojo
 #   pixi run build/compiler_fuzz build/compiler_fuzz_work
+#
+# To build with AddressSanitizer instead (without the comptime check), add
+# examples/compiler_fuzz/asan_compare.sh as a second argument.
 #
 # Each test case takes a second or two, nearly all of it compiling.
 # The compiler under test is $MOJO (default `mojo`); see
@@ -186,6 +191,16 @@ struct ProgramGenerator(Movable):
         names += self.loop_variables.copy()
         return Self.pick(data, names^)
 
+    @staticmethod
+    def ternary(a: String, cond: String, b: String) -> String:
+        # When the condition folds to a constant, a vector constructor
+        # `Vk(x)` in the dead branch is typed as a scalar
+        # (https://github.com/modular/modular/issues/7664), so the condition
+        # goes through _cond if either branch builds a vector.
+        if "V" in a or "V" in b:
+            return String("(", a, " if _cond(", cond, ") else ", b, ")")
+        return String("(", a, " if ", cond, " else ", b, ")")
+
     def int_expr(
         mut self, mut data: ConjectureData, depth: Int
     ) raises -> String:
@@ -236,14 +251,10 @@ struct ProgramGenerator(Movable):
         if choice == 6:
             return String("opt.or_else(", self.int_expr(data, d), ")")
         if choice == 7:
-            return String(
-                "(",
+            return self.ternary(
                 self.int_expr(data, d),
-                " if ",
                 self.condition(data, d),
-                " else ",
                 self.int_expr(data, d),
-                ")",
             )
         if choice == 8:
             # not Int(cond): see unfiled-mojo-issue-ternary-dead-branch.md
@@ -414,14 +425,10 @@ struct ProgramGenerator(Movable):
                 x, ".cast[DType.", materialize[NARROW_DTYPES]()[k], "]()"
             )
         if choice == 7:
-            return String(
-                "(",
+            return self.ternary(
                 self.narrow_expr(data, k, d),
-                " if ",
                 self.condition(data, d),
-                " else ",
                 self.narrow_expr(data, k, d),
-                ")",
             )
         if choice == 8:
             var f = "min" if data.draw(booleans()) else "max"
@@ -3196,19 +3203,23 @@ comptime LedgerPtr = Pointer[Int, MutUntrackedOrigin]
 
 struct Tracked(Copyable):
     # Counts itself in a ledger: [0] live values, [1] made, [2] a hash of
-    # the destruction order, [3] copies.
+    # the destruction order, [3] copies. The value lives in a heap cell of
+    # its own, freed by __deinit__, so that under AddressSanitizer any use
+    # of a destroyed Tracked is a heap-use-after-free.
 
-    var val: Int
+    var cell: LedgerPtr
     var ledger: LedgerPtr
 
     def __init__(out self, val: Int, ledger: LedgerPtr):
-        self.val = val
+        self.cell = unsafe_alloc[Int](1)
+        self.cell[unsafe_offset=0] = val
         self.ledger = ledger
         ledger[unsafe_offset=0] += 1
         ledger[unsafe_offset=1] += 1
 
     def __init__(out self, *, copy: Self):
-        self.val = copy.val
+        self.cell = unsafe_alloc[Int](1)
+        self.cell[unsafe_offset=0] = copy.cell[unsafe_offset=0]
         self.ledger = copy.ledger
         self.ledger[unsafe_offset=0] += 1
         self.ledger[unsafe_offset=3] += 1
@@ -3216,8 +3227,16 @@ struct Tracked(Copyable):
     def __deinit__(deinit self):
         self.ledger[unsafe_offset=0] -= 1
         self.ledger[unsafe_offset=2] = (
-            self.ledger[unsafe_offset=2] * 31 + self.val
+            self.ledger[unsafe_offset=2] * 31 + self.cell[unsafe_offset=0]
         )
+        self.cell.unsafe_free()
+
+    @always_inline
+    def __getattr__(ref self, name: StaticString) -> ref[self] Int:
+        # `t.val`, a reference into the cell that keeps `t` alive
+        return self.cell.unsafe_mut_cast[origin_of(self).mut]().unsafe_origin_cast[
+            origin_of(self)
+        ]()[]
 
 
 struct Ledger(Movable):
