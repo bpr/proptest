@@ -748,6 +748,25 @@ the same table at run time from `unicodedata` and caches it on disk.
   so when the final replay of a failure fails with a different origin,
   the report says so and gives the original error (Hypothesis reports the
   new error alone); such a failure may not have been shrunk.
+- **`Settings(workers=k)`** (not in Hypothesis; after QuickerCheck,
+  Krook et al., IFL 2023): the generate and target phases run in `k`
+  `fork()`ed workers, each with a seed drawn from the run's seed and a
+  share of `max_examples`. QuickerCheck runs threads and kills the other
+  testers when one fails; Mojo doesn't check thread safety and proptest's
+  runner state isn't shared, so proptest uses processes, which also
+  keep a test's side effects (and crashes) out of the main process. The
+  first worker to fail sets a flag in shared memory; the others stop
+  after their current test case, or with `report_multiple_bugs` once they
+  have made as many calls again as when they saw it (as a single run
+  does after its first failure). Each worker sends back its counts,
+  statistics, errors, and failures' choice sequences, and the main
+  process replays and shrinks the failures. Shrinking stays sequential
+  (QuickerCheck's parallel shrinking pays off only when test cases are
+  slow, and its deterministic variant wastes work on speculation). The
+  workers keep separate `DataTree`s, so they can repeat each other's
+  test cases, and which failure is found first depends on timing.
+  Ignored with `check_coverage`, whose stopping rule needs all the test
+  cases seen so far.
 - **Observability output, settings profiles, the pytest plugin, the ghostwriter**: tooling around
   Python's ecosystem. Environment-variable overrides stand in for profiles.
 - **Health checks**: `filter_too_much`, `data_too_large`,

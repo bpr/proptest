@@ -378,6 +378,7 @@ given(s, prop, Settings(
     print_blob=True,           # print a blob for reproduce=
     fork=True,                 # run test cases in child processes
     timeout=1000.0,            # ms; kill test cases that hang (implies fork)
+    workers=4,                 # generate in 4 processes at once (0: one per core)
 ))
 ```
 
@@ -404,7 +405,8 @@ Settings left at their defaults can be set from the environment, like a
 Hypothesis profile: `PROPTEST_MAX_EXAMPLES`, `PROPTEST_SEED`,
 `PROPTEST_VERBOSITY` (`quiet`/`normal`/`verbose`/`debug`) and
 `PROPTEST_DATABASE` (a directory, or `none`), `PROPTEST_FORK`
-(`1` turns `fork` on), and `PROPTEST_TIMEOUT` (milliseconds).
+(`1` turns `fork` on), `PROPTEST_TIMEOUT` (milliseconds), and
+`PROPTEST_WORKERS`.
 
 With `fork=True` (after Rust proptest), each test case runs in a
 `fork()`ed child, so a test that segfaults, aborts, or fails under
@@ -412,6 +414,12 @@ AddressSanitizer is reported and shrunk like any other failure instead of
 ending the run. The child logs its choices to shared memory as it makes
 them, so the parent can rebuild a test case that crashed partway.
 `timeout=ms` kills test cases that run too long.
+
+With `workers=k` (after QuickerCheck, a parallel QuickCheck), the
+generate phase runs in `k` forked processes, each with its own seed and
+a share of `max_examples`; the first failure stops the others, and the
+main process shrinks it. It pays off for slow test cases (a millisecond
+or more each).
 
 Failing examples are saved in the example database (`.proptest/examples`,
 one directory per test, keyed by the test's source location) and replayed

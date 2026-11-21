@@ -19,11 +19,12 @@ supported: `backend`. Settings left at their defaults can be changed through
 environment variables (like a Hypothesis settings profile):
 `PROPTEST_MAX_EXAMPLES`, `PROPTEST_SEED`, `PROPTEST_VERBOSITY`
 (`quiet`, `normal`, `verbose`, `debug`), `PROPTEST_DATABASE`
-(a directory, or `none` to disable it), `PROPTEST_FORK` (`1`), and
-`PROPTEST_TIMEOUT` (milliseconds).
+(a directory, or `none` to disable it), `PROPTEST_FORK` (`1`),
+`PROPTEST_TIMEOUT` (milliseconds), and `PROPTEST_WORKERS`.
 """
 
 from std.os import getenv
+from std.sys.info import num_physical_cores
 
 from proptest.dictionary import Dictionary
 
@@ -217,6 +218,14 @@ struct Settings(Copyable, Writable):
     counting the whole test case (drawing included), by killing the child
     process that runs it; implies `fork`. Unlike `deadline`, this catches
     tests that never finish."""
+    var workers: Int
+    """Generate test cases in this many processes at once (`fork()`ed
+    workers, each with its own seed and a share of `max_examples`); 0
+    means one per physical core. The first failure stops the other
+    workers; shrinking runs in this process, as usual. Speeds up tests
+    whose test cases are slow (milliseconds or more each): see
+    `docs/differences-from-hypothesis.md`. Not used with
+    `check_coverage`, `reproduce=`, or by the fuzz loop. POSIX only."""
     var dictionary: Dictionary
     """Tokens the inputs are likely to need (keywords, magic bytes,
     numbers): generation occasionally returns one, and `fuzz` inserts them
@@ -245,6 +254,7 @@ struct Settings(Copyable, Writable):
         fork: Bool = False,
         timeout: Optional[Float64] = None,
         var dictionary: Dictionary = Dictionary(),
+        workers: Int = 1,
     ):
         self.max_examples = max_examples
         self.seed = seed
@@ -265,10 +275,18 @@ struct Settings(Copyable, Writable):
         self.fork = fork
         self.timeout = timeout
         self.dictionary = dictionary^
+        self.workers = workers
 
     def forks(self) -> Bool:
         """Whether test cases run in child processes."""
         return self.fork or Bool(self.timeout)
+
+    def worker_count(self) -> Int:
+        """How many processes generate test cases (`workers`, with 0 as
+        the number of physical cores)."""
+        if self.workers == 0:
+            return max(num_physical_cores(), 1)
+        return max(self.workers, 1)
 
     def with_env_overrides(self) -> Self:
         """These settings, updated from `PROPTEST_*` environment variables.
@@ -304,6 +322,12 @@ struct Settings(Copyable, Writable):
         if timeout.byte_length() > 0 and not s.timeout:
             try:
                 s.timeout = Float64(timeout)
+            except:
+                pass
+        var workers = getenv("PROPTEST_WORKERS")
+        if workers.byte_length() > 0 and s.workers == 1:
+            try:
+                s.workers = max(Int(workers), 0)
             except:
                 pass
         var db = getenv("PROPTEST_DATABASE")

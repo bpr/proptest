@@ -46,7 +46,11 @@ from proptest.internal.data import (
 from proptest.internal.provider import Provider, Constants
 from proptest.internal.random import Random
 from proptest.settings import Settings, Verbosity, HealthCheck
-from proptest.database import ExampleDatabase
+from proptest.database import (
+    ExampleDatabase,
+    choices_to_string,
+    choices_from_string,
+)
 from proptest.internal.datatree import DataTree
 from proptest.internal.fork import (
     ForkLog,
@@ -196,6 +200,12 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
     var coverage_next_check: Int
     var coverage_verdict: Int
     var fork_warned: Bool
+    var stop_addr: Int
+    """In a worker (`Settings.workers`), the address of the flag in
+    shared memory that the first worker to find a failure sets, so that
+    the others stop; 0 otherwise."""
+    var stop_seen_at: Int
+    """`call_count` when this worker first saw the flag set (-1 before)."""
 
     def __init__(out self, var test_fn: Self.F, settings: Settings):
         self.test_fn = test_fn^
@@ -260,6 +270,8 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
         self.coverage_next_check = max(settings.max_examples, 100)
         self.coverage_verdict = COVERAGE_UNDECIDED
         self.fork_warned = False
+        self.stop_addr = 0
+        self.stop_seen_at = -1
 
     # ===------------------------------------------------------------------=== #
     # Running test cases
@@ -467,6 +479,8 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
         if r.status == Status.INTERESTING:
             var origin = r.interesting_origin
             if origin not in self.interesting:
+                if self.stop_addr != 0:
+                    _Flag(unsafe_from_address=self.stop_addr)[] = 1
                 self.origins.append(origin)
                 self.last_bug_found_at = self.call_count
                 if self.first_bug_found_at < 0:
@@ -605,7 +619,33 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
                 if result[].status == Status.INTERESTING:
                     break
 
+    def _stopped(mut self) -> Bool:
+        """Whether this worker should stop because another found a
+        failure (and this one hasn't). With `report_multiple_bugs`, it
+        looks for other bugs for a while first, as a run does after its
+        own first failure (`should_generate_more`): until it has made as
+        many calls again as when it saw the flag."""
+        if (
+            self.stop_addr == 0
+            or len(self.interesting) > 0
+            or _Flag(unsafe_from_address=self.stop_addr)[] == 0
+        ):
+            return False
+        if (
+            not self.settings.phases.shrink
+            or not self.settings.report_multiple_bugs
+        ):
+            return True
+        if self.stop_seen_at < 0:
+            self.stop_seen_at = self.call_count
+        return self.call_count >= max(
+            MIN_TEST_CALLS,
+            min(self.stop_seen_at + 1000, self.stop_seen_at * 2),
+        )
+
     def should_generate_more(mut self) -> Bool:
+        if self._stopped():
+            return False
         if (
             self.valid_count >= self.settings.max_examples
             and not self._coverage_wants_more()
@@ -910,7 +950,7 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
             var improved = True
             while improved and self.call_count < budget_end:
                 improved = False
-                if len(self.interesting) > 0:
+                if len(self.interesting) > 0 or self._stopped():
                     return
                 var best: Result
                 try:
@@ -999,10 +1039,8 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
                 )
             )
 
-    def run(mut self) raises:
-        """Run the reuse, generate and target phases. Shrinking is done by
-        the caller (see `proptest.core`), which owns the shrinker."""
-        self.reuse_existing_examples()
+    def _generate_and_target(mut self) raises:
+        """The generate and target phases."""
         self.generate_new_examples()
         if (
             self.settings.phases.target
@@ -1010,6 +1048,200 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
             and len(self.interesting) == 0
         ):
             self.optimize_targets(max_calls=self.settings.max_examples)
+
+    def _use_workers(self) -> Bool:
+        return (
+            self.settings.worker_count() > 1
+            and self.settings.max_examples > 1
+            and self.settings.phases.generate
+            and not self.settings.check_coverage
+            and len(self.interesting) == 0
+        )
+
+    def _generate_in_workers(mut self) raises -> Bool:
+        """Run the generate and target phases in `Settings.workers`
+        forked processes, each with its own seed and a share of
+        `max_examples`, then replay here the failures they found, so that
+        they are shrunk here. The first worker to find a failure sets a
+        flag in shared memory that makes the others stop after their
+        current test case. False if the workers couldn't be started."""
+        var k = min(self.settings.worker_count(), self.settings.max_examples)
+        var flag = map_shared(4096)
+        if flag == 0:
+            return False
+        var logs = List[Int]()
+        for _ in range(k):
+            var base = map_shared(LOG_SIZE)
+            if base == 0:
+                break
+            logs.append(base)
+        if len(logs) < k:
+            for base in logs:
+                unmap_shared(base, LOG_SIZE)
+            unmap_shared(flag, 4096)
+            return False
+        var seeds = Random(self.seed ^ 0xD1B54A32D192ED03)
+        var pids = List[Int]()
+        for i in range(k):
+            var worker_seed = seeds.next_u64()
+            var share = self.settings.max_examples // k + (
+                1 if i < self.settings.max_examples % k else 0
+            )
+            var pid = fork_process()
+            if pid == 0:
+                self._run_worker(worker_seed, share, flag, logs[i])
+                exit_child(0)
+            if pid < 0:
+                # stop the workers already started, and run here instead
+                _Flag(unsafe_from_address=flag)[] = 1
+                break
+            pids.append(pid)
+        var statuses = List[Int]()
+        for pid in pids:
+            statuses.append(wait_process(pid))
+        var started = len(pids) == k
+        try:
+            if started:
+                self._collect_workers(logs, statuses)
+        finally:
+            for base in logs:
+                unmap_shared(base, LOG_SIZE)
+            unmap_shared(flag, 4096)
+        return started
+
+    def _run_worker(
+        mut self, seed: UInt64, share: Int, flag: Int, log_base: Int
+    ):
+        """In a worker process: generate `share` valid test cases from
+        `seed`, and write what happened to the log at `log_base`."""
+        prepare_child(None, quiet=False)
+        self.seed = seed
+        self.random = Random(seed)
+        self.tree_provider = Provider(
+            Random(seed ^ 0x5DEECE66D), self.constants
+        )
+        self.settings.max_examples = share
+        self.coverage_next_check = max(share, 100)
+        self.db = None  # the parent saves the failures it replays
+        self.front = None
+        self.stop_addr = flag
+        var error = String()
+        try:
+            self._generate_and_target()
+            self.check_flaky()
+        except e:
+            error = String(e)
+        var log = ForkLog(log_base, LOG_SIZE)
+        log.string(error)
+        for n in [
+            self.call_count,
+            self.valid_count,
+            self.invalid_count,
+            self.overrun_count,
+            self.duplicate_count,
+            self.misaligned_count,
+        ]:
+            log.int(n)
+        log.string(self.exit_reason)
+        log.int(len(self.origins))
+        for origin in self.origins:
+            try:
+                log.string(origin)
+                log.string(self.interesting_errors[origin])
+                log.string(
+                    choices_to_string(self.interesting[origin][].choices())
+                )
+            except:
+                pass
+        _write_stats(log, self.stats)
+        var reasons = List[String]()
+        for item in self.invalid_reasons.items():
+            reasons.append(item.key)
+            reasons.append(String(item.value))
+        log.strings(reasons)
+        log.commit()
+
+    def _collect_workers(mut self, logs: List[Int], statuses: List[Int]) raises:
+        """Add up what the workers did, and replay their failures."""
+        var failures = List[Tuple[String, String]]()  # (choices, error)
+        var errors = List[String]()
+        var crashes = List[String]()
+        for i in range(len(logs)):
+            var r = LogReader(logs[i])
+            if not r.more():
+                var status = statuses[i]
+                var sig = term_signal(status)
+                crashes.append(
+                    String(
+                        "worker ", i, " was killed by ", signal_name(sig)
+                    ) if sig
+                    != 0 else String(
+                        "worker ", i, " exited with status ", exit_code(status)
+                    )
+                )
+                continue
+            try:
+                var error = r.string()
+                if error.byte_length() > 0:
+                    errors.append(error)
+                self.call_count += r.int()
+                self.valid_count += r.int()
+                self.invalid_count += r.int()
+                self.overrun_count += r.int()
+                self.duplicate_count += r.int()
+                self.misaligned_count += r.int()
+                var reason = r.string()
+                if self.exit_reason.byte_length() == 0:
+                    self.exit_reason = reason
+                for _ in range(r.int()):
+                    _ = r.string()  # origin: the replay recomputes it
+                    var msg = r.string()
+                    failures.append((r.string(), msg))
+                _merge_stats(self.stats, _read_stats(r))
+                var reasons = r.strings()
+                for j in range(0, len(reasons) - 1, 2):
+                    var why = reasons[j]
+                    self.invalid_reasons[why] = self.invalid_reasons.get(
+                        why, 0
+                    ) + Int(reasons[j + 1])
+            except e:
+                crashes.append(String("worker ", i, " sent back ", e))
+        if self.valid_count >= self.settings.max_examples:
+            self.exit_reason = "max_examples"
+        # replay the failures here, simplest first per origin (`_record`)
+        for f in failures:
+            var choices = choices_from_string(f[0])
+            var result = self.cached_test_function(choices)
+            if result[].status != Status.INTERESTING:
+                raise Error(
+                    String(
+                        "Flaky: a failure found by a worker process",
+                        " (Settings(workers=...)) did not fail when",
+                        " replayed (the test may depend on state outside its",
+                        " inputs). Original error: ",
+                        f[1],
+                    )
+                )
+        if len(self.interesting) > 0:
+            return
+        if len(errors) > 0:
+            raise Error(errors[0])
+        if len(crashes) > 0:
+            raise Error(
+                String(
+                    "Crash: a worker process (Settings(workers=...)) died: ",
+                    ", ".join(crashes),
+                    ". Use Settings(fork=True) to find and shrink the test",
+                    " case that crashed.",
+                )
+            )
+
+    def run(mut self) raises:
+        """Run the reuse, generate and target phases. Shrinking is done by
+        the caller (see `proptest.core`), which owns the shrinker."""
+        self.reuse_existing_examples()
+        if not (self._use_workers() and self._generate_in_workers()):
+            self._generate_and_target()
         self.check_flaky()
         if len(self.interesting) == 0 and self.valid_count == 0:
             if self.settings.max_examples > 0 and self.settings.phases.generate:
@@ -1023,3 +1255,84 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
                         " overran.",
                     )
                 )
+
+
+comptime _Flag = Pointer[Int, MutUntrackedOrigin]
+
+
+def _write_stats(mut log: ForkLog, s: Statistics):
+    """Write `s` to a worker's log (see `_read_stats`)."""
+    for n in [s.cases, s.valid, s.invalid, s.overrun]:
+        log.int(n)
+    log.int(len(s.event_order))
+    for e in s.event_order:
+        log.string(e)
+        log.int(s.events.get(e, 0))
+    log.int(len(s.table_order))
+    for name in s.table_order:
+        log.string(name)
+        try:
+            ref t = s.tables[name]
+            log.int(len(t))
+            for item in t.items():
+                log.string(item.key)
+                log.int(item.value)
+        except:
+            log.int(0)
+    log.int(len(s.cover_order))
+    for label in s.cover_order:
+        log.string(label)
+        log.f64(s.cover_required.get(label, 0.0))
+        log.int(s.cover_hits.get(label, 0))
+
+
+def _read_stats(mut r: LogReader) raises -> Statistics:
+    var s = Statistics()
+    s.cases = r.int()
+    s.valid = r.int()
+    s.invalid = r.int()
+    s.overrun = r.int()
+    for _ in range(r.int()):
+        var e = r.string()
+        s.event_order.append(e)
+        s.events[e] = r.int()
+    for _ in range(r.int()):
+        var name = r.string()
+        s.table_order.append(name)
+        var t = Dict[String, Int]()
+        for _ in range(r.int()):
+            var key = r.string()
+            t[key] = r.int()
+        s.tables[name] = t^
+    for _ in range(r.int()):
+        var label = r.string()
+        s.cover_order.append(label)
+        s.cover_required[label] = r.f64()
+        s.cover_hits[label] = r.int()
+    return s^
+
+
+def _merge_stats(mut into: Statistics, s: Statistics) raises:
+    """Add a worker's statistics to `into`."""
+    into.cases += s.cases
+    into.valid += s.valid
+    into.invalid += s.invalid
+    into.overrun += s.overrun
+    for e in s.event_order:
+        if e not in into.events:
+            into.events[e] = 0
+            into.event_order.append(e)
+        into.events[e] += s.events[e]
+    for name in s.table_order:
+        if name not in into.tables:
+            into.tables[name] = Dict[String, Int]()
+            into.table_order.append(name)
+        ref t = into.tables[name]
+        for item in s.tables[name].items():
+            t[item.key] = t.get(item.key, 0) + item.value
+    for label in s.cover_order:
+        if label not in into.cover_required:
+            into.cover_required[label] = s.cover_required[label]
+            into.cover_hits[label] = 0
+            into.cover_order.append(label)
+        into.cover_hits[label] += s.cover_hits[label]
