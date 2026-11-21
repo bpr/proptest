@@ -3,8 +3,8 @@
 #
 # DIR holds abi.h, callee.c, ref.c and program.mojo (see abi_fuzz.mojo).
 # Builds program.mojo at -O0 and -O3, linked with callee.c, and the C
-# reference (ref.c and callee.c) with gcc, runs all three, and prints one
-# line:
+# reference (ref.c and callee.c) with $CC (default clang), runs all
+# three, and prints one line:
 #
 #   OK                        all agree
 #   BUILD_CRASH <which> ...   a compiler crashed
@@ -17,7 +17,13 @@
 # MOJO selects the compiler, e.g. a nightly in another pixi environment:
 #   MOJO="pixi run --manifest-path ../nightly mojo"
 MOJO="${MOJO:-mojo}"
-CC="${CC:-gcc}"
+# The C reference is clang, whose ABI Mojo (built on LLVM) follows: gcc
+# classifies a struct with a GNU zero-length array differently, e.g.
+# struct { float f[3]; int z[0]; } takes an integer register for f[2].
+if [ -z "$CC" ]; then
+    CC=$(command -v clang || ls /usr/lib/llvm-*/bin/clang 2>/dev/null | sort -V | tail -1)
+    CC="${CC:-gcc}"
+fi
 cd "$1" || exit 1
 rm -f o0 o3 ref callee.o
 

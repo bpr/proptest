@@ -1,4 +1,4 @@
-# Differential testing of Mojo's C ABI against gcc. Each test case draws
+# Differential testing of Mojo's C ABI against clang. Each test case draws
 # a few C-compatible struct types and functions over them, and writes:
 #
 # - abi.h: the C types, and the hash and value-making functions for them
@@ -13,9 +13,10 @@
 # hash. So for each call, the program prints the hash the callee saw and
 # a hash of the value the caller got back, and any argument or return
 # value passed wrongly changes the line. build_and_compare.sh builds
-# program.mojo at -O0 and -O3, linked with callee.c, and ref.c with gcc,
+# program.mojo at -O0 and -O3, linked with callee.c, and ref.c with clang,
 # and compares the outputs. Any difference is a bug in Mojo's C ABI
-# (or in gcc).
+# (or in clang). gcc disagrees with clang on structs with zero-length
+# arrays, so it isn't the default reference (see build_and_compare.sh).
 #
 # Types: integers of 8 to 128 bits, Int, Float32, Float64, Bool, SIMD
 # vectors (gcc vector types), nested structs, `Array` fields (C arrays),
@@ -38,9 +39,17 @@
 # PROPTEST_SEED and PROPTEST_MAX_EXAMPLES set the seed and the number of
 # programs. The failing case is kept in the work directory as failing_*.
 # ABI_FUZZ_NO_EMPTY_WORKAROUND=1 passes empty structs through
-# `external_call` and function pointers too, which Mojo gets wrong, and
-# ABI_FUZZ_NO_SRET_WORKAROUND=1 lets Mojo functions that C calls take and
-# return large structs, which Mojo miscompiles at -O1 and above.
+# `external_call` and function pointers too, which Mojo gets wrong
+# (#7710), and ABI_FUZZ_NO_SRET_WORKAROUND=1 lets Mojo functions that C
+# calls take and return large structs, which Mojo miscompiles at -O1 and
+# above (#7711).
+#
+# ABI_FUZZ_SECONDS=N runs proptest's fuzz loop (`FuzzTarget.fuzz`) for N
+# seconds instead of `max_examples` random programs; ABI_FUZZ_BLIND=1
+# makes it unguided, as a baseline. The loop's coverage features are
+# each argument's and result's ABI shape on each call path: its size
+# and x86-64 eightbyte classes, and how many argument registers the
+# arguments before it took (see `Gen.record_features`).
 
 from std.os import getenv
 from std.subprocess import run
@@ -185,6 +194,13 @@ struct FnDef(Copyable):
     var args: List[Tuple[String, String]]  # (Mojo, C) argument values
 
 
+def fnv(xs: List[UInt64]) -> UInt64:
+    var h: UInt64 = 14695981039346656037
+    for x in xs:
+        h = (h ^ x) * 0x100000001B3
+    return h
+
+
 def H(var a: String, b: String) -> String:
     return String("H(", a, ", ", b, ")")
 
@@ -288,6 +304,136 @@ struct Gen(Movable):
             return materialize[VARIADIC_OK]()[t.a]
         return t.kind != VOID
 
+    # ---- ABI shapes, for the fuzz loop's coverage features
+
+    def size_align(self, t: Ty) -> Tuple[Int, Int]:
+        """A `t`'s size and alignment on x86-64, as C lays it out."""
+        if t.kind == SCALAR:
+            var n = materialize[BITS]()[t.a] // 8
+            return (n, n)
+        if t.kind == VECTOR:
+            var n = (
+                materialize[SIMD_LANES]()[t.a]
+                * materialize[BITS]()[materialize[SIMD_SCALARS]()[t.a]]
+                // 8
+            )
+            return (n, n)
+        if t.kind == ARRAY or t.kind == STRUCT_ARRAY:
+            var e = self.size_align(
+                Ty(SCALAR if t.kind == ARRAY else STRUCT, t.a, 0)
+            )
+            return (e[0] * t.n, e[1])
+        if t.kind == VOID:
+            return (0, 1)
+        var size = 0
+        var align = 1
+        for f in self.structs[t.a].fields:
+            var fa = self.size_align(f)
+            size = (size + fa[1] - 1) // fa[1] * fa[1] + fa[0]
+            align = max(align, fa[1])
+        align = max(align, self.structs[t.a].align)
+        return ((size + align - 1) // align * align, align)
+
+    def classify(self, t: Ty, offset: Int, mut classes: List[Int]):
+        """Merge the classes of `t`'s scalars at `offset` into the
+        eightbyte classes `classes` (0 none, 1 INTEGER, 2 SSE, 3 both:
+        INTEGER wins)."""
+        if offset >= 16:
+            return
+        if t.kind == SCALAR or t.kind == VECTOR:
+            var sse = t.kind == VECTOR or materialize[KINDS]()[t.a] in (2, 3)
+            var n = self.size_align(t)[0]
+            var e = offset // 8
+            while e < 2 and e * 8 < offset + n:
+                classes[e] |= 2 if sse else 1
+                e += 1
+            return
+        if t.kind == ARRAY or t.kind == STRUCT_ARRAY:
+            var et = Ty(SCALAR if t.kind == ARRAY else STRUCT, t.a, 0)
+            var n = self.size_align(et)[0]
+            for i in range(t.n):
+                self.classify(et, offset + i * n, classes)
+            return
+        if t.kind == STRUCT:
+            var off = offset
+            for f in self.structs[t.a].fields:
+                var fa = self.size_align(f)
+                off = (off + fa[1] - 1) // fa[1] * fa[1]
+                self.classify(f, off, classes)
+                off += fa[0]
+
+    def shape(self, t: Ty) -> Tuple[UInt64, Int, Int]:
+        """A summary of how x86-64 passes a `t`, and the INTEGER and SSE
+        registers it takes (0, 0 in memory)."""
+        if t.kind == VOID:
+            return (UInt64(0x100), 0, 0)
+        if t.kind == SCALAR:
+            var k = materialize[KINDS]()[t.a]
+            var regs = 2 if k >= 5 else 1
+            return (
+                UInt64(0x200 + t.a),
+                0 if k in (2, 3) else regs,
+                1 if k in (2, 3) else 0,
+            )
+        if t.kind == VECTOR:
+            return (UInt64(0x300 + t.a), 0, 1)
+        var sa = self.size_align(t)
+        var size = sa[0]
+        var bucket = size if size <= 16 else (
+            17 if size
+            <= 32 else (18 if size <= 64 else (19 if size <= 256 else 20))
+        )
+        var classes: List[Int] = [0, 0]
+        if size <= 16:
+            self.classify(t, 0, classes)
+        var ints = 0
+        var sses = 0
+        for c in classes:
+            if c & 1:
+                ints += 1
+            elif c == 2:
+                sses += 1
+        ref s = self.structs[t.a]
+        var code = UInt64(
+            0x10000
+            + bucket * 256
+            + classes[0] * 32
+            + classes[1] * 8
+            + (4 if s.align > 0 else 0)
+            + (2 if s.register_passable else 0)
+            + (1 if self.indirect(t) else 0)
+        )
+        return (code, ints, sses)
+
+    def record_features(self, mut data: ConjectureData, f: FnDef):
+        """Record, for each call path, the shape of the result and of
+        each argument with the registers the arguments before it took."""
+        var ret = self.shape(f.ret)
+        for j in range(len(f.paths)):
+            var tag = UInt64(f.paths[j] * 2 + (1 if f.tail[j] else 0))
+            data.feature(fnv([tag, 0xFE, ret[0]]))
+            var ints = 0
+            var sses = 0
+            # a result in memory takes a register for its address
+            if f.ret.kind == STRUCT and self.size_align(f.ret)[0] > 16:
+                ints = 1
+            for i in range(len(f.params)):
+                var sh = self.shape(f.params[i])
+                data.feature(
+                    fnv(
+                        [
+                            tag,
+                            sh[0],
+                            UInt64(min(ints, 7)),
+                            UInt64(min(sses, 9)),
+                        ]
+                    )
+                )
+                if ints + sh[1] <= 6 and sses + sh[2] <= 8:
+                    ints += sh[1]
+                    sses += sh[2]
+            data.feature(fnv([tag, 0xFF, UInt64(len(f.params))]))
+
     def draw_fns(mut self, mut data: ConjectureData) raises:
         for _ in range(data.draw(integers(1, 6))):
             var params = List[Ty]()
@@ -299,8 +445,7 @@ struct Gen(Movable):
             var to_c = data.draw(integers(0, 2)) > 0
             # An abi("C") Mojo function passes a large struct argument or
             # result through a local temporary to a call marked `tail`,
-            # which -O1 and above miscompile
-            # (unfiled-mojo-issue-abi-c-sret-tail.md), so only C gets
+            # which -O1 and above miscompile (#7711), so only C gets
             # those.
             if self.sret_workaround:
                 var indirect = self.indirect(ret)
@@ -313,8 +458,8 @@ struct Gen(Movable):
             if to_c:
                 var can_variadic = len(params) > 0 and self.passable(ret)
                 # external_call and function pointers pass an empty
-                # struct argument as an i32 (unfiled-mojo-issue-empty-
-                # struct-param.md); @extern gets it right
+                # struct argument as an i32 (#7710); @extern gets it
+                # right
                 var has_empty = False
                 for p in params:
                     can_variadic = can_variadic and self.variadic_ok(p)
@@ -343,7 +488,9 @@ struct Gen(Movable):
             var args = List[Tuple[String, String]]()
             for p in params:
                 args.append(self.value(data, p))
-            self.fns.append(FnDef(params^, ret, to_c, paths^, tail^, args^))
+            var fn_def = FnDef(params^, ret, to_c, paths^, tail^, args^)
+            self.record_features(data, fn_def)
+            self.fns.append(fn_def^)
 
     # ---- values (Mojo, C)
 
@@ -1227,5 +1374,13 @@ def main() raises:
     )
     if getenv("ABI_FUZZ_NO_SHRINK") != "":
         settings.phases = Phases(shrink=False, explain=False)
-    given_data(differential, settings)
-    print("no differences")
+    var seconds = getenv("ABI_FUZZ_SECONDS")
+    if seconds == "":
+        given_data(differential, settings)
+        print("no differences")
+        return
+    var target = fuzz_target_data(differential, settings)
+    var report = target.fuzz(
+        Float64(atof(seconds)), guided=getenv("ABI_FUZZ_BLIND") == ""
+    )
+    print("no differences:", report)
