@@ -125,7 +125,8 @@ and RapidCheck (see `docs/ideas.md`).
 ## Testing
 
 - Each test file ends with `TestSuite.discover_tests[__functions_in_module()]().run()`.
-- `tests/run_all.sh` sets `PROPTEST_DATABASE=none`.
+- `tests/run_all.sh` sets `PROPTEST_DATABASE=none` and runs the files in
+  parallel, `PROPTEST_JOBS` at a time (default: the number of CPUs).
 - Compiling a test file takes about a minute (generic instantiation); tests run in seconds.
 - `TestSuite`'s per-test timings overstate run time. Use `time` on a built
   binary when measuring performance.

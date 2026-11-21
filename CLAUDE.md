@@ -8,7 +8,7 @@
 
 ```sh
 pixi install
-pixi run test                                   # every tests/test_*.mojo
+pixi run test                                   # every tests/test_*.mojo, in parallel (PROPTEST_JOBS)
 bash tests/run_all.sh tests/test_engine.mojo    # one file (inside `pixi shell`)
 pixi run mojo run -I . tests/test_engine.mojo   # same, without the env vars
 pixi run examples
