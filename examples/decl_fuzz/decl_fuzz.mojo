@@ -12,13 +12,22 @@
 # construction: a `BUILD_FAIL` is a bug in this generator or in the
 # compiler.
 #
-# FM is pure and every program terminates: each method and function has a
-# rank, and a body calls only methods and functions of lower rank.
-# The generator also evaluates the program itself (`Program.eval`, the
-# reference semantics in the rules doc). The script then compares four
+# Stage 2 adds ownership: types are `ImplicitlyCopyable`, `Copyable` (they
+# need `.copy()`) or only `Movable` (they need `^`); arguments are read,
+# `mut` or `var`; bodies are statements (`var`, assignment to variables
+# and fields, `if`, bounded `for`) that move, copy and mutate values. The
+# environment tracks which variables are live, and the exclusivity rules
+# of each statement. `Res` values count their constructions, copies and
+# destructions, and `main` checks that every one was destroyed (UNBALANCED
+# otherwise).
+#
+# Every program terminates: each method and function has a rank, and a
+# body calls only methods and functions of lower rank; loops have constant
+# bounds. The generator also evaluates the program itself (`Program.eval`,
+# the reference semantics in the rules doc). The script then compares four
 # results: -O0, -O3, `comptime` and the generator's. -O0 and -O3 agreeing
-# on a wrong answer (a front-end bug in dispatch, substitution or
-# associated constants) shows up as DIFF_EXPECTED.
+# on a wrong answer (a front-end bug in dispatch, substitution, associated
+# constants or argument conventions) shows up as DIFF_EXPECTED.
 #
 # Build and run from the repository root:
 #
@@ -28,6 +37,7 @@
 #
 # The compiler under test is $MOJO (default `mojo`); see
 # build_and_compare.sh. DECL_FUZZ_NO_SHRINK=1 skips shrinking;
+# DECL_FUZZ_STATS=1 prints what evaluation reached in each program;
 # PROPTEST_SEED, PROPTEST_MAX_EXAMPLES and PROPTEST_WORKERS set the seed,
 # the number of programs, and the worker processes (0: one per physical
 # core). The failing program is kept as failing_program.mojo in the work
@@ -50,6 +60,8 @@ comptime STEP_LIMIT = 20000
 """Evaluation steps per program; a program that takes more is rejected."""
 comptime POOL_LIMIT = 40
 """At most this many types in a context's type pool."""
+comptime MAX_DEPTH = 2
+"""Blocks (`if`, `for`) nest at most this deep."""
 
 # type kinds
 comptime INT = 0
@@ -57,6 +69,39 @@ comptime STRUCT = 1
 """A struct; generic ones carry their type argument."""
 comptime PARAM = 2
 """A type parameter of the context: `T`, `U`, `Self.T` or a trait's `Self`."""
+comptime RES = 3
+"""`Res`, the prelude's counted resource (Copyable, one Int field `val`)."""
+
+# capabilities, weakest first
+comptime CAP_M = 0
+comptime CAP_C = 1
+comptime CAP_IC = 2
+comptime CAP_NAMES: List[String] = [
+    "Movable",
+    "Copyable",
+    "ImplicitlyCopyable",
+]
+
+# argument conventions
+comptime CONV_READ = 0
+comptime CONV_MUT = 1
+comptime CONV_VAR = 2
+comptime CONV_PREFIX: List[String] = ["", "mut ", "var "]
+
+# kinds of variables in Γ
+comptime V_READ = 0
+"""A read argument, a read `self`, or a loop variable."""
+comptime V_MUT = 1
+"""A `mut` argument or `mut self`: assignable, not movable."""
+comptime V_OWNED = 2
+"""A local `var` or a `var` argument: assignable and movable."""
+
+# positions an expression is drawn for
+comptime P_READ = 0
+"""Borrowed: a read argument, a receiver, an operand."""
+comptime P_OWNED = 1
+"""Consumed: a `var` argument, a field initializer, an assigned value, a
+result. A place there needs `.copy()` or `^` unless implicitly copyable."""
 
 # expression kinds
 comptime E_LIT = 0
@@ -69,6 +114,17 @@ comptime E_METHOD = 6
 comptime E_STATIC = 7
 comptime E_K = 8
 comptime E_CALL = 9
+comptime E_COPY = 10
+comptime E_MOVE = 11
+
+# statement kinds
+comptime S_VAR = 0
+comptime S_ASSIGN = 1
+comptime S_EXPR = 2
+comptime S_IF = 3
+comptime S_FOR = 4
+comptime S_USE = 5
+"""`_use(v)`: a read with no effect (the workaround in `gen_stmt`)."""
 
 # generation rules, simplest first (shrinking moves toward rule 0)
 comptime R_ATOM = 0
@@ -81,6 +137,11 @@ comptime R_METHOD = 6
 comptime R_K = 7
 comptime R_CALL = 8
 
+# how an atom uses its variable
+comptime A_PLAIN = 0
+comptime A_COPY = 1
+comptime A_MOVE = 2
+
 # what evaluation reached, for tuning the generator
 comptime STAT_OWN = 0
 comptime STAT_REQUIRED = 1
@@ -90,7 +151,13 @@ comptime STAT_STATIC = 4
 comptime STAT_GENERIC = 5
 comptime STAT_K = 6
 comptime STAT_K_SOURCE = 7
-comptime N_STATS = 8
+comptime STAT_MUT_CALL = 8
+comptime STAT_MOVE = 9
+comptime STAT_COPY = 10
+comptime STAT_ASSIGN = 11
+comptime STAT_LOOP = 12
+comptime STAT_RES = 13
+comptime N_STATS = 14
 comptime STAT_NAMES: List[String] = [
     "own",
     "required",
@@ -100,6 +167,12 @@ comptime STAT_NAMES: List[String] = [
     "generic",
     "K",
     "K_source",
+    "mut_call",
+    "move",
+    "copy",
+    "assign",
+    "loop",
+    "res",
 ]
 
 comptime BIN_OPS: List[String] = ["+", "-", "*", "&", "|", "^"]
@@ -128,6 +201,64 @@ comptime LITERAL_VALUES: List[Int] = [
     4611686018427387904,
     -1000003,
 ]
+
+comptime PRELUDE_HEAD = """from std.benchmark import black_box
+from std.ffi import external_call
+
+
+def _use[T: AnyType](x: T):
+    pass
+
+
+"""
+
+comptime RUN_TIME_RES = """comptime _LEDGER = 0x7E5500000000
+
+
+def _live() -> Pointer[Int, MutUntrackedOrigin]:
+    \"\"\"The number of live `Res` values, at a fixed address (no globals).\"\"\"
+    return Pointer[Int, MutUntrackedOrigin](unsafe_from_address=_LEDGER)
+
+
+def _ledger_init():
+    # PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE
+    _ = external_call["mmap", Int](_LEDGER, 4096, 3, 0x100022, -1, 0)
+
+
+def _check(i: Int):
+    if _live()[] != 0:
+        print("UNBALANCED", i, _live()[])
+        _live()[] = 0
+
+
+struct Res(Copyable):
+    var val: Int
+
+    def __init__(out self, val: Int):
+        self.val = val
+        _live()[] += 1
+
+    def __init__(out self, *, copy: Self):
+        self.val = copy.val
+        _live()[] += 1
+
+    def __deinit__(deinit self):
+        _live()[] -= 1
+
+
+"""
+
+comptime COMPILE_TIME_RES = """struct Res(Copyable):
+    var val: Int
+
+    def __init__(out self, val: Int):
+        self.val = val
+
+    def __init__(out self, *, copy: Self):
+        self.val = copy.val
+
+
+"""
 
 
 def env_int(name: String, default: Int) -> Int:
@@ -158,6 +289,17 @@ def pick(mut data: ConjectureData, n: Int) raises -> Int:
     return data.draw(integers(0, n - 1))
 
 
+def draw_conv(mut data: ConjectureData) raises -> Int:
+    """Read 1/2, `var` 1/3, `mut` 1/6 of the time.
+
+    A call with a `mut` argument goes only at the root of a statement, so
+    `mut` arguments would otherwise rule out most calls."""
+    var c = data.draw(integers(0, 5))
+    if c <= 2:
+        return CONV_READ
+    return CONV_VAR if c <= 4 else CONV_MUT
+
+
 @fieldwise_init
 struct TraitDecl(Copyable):
     var parents: List[Int]
@@ -167,6 +309,10 @@ struct TraitDecl(Copyable):
     """Whether it declares `comptime K<t>: Int`."""
     var make: Int
     """Its `@staticmethod def make<t>(x: Int) -> Self`, or -1."""
+    var cap: Int
+    """CAP_C or CAP_IC: what it requires of its conforming types."""
+    var strengthens: Bool
+    """Whether it adds `ImplicitlyCopyable` to Copyable parents."""
 
 
 @fieldwise_init
@@ -177,9 +323,11 @@ struct MethodDecl(Copyable):
     var struct_id: Int
     """The struct of an own method, or -1."""
     var is_static: Bool
+    var self_conv: Int
     var params: List[Int]
     """Parameter types, without `self`. In a trait, PARAM 0 is `Self`; in a
     generic struct, the struct's `T`."""
+    var convs: List[Int]
     var ret: Int
     var rank: Int
     var has_default: Bool
@@ -193,6 +341,7 @@ struct StructDecl(Copyable):
     var generic: Bool
     var bound: Int
     """The bound of `T` (generic structs), or -1."""
+    var cap: Int
     var fields: List[Int]
     """Field types; field 0 of a generic struct is `Self.T`."""
     var traits: List[Int]
@@ -216,6 +365,7 @@ struct FnDecl(Copyable):
     """One trait bound per type parameter (`T`, `U`)."""
     var params: List[Int]
     """Parameter types; parameter i < len(bounds) has type PARAM i."""
+    var convs: List[Int]
     var ret: Int
     var rank: Int
     var body: Int
@@ -223,8 +373,7 @@ struct FnDecl(Copyable):
 
 @fieldwise_init
 struct Body(Copyable):
-    var lets: List[Int]
-    """`var vK = e` bindings before the result, in order."""
+    var stmts: List[Int]
     var ret: Int
     var self_print: Int
     """The type written `Self` in this body and its signature, or -1."""
@@ -244,17 +393,120 @@ struct Expr(Copyable):
 
 
 @fieldwise_init
+struct Stmt(Copyable):
+    var kind: Int
+    var target: Int
+    """The place assigned (S_ASSIGN), or -1."""
+    var e: Int
+    """The value (S_VAR, S_ASSIGN, S_EXPR) or the left operand (S_IF)."""
+    var e2: Int
+    """The right operand of the condition (S_IF), or -1."""
+    var a: Int
+    """The comparison (S_IF) or the trip count (S_FOR)."""
+    var body: List[Int]
+    var orelse: List[Int]
+    var name: String
+    """The variable declared (S_VAR) or the loop variable (S_FOR)."""
+
+
+@fieldwise_init
 struct Ctx(Copyable):
-    """Γ, the type parameters in scope, and the rank of the body."""
+    """Γ with each variable's kind and state, the type parameters in scope,
+    the rank of the body, and the exclusivity state of the statement being
+    drawn."""
 
     var names: List[String]
     var types: List[Int]
+    var kinds: List[Int]
+    var live: List[Bool]
+    var move_depth: List[Int]
+    """The block depth where a dead variable was moved."""
+    var touched: List[Bool]
+    """Used in the current statement (so no longer movable or mut-able)."""
+    var excl: List[Bool]
+    """Passed as `mut` in the current statement (so unusable in it)."""
     var bounds: List[Int]
     var param_names: List[String]
     var rank: Int
     var self_print: Int
     var pool: List[Int]
     """The types this context draws from."""
+    var depth: Int
+    var no_move: Int
+    """Inside a ternary branch, where moves would be conditional."""
+    var counter: Int
+    """For fresh local names."""
+
+    def __init__(
+        out self,
+        var bounds: List[Int],
+        var param_names: List[String],
+        rank: Int,
+        self_print: Int,
+        var pool: List[Int],
+    ):
+        self.names = []
+        self.types = []
+        self.kinds = []
+        self.live = []
+        self.move_depth = []
+        self.touched = []
+        self.excl = []
+        self.bounds = bounds^
+        self.param_names = param_names^
+        self.rank = rank
+        self.self_print = self_print
+        self.pool = pool^
+        self.depth = 0
+        self.no_move = 0
+        self.counter = 0
+
+    def push(mut self, var name: String, ty: Int, kind: Int):
+        self.names.append(name^)
+        self.types.append(ty)
+        self.kinds.append(kind)
+        self.live.append(True)
+        self.move_depth.append(-1)
+        self.touched.append(False)
+        self.excl.append(False)
+
+    def truncate(mut self, n: Int):
+        while len(self.names) > n:
+            _ = self.names.pop()
+            _ = self.types.pop()
+            _ = self.kinds.pop()
+            _ = self.live.pop()
+            _ = self.move_depth.pop()
+            _ = self.touched.pop()
+            _ = self.excl.pop()
+
+    def new_statement(mut self):
+        for i in range(len(self.names)):
+            self.touched[i] = False
+            self.excl[i] = False
+
+
+def kind_of_conv(conv: Int) -> Int:
+    if conv == CONV_MUT:
+        return V_MUT
+    return V_OWNED if conv == CONV_VAR else V_READ
+
+
+@fieldwise_init
+struct Cands(Copyable):
+    """The candidates of each generation rule for one expression."""
+
+    var atom_vars: List[Int]
+    var atom_fields: List[Int]
+    var atom_modes: List[Int]
+    var makes: List[Int]
+    var field_recv: List[Int]
+    var field_idx: List[Int]
+    var meth_recv: List[Int]
+    var meth_id: List[Int]
+    var k_recv: List[Int]
+    var k_trait: List[Int]
+    var call_fn: List[Int]
 
 
 struct Program(Movable):
@@ -267,10 +519,11 @@ struct Program(Movable):
     var fns: List[FnDecl]
     var bodies: List[Body]
     var exprs: List[Expr]
+    var stmts: List[Stmt]
     var entries: List[Int]
     """Bodies of run_f0, run_f1, ..."""
     var vtag: List[Int]
-    """Values: -1 for an Int, else the struct."""
+    """Values: -1 for an Int, -2 for a Res, else the struct."""
     var vint: List[Int]
     var vkids: List[List[Int]]
     var steps: Int
@@ -279,6 +532,7 @@ struct Program(Movable):
     var literals: List[String]
     var literal_values: List[Int]
     var int_ty: Int
+    var res_ty: Int
     var p0_ty: Int
 
     def __init__(out self):
@@ -291,6 +545,7 @@ struct Program(Movable):
         self.fns = []
         self.bodies = []
         self.exprs = []
+        self.stmts = []
         self.entries = []
         self.vtag = []
         self.vint = []
@@ -300,8 +555,10 @@ struct Program(Movable):
         self.literals = materialize[LITERALS]()
         self.literal_values = materialize[LITERAL_VALUES]()
         self.int_ty = 0
+        self.res_ty = 0
         self.p0_ty = 0
         self.int_ty = self.intern(INT, -1, -1)
+        self.res_ty = self.intern(RES, -1, -1)
         self.p0_ty = self.intern(PARAM, 0, -1)
 
     # ---- types
@@ -341,6 +598,8 @@ struct Program(Movable):
         var kind = self.tkind[ty]
         if kind == INT:
             return "Int"
+        if kind == RES:
+            return "Res"
         if kind == PARAM:
             return names[self.tid[ty]]
         var s = self.structs[self.tid[ty]].name
@@ -364,7 +623,7 @@ struct Program(Movable):
 
     def conforms(self, ty: Int, t: Int, bounds: List[Int]) -> Bool:
         var kind = self.tkind[ty]
-        if kind == INT:
+        if kind == INT or kind == RES:
             return False
         if kind == PARAM:
             return self.refines(bounds[self.tid[ty]], t)
@@ -373,7 +632,19 @@ struct Program(Movable):
                 return True
         return False
 
+    def cap_of(self, ty: Int, bounds: List[Int]) -> Int:
+        var kind = self.tkind[ty]
+        if kind == INT:
+            return CAP_IC
+        if kind == RES:
+            return CAP_C
+        if kind == PARAM:
+            return self.traits[bounds[self.tid[ty]]].cap
+        return self.structs[self.tid[ty]].cap
+
     def fields_of(mut self, ty: Int) -> List[Int]:
+        if self.tkind[ty] == RES:
+            return [self.int_ty]
         if self.tkind[ty] != STRUCT:
             return []
         var s = self.tid[ty]
@@ -382,10 +653,15 @@ struct Program(Movable):
             return self.subst_all(fields, [self.targ[ty]])
         return fields^
 
+    def field_name(self, ty: Int, f: Int) -> String:
+        if self.tkind[ty] == RES:
+            return "val"
+        return String("f", f)
+
     def type_pool(mut self, bounds: List[Int], n_structs: Int) -> List[Int]:
-        """Int, the concrete structs, the parameters in scope, and generic
-        structs over them (two levels deep)."""
-        var pool: List[Int] = [self.int_ty]
+        """Int, Res, the concrete structs, the parameters in scope, and
+        generic structs over them (two levels deep)."""
+        var pool: List[Int] = [self.int_ty, self.res_ty]
         for s in range(n_structs):
             if not self.structs[s].generic:
                 pool.append(self.intern(STRUCT, s, -1))
@@ -441,6 +717,13 @@ struct Program(Movable):
             return params^
         return self.subst_all(params, args)
 
+    def has_mut(self, m: Int) -> Bool:
+        """Whether m takes `mut self` or a `mut` argument; such calls go
+        only at the root of a statement."""
+        if self.methods[m].self_conv == CONV_MUT:
+            return True
+        return has(self.methods[m].convs, CONV_MUT)
+
     def unify(self, pat: Int, ty: Int, mut assign: List[Int]) -> Bool:
         var kind = self.tkind[pat]
         if kind == PARAM:
@@ -449,8 +732,8 @@ struct Program(Movable):
                 assign[i] = ty
                 return True
             return assign[i] == ty
-        if kind == INT:
-            return self.tkind[ty] == INT
+        if kind == INT or kind == RES:
+            return self.tkind[ty] == kind
         if self.tkind[ty] != STRUCT or self.tid[ty] != self.tid[pat]:
             return False
         if self.targ[pat] < 0:
@@ -505,8 +788,8 @@ struct Program(Movable):
         return self.draw_type(data, pool)
 
     def draw_declarations(mut self, mut data: ConjectureData) raises:
-        # trait headers: parents, K, make (FJ: classes in order, so the
-        # refinement relation is acyclic)
+        # trait headers: parents, capability, K, make (FJ: classes in
+        # order, so the refinement relation is acyclic)
         var n_traits = data.draw(integers(1, 4))
         for t in range(n_traits):
             var parents = List[Int]()
@@ -515,6 +798,14 @@ struct Program(Movable):
                     var p = pick(data, t)
                     if not has(parents, p):
                         parents.append(p)
+            var cap = CAP_IC - data.draw(integers(0, 1))
+            var strengthens = False
+            if len(parents) > 0:
+                var inherited = CAP_C
+                for p in parents:
+                    inherited = max(inherited, self.traits[p].cap)
+                strengthens = cap > inherited
+                cap = max(cap, inherited)
             var has_k = data.draw(booleans())
             var make = -1
             if data.draw(booleans()):
@@ -525,7 +816,9 @@ struct Program(Movable):
                         t,
                         -1,
                         True,
+                        CONV_READ,
                         [self.int_ty],
+                        [CONV_READ],
                         self.p0_ty,
                         data.draw(integers(0, MAX_RANK)),
                         False,
@@ -535,25 +828,36 @@ struct Program(Movable):
             var methods = List[Int]()
             if make >= 0:
                 methods.append(make)
-            self.traits.append(TraitDecl(parents^, methods^, has_k, make))
+            self.traits.append(
+                TraitDecl(parents^, methods^, has_k, make, cap, strengthens)
+            )
 
-        # struct headers: fields over earlier structs only (acyclic, like
-        # FJ's fields), conformances, associated constants
+        # struct headers: capability, fields over earlier structs only
+        # (acyclic, like FJ's fields) that are at least as capable,
+        # conformances, associated constants
         var n_structs = data.draw(integers(1, 5))
         for s in range(n_structs):
             var generic = data.draw(integers(0, 2)) == 0
             var bound = pick(data, n_traits) if generic else -1
             var bounds = [bound] if generic else List[Int]()
+            var cap_max = self.traits[bound].cap if generic else CAP_IC
+            var cap = cap_max - data.draw(integers(0, cap_max))
             var pool = self.type_pool(bounds, s)
+            var fit = List[Int]()
+            for t in pool:
+                if self.cap_of(t, bounds) >= cap:
+                    fit.append(t)
             var fields = List[Int]()
             if generic:
                 fields.append(self.p0_ty)
             for _ in range(data.draw(integers(0 if generic else 1, 3))):
-                fields.append(self.draw_type(data, pool))
+                fields.append(self.draw_type(data, fit))
             var traits = List[Int]()
             for t in range(n_traits):
-                if data.draw(booleans()) and (
-                    not generic or self.make_ok(t, bound)
+                if (
+                    data.draw(booleans())
+                    and self.traits[t].cap <= cap
+                    and (not generic or self.make_ok(t, bound))
                 ):
                     traits.append(t)
             var k_traits = List[Int]()
@@ -578,6 +882,7 @@ struct Program(Movable):
                     String("B" if generic else "S", s),
                     generic,
                     bound,
+                    cap,
                     fields^,
                     traits^,
                     [],
@@ -597,16 +902,23 @@ struct Program(Movable):
             var pool = self.type_pool([t], n_structs)
             for _ in range(data.draw(integers(lo, 2))):
                 var m = len(self.methods)
+                var self_conv = (
+                    CONV_MUT if data.draw(integers(0, 3)) == 3 else CONV_READ
+                )
                 var params = List[Int]()
+                var convs = List[Int]()
                 for _ in range(data.draw(integers(0, 2))):
                     params.append(self.draw_sig_type(data, pool, self.p0_ty))
+                    convs.append(draw_conv(data))
                 self.methods.append(
                     MethodDecl(
                         String("m", m),
                         t,
                         -1,
                         False,
+                        self_conv,
                         params^,
+                        convs^,
                         self.draw_sig_type(data, pool, self.p0_ty),
                         data.draw(integers(0, MAX_RANK)),
                         data.draw(booleans()),
@@ -624,16 +936,23 @@ struct Program(Movable):
             var own_ty = self.self_type(s)
             for _ in range(data.draw(integers(0, 2))):
                 var m = len(self.methods)
+                var self_conv = (
+                    CONV_MUT if data.draw(integers(0, 3)) == 3 else CONV_READ
+                )
                 var params = List[Int]()
+                var convs = List[Int]()
                 for _ in range(data.draw(integers(0, 2))):
                     params.append(self.draw_sig_type(data, pool, own_ty))
+                    convs.append(draw_conv(data))
                 self.methods.append(
                     MethodDecl(
                         String("m", m),
                         -1,
                         s,
                         False,
+                        self_conv,
                         params^,
+                        convs^,
                         self.draw_sig_type(data, pool, own_ty),
                         data.draw(integers(0, MAX_RANK)),
                         False,
@@ -650,15 +969,19 @@ struct Program(Movable):
             var pool = self.type_pool(bounds, n_structs)
             var own_ty = self.p0_ty if len(bounds) > 0 else -1
             var params = List[Int]()
+            var convs = List[Int]()
             for i in range(len(bounds)):
                 params.append(self.intern(PARAM, i, -1))
+                convs.append(draw_conv(data))
             for _ in range(data.draw(integers(0, 2))):
                 params.append(self.draw_sig_type(data, pool, own_ty))
+                convs.append(draw_conv(data))
             self.fns.append(
                 FnDecl(
                     String("g", f),
                     bounds^,
                     params^,
+                    convs^,
                     self.draw_sig_type(data, pool, own_ty),
                     data.draw(integers(0, MAX_RANK)),
                     -1,
@@ -667,14 +990,21 @@ struct Program(Movable):
 
     # ---- bodies
 
+    def push_params(
+        self, mut ctx: Ctx, params: List[Int], convs: List[Int], prefix: String
+    ):
+        for i in range(len(params)):
+            ctx.push(String(prefix, i), params[i], kind_of_conv(convs[i]))
+
     def trait_ctx(mut self, m: Int) -> Ctx:
         var t = self.methods[m].trait_id
         var rank = self.methods[m].rank
         var pool = self.type_pool([t], len(self.structs))
-        var ctx = Ctx(["self"], [self.p0_ty], [t], ["Self"], rank, -1, pool^)
-        for i in range(len(self.methods[m].params)):
-            ctx.names.append(String("p", i))
-            ctx.types.append(self.methods[m].params[i])
+        var ctx = Ctx([t], ["Self"], rank, -1, pool^)
+        ctx.push("self", self.p0_ty, kind_of_conv(self.methods[m].self_conv))
+        self.push_params(
+            ctx, self.methods[m].params, self.methods[m].convs, "p"
+        )
         return ctx^
 
     def self_type(mut self, s: Int) -> Int:
@@ -692,30 +1022,30 @@ struct Program(Movable):
         var rank = self.methods[m].rank
         var pool = self.type_pool(bounds, len(self.structs))
         var ctx = Ctx(
-            [],
-            [],
-            bounds.copy(),
+            bounds^,
             ["Self.T"] if generic else List[String](),
             rank,
             self_ty if data.draw(booleans()) else -1,
             pool^,
         )
         if not self.methods[m].is_static:
-            ctx.names.append("self")
-            ctx.types.append(self_ty)
+            ctx.push("self", self_ty, kind_of_conv(self.methods[m].self_conv))
         var params = self.methods[m].params.copy()
         if self.methods[m].trait_id >= 0:
             params = self.subst_all(params, [self_ty])
-        for i in range(len(params)):
-            ctx.names.append(
-                "x" if self.methods[m].is_static else String("p", i)
-            )
-            ctx.types.append(params[i])
+        self.push_params(
+            ctx,
+            params,
+            self.methods[m].convs,
+            "x" if self.methods[m].is_static else "p",
+        )
+        if self.methods[m].is_static:
+            ctx.names[len(ctx.names) - 1] = "x"
         return ctx^
 
     def body_ret(mut self, s: Int, m: Int) -> Int:
-        """Method m's result type in struct s (-1: a trait default)."""
-        if s < 0 or self.methods[m].trait_id < 0:
+        """Method m's result type in struct s."""
+        if self.methods[m].trait_id < 0:
             return self.methods[m].ret
         var self_ty = self.self_type(s)
         return self.subst(self.methods[m].ret, [self_ty])
@@ -728,15 +1058,71 @@ struct Program(Movable):
         size: Int = BODY_SIZE,
         root: Bool = False,
     ) raises -> Int:
-        var lets = List[Int]()
-        for k in range(data.draw(integers(0, 2))):
-            var ty = self.draw_type(data, ctx.pool)
-            lets.append(self.gen(data, ctx, ty, size - 1))
-            ctx.names.append(String("v", k))
-            ctx.types.append(ty)
-        var r = self.gen(data, ctx, ret, size, root)
-        self.bodies.append(Body(lets^, r, ctx.self_print))
+        # entry points (root) drive everything: give them more statements
+        var stmts = self.gen_block(data, ctx, 5 if root else 3)
+        ctx.new_statement()
+        var r = self.gen(data, ctx, ret, size, P_OWNED, root, True)
+        if root:
+            # A checksum, as in Csmith: the entry point keeps its result in
+            # a variable, then returns it plus every Int reachable from its
+            # live locals, so that what mutations did to them is printed.
+            var name = String("v", ctx.counter)
+            ctx.counter += 1
+            stmts.append(
+                self.add_stmt(Stmt(S_VAR, -1, r, -1, 0, [], [], name.copy()))
+            )
+            ctx.push(name^, self.int_ty, V_OWNED)
+            r = self.checksum(ctx)
+        self.bodies.append(Body(stmts^, r, ctx.self_print))
         return len(self.bodies) - 1
+
+    def int_paths(mut self, ty: Int, depth: Int) -> List[List[Int]]:
+        """Field paths from a value of type ty to its Ints."""
+        var kind = self.tkind[ty]
+        if kind == INT:
+            return [List[Int]()]
+        var out = List[List[Int]]()
+        if depth == 0 or (kind != STRUCT and kind != RES):
+            return out^
+        var fs = self.fields_of(ty)
+        for f in range(len(fs)):
+            for p in self.int_paths(fs[f], depth - 1):
+                var path: List[Int] = [f]
+                path += p.copy()
+                out.append(path^)
+        return out^
+
+    def checksum(mut self, ctx: Ctx) -> Int:
+        """The sum of the Ints reachable from the live owned variables (the
+        last one is the result), at most 8 per variable."""
+        var sum = -1
+        for v in range(len(ctx.names)):
+            if ctx.kinds[v] != V_OWNED or not ctx.live[v]:
+                continue
+            var ty = ctx.types[v]
+            var paths = self.int_paths(ty, 3)
+            for i in range(min(len(paths), 8)):
+                var e = self.add(E_VAR, v, ty, [], [], ctx.names[v])
+                var cur = ty
+                for f in paths[i]:
+                    var fty = self.fields_of(cur)[f]
+                    var text = String(
+                        self.exprs[e].text, ".", self.field_name(cur, f)
+                    )
+                    e = self.add(E_FIELD, f, fty, [e], [], text^)
+                    cur = fty
+                if sum < 0:
+                    sum = e
+                else:
+                    var text = String(
+                        "(",
+                        self.exprs[sum].text,
+                        " + ",
+                        self.exprs[e].text,
+                        ")",
+                    )
+                    sum = self.add(E_BIN, 0, self.int_ty, [sum, e], [], text^)
+        return sum
 
     def draw_bodies(mut self, mut data: ConjectureData) raises:
         # trait defaults
@@ -770,26 +1156,206 @@ struct Program(Movable):
             var bounds = self.fns[f].bounds.copy()
             var rank = self.fns[f].rank
             var pool = self.type_pool(bounds, len(self.structs))
-            var ctx = Ctx([], [], bounds.copy(), ["T", "U"], rank, -1, pool^)
-            for i in range(len(self.fns[f].params)):
-                ctx.names.append(String("p", i))
-                ctx.types.append(self.fns[f].params[i])
+            var ctx = Ctx(bounds^, ["T", "U"], rank, -1, pool^)
+            self.push_params(ctx, self.fns[f].params, self.fns[f].convs, "p")
             var ret = self.fns[f].ret
             self.fns[f].body = self.gen_body(data, ctx^, ret)
         # entry points
         for _ in range(data.draw(integers(1, 4))):
-            var ctx = Ctx(
-                ["a", "b", "c"],
-                [self.int_ty, self.int_ty, self.int_ty],
-                [],
-                [],
-                MAX_RANK + 1,
-                -1,
-                self.type_pool([], len(self.structs)),
-            )
+            var pool = self.type_pool([], len(self.structs))
+            var ctx = Ctx([], [], MAX_RANK + 1, -1, pool^)
+            for name in ["a", "b", "c"]:
+                ctx.push(name, self.int_ty, V_READ)
             self.entries.append(
                 self.gen_body(data, ctx^, self.int_ty, BODY_SIZE + 2, True)
             )
+
+    # ---- statements
+
+    def add_stmt(mut self, var s: Stmt) -> Int:
+        self.stmts.append(s^)
+        return len(self.stmts) - 1
+
+    def gen_block(
+        mut self, mut data: ConjectureData, mut ctx: Ctx, n_max: Int
+    ) raises -> List[Int]:
+        """Statements; in a nested block, variables live at its start are
+        live at its end (moved ones are reinitialized), and its locals go
+        out of scope."""
+        var n_outer = len(ctx.names)
+        var live_at_start = ctx.live.copy()
+        var out = List[Int]()
+        for _ in range(data.draw(integers(0, n_max))):
+            out.append(self.gen_stmt(data, ctx))
+        if ctx.depth > 0:
+            for v in range(n_outer):
+                if live_at_start[v] and not ctx.live[v]:
+                    out.append(self.gen_reinit(data, ctx, v))
+            ctx.truncate(n_outer)
+        return out^
+
+    def place_expr(mut self, ctx: Ctx, v: Int, f: Int) -> Int:
+        """The place `v` or `v.f<f>`."""
+        var var_e = self.add(E_VAR, v, ctx.types[v], [], [], ctx.names[v])
+        if f < 0:
+            return var_e
+        var fty = self.fields_of(ctx.types[v])[f]
+        var text = String(ctx.names[v], ".", self.field_name(ctx.types[v], f))
+        return self.add(E_FIELD, f, fty, [var_e], [], text^)
+
+    def gen_reinit(
+        mut self, mut data: ConjectureData, mut ctx: Ctx, v: Int
+    ) raises -> Int:
+        ctx.new_statement()
+        var e = self.gen(data, ctx, ctx.types[v], BODY_SIZE - 2, P_OWNED)
+        var target = self.place_expr(ctx, v, -1)
+        ctx.live[v] = True
+        ctx.move_depth[v] = -1
+        return self.add_stmt(Stmt(S_ASSIGN, target, e, -1, 0, [], [], String()))
+
+    def gen_stmt(
+        mut self, mut data: ConjectureData, mut ctx: Ctx
+    ) raises -> Int:
+        """A statement; if it gets stuck, `var vN = <an Int>` instead."""
+        var saved = ctx.copy()
+        try:
+            return self.try_stmt(data, ctx)
+        except e:
+            if String(e) != "STUCK":
+                raise e^
+        ctx = saved^
+        ctx.new_statement()
+        var x = self.gen(data, ctx, self.int_ty, 1, P_OWNED)
+        var name = String("v", ctx.counter)
+        ctx.counter += 1
+        ctx.push(name, self.int_ty, V_OWNED)
+        return self.add_stmt(Stmt(S_VAR, -1, x, -1, 0, [], [], name^))
+
+    def try_stmt(
+        mut self, mut data: ConjectureData, mut ctx: Ctx
+    ) raises -> Int:
+        ctx.new_statement()
+        # assignment targets: whole variables that are assignable (and
+        # live, or moved in this block), and fields of live mutable ones
+        var t_var = List[Int]()
+        var t_field = List[Int]()
+        for v in range(len(ctx.names)):
+            var k = ctx.kinds[v]
+            if k == V_READ:
+                continue
+            if ctx.live[v] or (k == V_OWNED and ctx.move_depth[v] == ctx.depth):
+                t_var.append(v)
+                t_field.append(-1)
+            if ctx.live[v]:
+                var fs = self.fields_of(ctx.types[v])
+                for f in range(len(fs)):
+                    t_var.append(v)
+                    t_field.append(f)
+        var mut_types = self.mut_call_types(ctx)
+        var kinds: List[Int] = [S_VAR, S_EXPR]
+        if len(mut_types) > 0:
+            kinds += [S_EXPR, S_EXPR]
+        if len(t_var) > 0:
+            kinds += [S_ASSIGN, S_ASSIGN]
+        if ctx.depth < MAX_DEPTH:
+            kinds += [S_IF, S_FOR]
+        var kind = kinds[pick(data, len(kinds))]
+
+        if kind == S_VAR:
+            # half the time a type with `mut` methods, to call them on
+            var receivers = self.mut_receivers(ctx)
+            var ty: Int
+            if len(receivers) > 0 and data.draw(booleans()):
+                ty = receivers[pick(data, len(receivers))]
+            else:
+                ty = self.draw_type(data, ctx.pool)
+            var e = self.gen(data, ctx, ty, BODY_SIZE - 1, P_OWNED, False, True)
+            var name = String("v", ctx.counter)
+            ctx.counter += 1
+            ctx.push(name, ty, V_OWNED)
+            return self.add_stmt(Stmt(S_VAR, -1, e, -1, 0, [], [], name^))
+
+        if kind == S_EXPR:
+            # the result type of a call with `mut` arguments possible here,
+            # if there is one (a random type would rarely match one)
+            var ty = mut_types[pick(data, len(mut_types))] if len(
+                mut_types
+            ) > 0 else self.draw_type(data, ctx.pool)
+            var e = self.gen(
+                data, ctx, ty, BODY_SIZE - 1, P_OWNED, True, True, True
+            )
+            return self.add_stmt(Stmt(S_EXPR, -1, e, -1, 0, [], [], String()))
+
+        if kind == S_ASSIGN:
+            var i = pick(data, len(t_var))
+            var v = t_var[i]
+            var f = t_field[i]
+            var ty = ctx.types[v] if f < 0 else self.fields_of(ctx.types[v])[f]
+            if f >= 0:
+                # the value may read `v` but not move or mut-borrow it
+                ctx.touched[v] = True
+            var e = self.gen(data, ctx, ty, BODY_SIZE - 1, P_OWNED, False, True)
+            var target = self.place_expr(ctx, v, f)
+            if f < 0:
+                ctx.live[v] = True
+                ctx.move_depth[v] = -1
+            if (
+                f < 0
+                and self.exprs[e].kind == E_VAR
+                and self.exprs[e].a == v
+                and getenv("DECL_FUZZ_NO_SELF_ASSIGN_WORKAROUND") == ""
+            ):
+                # `v = v` on an ImplicitlyCopyable struct gives garbage at
+                # -O1+ (modular/modular#7760): a no-op read instead
+                return self.add_stmt(
+                    Stmt(S_USE, -1, target, -1, 0, [], [], String())
+                )
+            return self.add_stmt(
+                Stmt(S_ASSIGN, target, e, -1, 0, [], [], String())
+            )
+
+        if kind == S_IF:
+            var op = pick(data, comptime (len(CMP_OPS)))
+            var x = self.gen(data, ctx, self.int_ty, 1, P_READ)
+            var y = self.gen(data, ctx, self.int_ty, 1, P_READ)
+            ctx.depth += 1
+            var then = self.gen_block(data, ctx, 2)
+            var orelse = self.gen_block(data, ctx, 2)
+            ctx.depth -= 1
+            return self.add_stmt(
+                Stmt(S_IF, -1, x, y, op, then^, orelse^, String())
+            )
+
+        # S_FOR
+        var count = data.draw(integers(0, 3))
+        var name = String("i", ctx.counter)
+        ctx.counter += 1
+        var n = len(ctx.names)
+        ctx.push(name.copy(), self.int_ty, V_READ)
+        ctx.depth += 1
+        var body = self.gen_block(data, ctx, 2)
+        ctx.depth -= 1
+        ctx.truncate(n)
+        var loop = self.add_stmt(
+            Stmt(S_FOR, -1, -1, -1, count, body^, [], name^)
+        )
+        if getenv("DECL_FUZZ_NO_LOOP_STORE_WORKAROUND") != "":
+            return loop
+        # A variable whose last use is a field assignment in a loop is
+        # destroyed on every iteration (modular/modular#7759), so the loop
+        # is followed by a read of each live owned variable. The loop and the reads form one S_USE group.
+        var uses: List[Int] = [loop]
+        for v in range(n):
+            if ctx.kinds[v] == V_OWNED and ctx.live[v]:
+                var place = self.place_expr(ctx, v, -1)
+                uses.append(
+                    self.add_stmt(
+                        Stmt(S_USE, -1, place, -1, 0, [], [], String())
+                    )
+                )
+        if len(uses) == 1:
+            return loop
+        return self.add_stmt(Stmt(S_USE, -1, -1, -1, 0, uses^, [], String()))
 
     # ---- expressions: the typing rules read backwards
 
@@ -815,7 +1381,8 @@ struct Program(Movable):
 
     def make_candidates(self, ctx: Ctx, ty: Int) -> List[Int]:
         var out = List[Int]()
-        if self.tkind[ty] == INT:
+        var kind = self.tkind[ty]
+        if kind == INT or kind == RES:
             return out^
         for t in range(len(self.traits)):
             var mk = self.traits[t].make
@@ -827,34 +1394,189 @@ struct Program(Movable):
                 out.append(mk)
         return out^
 
-    def gen(
-        mut self,
-        mut data: ConjectureData,
-        ctx: Ctx,
-        ty: Int,
-        size: Int,
-        root: Bool = False,
-    ) raises -> Int:
-        """An expression of type ty in ctx (Γ ⊢ ? : ty). At the root of an
-        entry point, only calls and associated constants, if there are any.
-        """
-        var kind = self.tkind[ty]
-        var sub = size - 1 if size > 0 else 0
-        var half = size // 2
-
-        # T-Var, and fields of variables (so that `self.f0` is a ground
-        # term for `Self.T`)
-        var atom_vars = List[Int]()
-        var atom_fields = List[Int]()
-        for v in range(len(ctx.types)):
+    def mut_places(mut self, ctx: Ctx, ty: Int) -> List[Int]:
+        """Places of type ty that can be passed as `mut` now: live mutable
+        variables not used yet in this statement, or their fields. Encoded
+        as v * 64 + f + 1 (f = -1 for the whole variable)."""
+        var out = List[Int]()
+        for v in range(len(ctx.names)):
+            if (
+                ctx.kinds[v] == V_READ
+                or not ctx.live[v]
+                or ctx.touched[v]
+                or ctx.excl[v]
+            ):
+                continue
             if ctx.types[v] == ty:
-                atom_vars.append(v)
-                atom_fields.append(-1)
+                out.append(v * 64)
             var fs = self.fields_of(ctx.types[v])
             for f in range(len(fs)):
                 if fs[f] == ty:
+                    out.append(v * 64 + f + 1)
+        return out^
+
+    def take_place(
+        mut self, mut data: ConjectureData, mut ctx: Ctx, ty: Int
+    ) raises -> Int:
+        var places = self.mut_places(ctx, ty)
+        if len(places) == 0:
+            raise Error("STUCK")
+        var p = places[pick(data, len(places))]
+        var v = p // 64
+        ctx.excl[v] = True
+        ctx.touched[v] = True
+        return self.place_expr(ctx, v, p % 64 - 1)
+
+    def callable_here(
+        mut self, ctx: Ctx, m: Int, recv: Int, stmt_root: Bool
+    ) -> Bool:
+        """Whether the `mut` arguments m needs have places now."""
+        if not self.has_mut(m):
+            return True
+        if not stmt_root:
+            return False
+        var needed = List[Int]()
+        if self.methods[m].self_conv == CONV_MUT:
+            needed.append(recv)
+        var params = self.method_params(m, recv)
+        for j in range(len(params)):
+            if self.methods[m].convs[j] == CONV_MUT:
+                needed.append(params[j])
+        return self.places_for(ctx, needed)
+
+    def places_for(mut self, ctx: Ctx, needed: List[Int]) -> Bool:
+        """Whether each type in `needed` has a `mut` place, all with
+        different root variables (greedily)."""
+        var used = List[Int]()
+        for ty in needed:
+            var found = False
+            for p in self.mut_places(ctx, ty):
+                if not has(used, p // 64):
+                    used.append(p // 64)
+                    found = True
+                    break
+            if not found:
+                return False
+        return True
+
+    def mut_receivers(self, ctx: Ctx) -> List[Int]:
+        """Types in the pool with a `mut self` method callable here."""
+        var out = List[Int]()
+        for r in ctx.pool:
+            var rk = self.tkind[r]
+            if rk == INT or rk == RES:
+                continue
+            for m in self.methods_on(r, ctx.bounds):
+                if (
+                    self.methods[m].self_conv == CONV_MUT
+                    and self.methods[m].rank < ctx.rank
+                ):
+                    out.append(r)
+                    break
+        return out^
+
+    def mut_call_types(mut self, ctx: Ctx) -> List[Int]:
+        """Result types of the methods and non-generic functions with `mut`
+        arguments that can be called now."""
+        var out = List[Int]()
+        for r in ctx.pool.copy():
+            var rk = self.tkind[r]
+            if rk == INT or rk == RES:
+                continue
+            for m in self.methods_on(r, ctx.bounds):
+                if (
+                    self.has_mut(m)
+                    and self.methods[m].rank < ctx.rank
+                    and self.callable_here(ctx, m, r, True)
+                ):
+                    var ret = self.method_ret(m, r)
+                    if not has(out, ret):
+                        out.append(ret)
+        for f in range(len(self.fns)):
+            if (
+                len(self.fns[f].bounds) > 0
+                or self.fns[f].rank >= ctx.rank
+                or not has(self.fns[f].convs, CONV_MUT)
+            ):
+                continue
+            var needed = List[Int]()
+            for j in range(len(self.fns[f].params)):
+                if self.fns[f].convs[j] == CONV_MUT:
+                    needed.append(self.fns[f].params[j])
+            if self.places_for(ctx, needed) and not has(out, self.fns[f].ret):
+                out.append(self.fns[f].ret)
+        return out^
+
+    def gen_arg(
+        mut self,
+        mut data: ConjectureData,
+        mut ctx: Ctx,
+        ty: Int,
+        conv: Int,
+        size: Int,
+    ) raises -> Int:
+        if conv == CONV_MUT:
+            return self.take_place(data, ctx, ty)
+        return self.gen(
+            data, ctx, ty, size, P_OWNED if conv == CONV_VAR else P_READ
+        )
+
+    def gen(
+        mut self,
+        mut data: ConjectureData,
+        mut ctx: Ctx,
+        ty: Int,
+        size: Int,
+        pos: Int,
+        root: Bool = False,
+        stmt_root: Bool = False,
+        prefer_mut: Bool = False,
+    ) raises -> Int:
+        """An expression of type ty in ctx (Γ ⊢ ? : ty), for position pos.
+        At the root of an entry point, only calls and associated constants,
+        if there are any. Calls with `mut` arguments only at the root of a
+        statement; with prefer_mut, only those if there are any."""
+        var kind = self.tkind[ty]
+        var cap = self.cap_of(ty, ctx.bounds)
+
+        # T-Var, and fields of variables (so that `self.f0` is a ground
+        # term for `Self.T`), each used as the position allows
+        var atom_vars = List[Int]()
+        var atom_fields = List[Int]()
+        var atom_modes = List[Int]()
+        for v in range(len(ctx.types)):
+            if not ctx.live[v] or ctx.excl[v]:
+                continue
+            if ctx.types[v] == ty:
+                if pos == P_READ or cap == CAP_IC:
+                    atom_vars.append(v)
+                    atom_fields.append(-1)
+                    atom_modes.append(A_PLAIN)
+                if pos == P_OWNED and cap == CAP_C:
+                    atom_vars.append(v)
+                    atom_fields.append(-1)
+                    atom_modes.append(A_COPY)
+                if (
+                    pos == P_OWNED
+                    and ctx.kinds[v] == V_OWNED
+                    and not ctx.touched[v]
+                    and ctx.no_move == 0
+                ):
+                    atom_vars.append(v)
+                    atom_fields.append(-1)
+                    atom_modes.append(A_MOVE)
+            var fs = self.fields_of(ctx.types[v])
+            for f in range(len(fs)):
+                if fs[f] != ty:
+                    continue
+                if pos == P_READ or cap == CAP_IC:
                     atom_vars.append(v)
                     atom_fields.append(f)
+                    atom_modes.append(A_PLAIN)
+                elif cap == CAP_C:
+                    atom_vars.append(v)
+                    atom_fields.append(f)
+                    atom_modes.append(A_COPY)
         var makes = self.make_candidates(ctx, ty)
 
         # candidates for each rule; FJ: one rule among the possible ones
@@ -868,17 +1590,22 @@ struct Program(Movable):
         if size > 0:
             for i in range(len(ctx.pool)):
                 var r = ctx.pool[i]
-                if self.tkind[r] == INT:
+                var rk = self.tkind[r]
+                if rk == INT:
                     continue
-                var fs = self.fields_of(r)
-                for f in range(len(fs)):
-                    if fs[f] == ty:
-                        field_recv.append(r)
-                        field_idx.append(f)
+                if pos == P_READ or cap >= CAP_C:
+                    var fs = self.fields_of(r)
+                    for f in range(len(fs)):
+                        if fs[f] == ty:
+                            field_recv.append(r)
+                            field_idx.append(f)
+                if rk == RES:
+                    continue
                 for m in self.methods_on(r, ctx.bounds):
                     if (
                         self.methods[m].rank < ctx.rank
                         and self.method_ret(m, r) == ty
+                        and self.callable_here(ctx, m, r, stmt_root)
                     ):
                         meth_recv.append(r)
                         meth_id.append(m)
@@ -892,10 +1619,18 @@ struct Program(Movable):
             for f in range(len(self.fns)):
                 if self.fns[f].rank >= ctx.rank:
                     continue
-                if (
-                    len(self.call_assignment(f, ty, ctx)) > 0
-                    or len(self.fns[f].bounds) == 0
-                    and self.fns[f].ret == ty
+                if has(self.fns[f].convs, CONV_MUT):
+                    if not stmt_root:
+                        continue
+                    if len(self.fns[f].bounds) == 0:
+                        var needed = List[Int]()
+                        for j in range(len(self.fns[f].params)):
+                            if self.fns[f].convs[j] == CONV_MUT:
+                                needed.append(self.fns[f].params[j])
+                        if not self.places_for(ctx, needed):
+                            continue
+                if len(self.call_assignment(f, ty, ctx)) > 0 or (
+                    len(self.fns[f].bounds) == 0 and self.fns[f].ret == ty
                 ):
                     call_fn.append(f)
 
@@ -906,7 +1641,7 @@ struct Program(Movable):
         var rules = List[Int]()
         if kind == INT or len(atom_vars) > 0:
             rules.append(R_ATOM)
-        if kind == STRUCT:
+        if kind == STRUCT or kind == RES:
             rules.append(R_NEW)
         if len(makes) > 0:
             rules += [R_MAKE, R_MAKE]
@@ -922,6 +1657,26 @@ struct Program(Movable):
                 rules += [R_K, R_K]
             if len(call_fn) > 0:
                 rules += [R_CALL, R_CALL, R_CALL]
+        if prefer_mut:
+            var mr = List[Int]()
+            var mm = List[Int]()
+            for i in range(len(meth_id)):
+                if self.has_mut(meth_id[i]):
+                    mr.append(meth_recv[i])
+                    mm.append(meth_id[i])
+            var mf = List[Int]()
+            for f in call_fn:
+                if has(self.fns[f].convs, CONV_MUT):
+                    mf.append(f)
+            if len(mm) > 0 or len(mf) > 0:
+                meth_recv = mr^
+                meth_id = mm^
+                call_fn = mf^
+                rules = List[Int]()
+                if len(meth_id) > 0:
+                    rules.append(R_METHOD)
+                if len(call_fn) > 0:
+                    rules.append(R_CALL)
         if root:
             var calls = List[Int]()
             for r in rules:
@@ -930,11 +1685,57 @@ struct Program(Movable):
             if len(calls) > 0:
                 rules = calls^
         if len(rules) == 0:
-            raise Error(String("generator: no rule for ", self.cty(ty, ctx)))
-        var rule = rules[pick(data, len(rules))]
+            raise Error("STUCK")
+        # Try a rule; if it gets stuck (a `mut` place or the only variable
+        # of a type parameter's type was taken earlier in the statement),
+        # restore Γ and try another: bounded backtracking, which fj-qc
+        # avoids and Pałka et al. use.
+        var c = Cands(
+            atom_vars^,
+            atom_fields^,
+            atom_modes^,
+            makes^,
+            field_recv^,
+            field_idx^,
+            meth_recv^,
+            meth_id^,
+            k_recv^,
+            k_trait^,
+            call_fn^,
+        )
+        while len(rules) > 0:
+            var rule = rules[pick(data, len(rules))]
+            var saved = ctx.copy()
+            try:
+                return self.apply_rule(data, ctx, rule, ty, size, pos, c)
+            except e:
+                if String(e) != "STUCK":
+                    raise e^
+                ctx = saved^
+                var rest = List[Int]()
+                for r in rules:
+                    if r != rule:
+                        rest.append(r)
+                rules = rest^
+        raise Error("STUCK")
+
+    def apply_rule(
+        mut self,
+        mut data: ConjectureData,
+        mut ctx: Ctx,
+        rule: Int,
+        ty: Int,
+        size: Int,
+        pos: Int,
+        c: Cands,
+    ) raises -> Int:
+        var kind = self.tkind[ty]
+        var cap = self.cap_of(ty, ctx.bounds)
+        var sub = size - 1 if size > 0 else 0
+        var half = size // 2
 
         if rule == R_ATOM:
-            var n = len(atom_vars)
+            var n = len(c.atom_vars)
             var i = pick(data, n + 1 if kind == INT else n)
             if kind == INT and i == n:
                 var l = data.draw(integers(0, len(self.literals) - 1))
@@ -946,31 +1747,34 @@ struct Program(Movable):
                     [],
                     self.literals[l],
                 )
-            var v = atom_vars[i]
-            var var_e = self.add(E_VAR, v, ctx.types[v], [], [], ctx.names[v])
-            if atom_fields[i] < 0:
-                return var_e
-            return self.add(
-                E_FIELD,
-                atom_fields[i],
-                ty,
-                [var_e],
-                [],
-                String(ctx.names[v], ".f", atom_fields[i]),
-            )
+            var v = c.atom_vars[i]
+            var mode = c.atom_modes[i]
+            if mode == A_MOVE:
+                ctx.live[v] = False
+                ctx.move_depth[v] = ctx.depth
+                ctx.touched[v] = True
+                return self.add(
+                    E_MOVE, v, ty, [], [], String(ctx.names[v], "^")
+                )
+            ctx.touched[v] = True
+            var place = self.place_expr(ctx, v, c.atom_fields[i])
+            if mode == A_COPY:
+                var text = String(self.exprs[place].text, ".copy()")
+                return self.add(E_COPY, 0, ty, [place], [], text^)
+            return place
 
-        if rule == R_NEW:  # T-New
+        if rule == R_NEW:  # T-New: the fields are consumed
             var kids = List[Int]()
             for ft in self.fields_of(ty):
-                kids.append(self.gen(data, ctx, ft, sub))
+                kids.append(self.gen(data, ctx, ft, sub, P_OWNED))
             var text = String(
                 self.cty(ty, ctx), "(", self.args_text(kids, 0), ")"
             )
             return self.add(E_NEW, 0, ty, kids^, [], text^)
 
         if rule == R_MAKE:  # static call: τ.make<t>(e)
-            var m = makes[pick(data, len(makes))]
-            var arg = self.gen(data, ctx, self.int_ty, sub)
+            var m = c.makes[pick(data, len(c.makes))]
+            var arg = self.gen(data, ctx, self.int_ty, sub, P_READ)
             var text = String(
                 self.cty(ty, ctx),
                 ".",
@@ -983,8 +1787,8 @@ struct Program(Movable):
 
         if rule == R_BIN:
             var op = pick(data, comptime (len(BIN_OPS)))
-            var l = self.gen(data, ctx, ty, half)
-            var r = self.gen(data, ctx, ty, half)
+            var l = self.gen(data, ctx, ty, half, P_READ)
+            var r = self.gen(data, ctx, ty, half, P_READ)
             var ops = materialize[BIN_OPS]()
             var text = String(
                 "(",
@@ -997,12 +1801,14 @@ struct Program(Movable):
             )
             return self.add(E_BIN, op, ty, [l, r], [], text^)
 
-        if rule == R_TERN:
+        if rule == R_TERN:  # the branches are owned values, never moves
             var op = pick(data, comptime (len(CMP_OPS)))
-            var x = self.gen(data, ctx, self.int_ty, half)
-            var y = self.gen(data, ctx, self.int_ty, half)
-            var t = self.gen(data, ctx, ty, half)
-            var e = self.gen(data, ctx, ty, half)
+            var x = self.gen(data, ctx, self.int_ty, half, P_READ)
+            var y = self.gen(data, ctx, self.int_ty, half, P_READ)
+            ctx.no_move += 1
+            var t = self.gen(data, ctx, ty, half, P_OWNED)
+            var e = self.gen(data, ctx, ty, half, P_OWNED)
+            ctx.no_move -= 1
             var ops = materialize[CMP_OPS]()
             var text = String(
                 "(",
@@ -1019,19 +1825,33 @@ struct Program(Movable):
             )
             return self.add(E_TERN, op, ty, [x, y, t, e], [], text^)
 
-        if rule == R_FIELD:  # T-Field
-            var i = pick(data, len(field_recv))
-            var recv = self.gen(data, ctx, field_recv[i], sub)
-            var text = String(self.exprs[recv].text, ".f", field_idx[i])
-            return self.add(E_FIELD, field_idx[i], ty, [recv], [], text^)
+        if rule == R_FIELD:  # T-Field, copied when consumed
+            var i = pick(data, len(c.field_recv))
+            var recv = self.gen(data, ctx, c.field_recv[i], sub, P_READ)
+            var text = String(
+                self.exprs[recv].text,
+                ".",
+                self.field_name(c.field_recv[i], c.field_idx[i]),
+            )
+            var fe = self.add(E_FIELD, c.field_idx[i], ty, [recv], [], text^)
+            if pos == P_OWNED and cap == CAP_C:
+                var ctext = String(self.exprs[fe].text, ".copy()")
+                return self.add(E_COPY, 0, ty, [fe], [], ctext^)
+            return fe
 
         if rule == R_METHOD:  # T-Invk
-            var i = pick(data, len(meth_recv))
-            var r = meth_recv[i]
-            var m = meth_id[i]
-            var kids: List[Int] = [self.gen(data, ctx, r, sub)]
-            for pt in self.method_params(m, r):
-                kids.append(self.gen(data, ctx, pt, half))
+            var i = pick(data, len(c.meth_recv))
+            var r = c.meth_recv[i]
+            var m = c.meth_id[i]
+            var kids = List[Int]()
+            if self.methods[m].self_conv == CONV_MUT:
+                kids.append(self.take_place(data, ctx, r))
+            else:
+                kids.append(self.gen(data, ctx, r, sub, P_READ))
+            var params = self.method_params(m, r)
+            var convs = self.methods[m].convs.copy()
+            for j in range(len(params)):
+                kids.append(self.gen_arg(data, ctx, params[j], convs[j], half))
             var text = String(
                 self.exprs[kids[0]].text,
                 ".",
@@ -1043,13 +1863,13 @@ struct Program(Movable):
             return self.add(E_METHOD, m, ty, kids^, [], text^)
 
         if rule == R_K:  # an associated constant: τ.K<t>
-            var i = pick(data, len(k_recv))
-            var text = String(self.cty(k_recv[i], ctx), ".K", k_trait[i])
-            return self.add(E_K, k_trait[i], ty, [], [k_recv[i]], text^)
+            var i = pick(data, len(c.k_recv))
+            var text = String(self.cty(c.k_recv[i], ctx), ".K", c.k_trait[i])
+            return self.add(E_K, c.k_trait[i], ty, [], [c.k_recv[i]], text^)
 
         # R_CALL: a free or generic function; T-UCast's counterpart is
         # passing a conforming type for a bounded parameter
-        var f = call_fn[pick(data, len(call_fn))]
+        var f = c.call_fn[pick(data, len(c.call_fn))]
         var targs = List[Int]()
         var n_tp = len(self.fns[f].bounds)
         if n_tp > 0:
@@ -1061,9 +1881,10 @@ struct Program(Movable):
         var params = self.fns[f].params.copy()
         if n_tp > 0:
             params = self.subst_all(params, targs)
+        var convs = self.fns[f].convs.copy()
         var kids = List[Int]()
-        for pt in params:
-            kids.append(self.gen(data, ctx, pt, half))
+        for j in range(len(params)):
+            kids.append(self.gen_arg(data, ctx, params[j], convs[j], half))
         var text = self.fns[f].name
         if n_tp > 0 and data.draw(booleans()):  # explicit type arguments
             text += "["
@@ -1102,15 +1923,42 @@ struct Program(Movable):
                 return []
         return assign^
 
-    # ---- the reference semantics: big-step, call by value
+    # ---- the reference semantics: big-step, call by value, with a store
+    # of variable slots; `mut` arguments are copied in and written back
+    # (Mojo's exclusivity rules make that the same as by reference)
 
-    def new_int(mut self, x: Int) -> Int:
-        self.vtag.append(-1)
+    def new_value(mut self, tag: Int, x: Int, var kids: List[Int]) -> Int:
+        self.vtag.append(tag)
         self.vint.append(x)
-        self.vkids.append([])
+        self.vkids.append(kids^)
         return len(self.vtag) - 1
 
-    def eval(mut self, e: Int, vars: List[Int], targs: List[Int]) raises -> Int:
+    def new_int(mut self, x: Int) -> Int:
+        return self.new_value(-1, x, [])
+
+    def read_place(self, e: Int, frame: List[Int]) raises -> Int:
+        if self.exprs[e].kind == E_VAR:
+            var v = frame[self.exprs[e].a]
+            if v < 0:
+                raise Error("evaluator: read of a moved variable")
+            return v
+        var base = self.read_place(self.exprs[e].kids[0], frame)
+        return self.vkids[base][self.exprs[e].a]
+
+    def write_place(mut self, e: Int, v: Int, mut frame: List[Int]) raises:
+        if self.exprs[e].kind == E_VAR:
+            frame[self.exprs[e].a] = v
+            return
+        var kid = self.exprs[e].kids[0]
+        var base = self.read_place(kid, frame)
+        var kids = self.vkids[base].copy()
+        kids[self.exprs[e].a] = v
+        var updated = self.new_value(self.vtag[base], self.vint[base], kids^)
+        self.write_place(kid, updated, frame)
+
+    def eval(
+        mut self, e: Int, mut frame: List[Int], targs: List[Int]
+    ) raises -> Int:
         self.steps += 1
         if self.steps > STEP_LIMIT:
             raise Error("STEP_LIMIT")
@@ -1120,10 +1968,20 @@ struct Program(Movable):
         if kind == E_LIT:
             return self.new_int(a)
         if kind == E_VAR:
-            return vars[a]
+            return self.read_place(e, frame)
+        if kind == E_MOVE:
+            self.stats[STAT_MOVE] += 1
+            var v = frame[a]
+            if v < 0:
+                raise Error("evaluator: move of a moved variable")
+            frame[a] = -1
+            return v
+        if kind == E_COPY:
+            self.stats[STAT_COPY] += 1
+            return self.eval(kids[0], frame, targs)
         if kind == E_BIN:
-            var x = self.vint[self.eval(kids[0], vars, targs)]
-            var y = self.vint[self.eval(kids[1], vars, targs)]
+            var x = self.vint[self.eval(kids[0], frame, targs)]
+            var y = self.vint[self.eval(kids[1], frame, targs)]
             var r: Int
             if a == 0:
                 r = x + y
@@ -1139,32 +1997,31 @@ struct Program(Movable):
                 r = x ^ y
             return self.new_int(r)
         if kind == E_TERN:
-            var x = self.vint[self.eval(kids[0], vars, targs)]
-            var y = self.vint[self.eval(kids[1], vars, targs)]
-            var c = x < y if a == 0 else (x == y if a == 1 else x != y)
-            return self.eval(kids[2] if c else kids[3], vars, targs)
+            var x = self.vint[self.eval(kids[0], frame, targs)]
+            var y = self.vint[self.eval(kids[1], frame, targs)]
+            if self.compare(a, x, y):
+                return self.eval(kids[2], frame, targs)
+            return self.eval(kids[3], frame, targs)
         if kind == E_FIELD:
-            var v = self.eval(kids[0], vars, targs)
+            var v = self.eval(kids[0], frame, targs)
             return self.vkids[v][a]
         if kind == E_NEW:
             var ty = self.subst(self.exprs[e].ty, targs)
             var vals = List[Int]()
             for k in kids:
-                vals.append(self.eval(k, vars, targs))
-            self.vtag.append(self.tid[ty])
-            self.vint.append(0)
-            self.vkids.append(vals^)
-            return len(self.vtag) - 1
+                vals.append(self.eval(k, frame, targs))
+            if self.tkind[ty] == RES:
+                self.stats[STAT_RES] += 1
+                return self.new_value(-2, 0, vals^)
+            return self.new_value(self.tid[ty], 0, vals^)
         if kind == E_METHOD:
             var recv_ty = self.subst(self.exprs[kids[0]].ty, targs)
-            var vals = List[Int]()
-            for k in kids:
-                vals.append(self.eval(k, vars, targs))
-            return self.call_method(a, recv_ty, vals^)
+            var convs: List[Int] = [self.methods[a].self_conv]
+            convs += self.methods[a].convs.copy()
+            return self.call(a, -1, recv_ty, kids, convs, frame, targs, [])
         if kind == E_STATIC:
             var ty = self.subst(self.exprs[e].tys[0], targs)
-            var vals: List[Int] = [self.eval(kids[0], vars, targs)]
-            return self.call_method(a, ty, vals^)
+            return self.call(a, -1, ty, kids, [CONV_READ], frame, targs, [])
         if kind == E_K:
             self.stats[STAT_K] += 1
             var ty = self.subst(self.exprs[e].tys[0], targs)
@@ -1173,21 +2030,99 @@ struct Program(Movable):
         if len(self.fns[a].bounds) > 0:
             self.stats[STAT_GENERIC] += 1
         var f_targs = self.subst_all(self.exprs[e].tys.copy(), targs)
-        var vals = List[Int]()
-        for k in kids:
-            vals.append(self.eval(k, vars, targs))
-        return self.run_body(self.fns[a].body, vals^, f_targs)
+        var convs = self.fns[a].convs.copy()
+        return self.call(-1, a, -1, kids, convs, frame, targs, f_targs)
+
+    def compare(self, op: Int, x: Int, y: Int) -> Bool:
+        if op == 0:
+            return x < y
+        return x == y if op == 1 else x != y
+
+    def call(
+        mut self,
+        m: Int,
+        f: Int,
+        recv_ty: Int,
+        args: List[Int],
+        convs: List[Int],
+        mut frame: List[Int],
+        targs: List[Int],
+        f_targs: List[Int],
+    ) raises -> Int:
+        """Calls method m (receiver type recv_ty) or function f (type
+        arguments f_targs): evaluates the arguments in order (in the
+        caller's targs), runs the body, then writes the `mut` ones back."""
+        var callee = List[Int]()
+        var has_mut = False
+        for i in range(len(args)):
+            if convs[i] == CONV_MUT:
+                callee.append(self.read_place(args[i], frame))
+                has_mut = True
+            else:
+                callee.append(self.eval(args[i], frame, targs))
+        var result: Int
+        if f >= 0:
+            result = self.run_body(self.fns[f].body, callee, f_targs)
+        else:
+            result = self.call_method(m, recv_ty, callee)
+        if has_mut:
+            self.stats[STAT_MUT_CALL] += 1
+            for i in range(len(args)):
+                if convs[i] == CONV_MUT:
+                    self.write_place(args[i], callee[i], frame)
+        return result
 
     def run_body(
-        mut self, b: Int, var vars: List[Int], targs: List[Int]
+        mut self, b: Int, mut frame: List[Int], targs: List[Int]
     ) raises -> Int:
-        var lets = self.bodies[b].lets.copy()
-        for l in lets:
-            vars.append(self.eval(l, vars, targs))
-        return self.eval(self.bodies[b].ret, vars, targs)
+        # the body's own locals stay in scope for its result
+        for s in self.bodies[b].stmts.copy():
+            self.exec(s, frame, targs)
+        return self.eval(self.bodies[b].ret, frame, targs)
+
+    def exec_block(
+        mut self, stmts: List[Int], mut frame: List[Int], targs: List[Int]
+    ) raises:
+        var n = len(frame)
+        for s in stmts:
+            self.exec(s, frame, targs)
+        while len(frame) > n:
+            _ = frame.pop()
+
+    def exec(mut self, s: Int, mut frame: List[Int], targs: List[Int]) raises:
+        self.steps += 1
+        if self.steps > STEP_LIMIT:
+            raise Error("STEP_LIMIT")
+        var kind = self.stmts[s].kind
+        var e = self.stmts[s].e
+        if kind == S_VAR:
+            frame.append(self.eval(e, frame, targs))
+        elif kind == S_ASSIGN:
+            self.stats[STAT_ASSIGN] += 1
+            var v = self.eval(e, frame, targs)
+            self.write_place(self.stmts[s].target, v, frame)
+        elif kind == S_EXPR:
+            _ = self.eval(e, frame, targs)
+        elif kind == S_USE:
+            for st in self.stmts[s].body.copy():
+                self.exec(st, frame, targs)
+        elif kind == S_IF:
+            var x = self.vint[self.eval(e, frame, targs)]
+            var y = self.vint[self.eval(self.stmts[s].e2, frame, targs)]
+            if self.compare(self.stmts[s].a, x, y):
+                self.exec_block(self.stmts[s].body.copy(), frame, targs)
+            else:
+                self.exec_block(self.stmts[s].orelse.copy(), frame, targs)
+        else:
+            var body = self.stmts[s].body.copy()
+            for i in range(self.stmts[s].a):
+                self.stats[STAT_LOOP] += 1
+                frame.append(self.new_int(i))
+                self.exec_block(body, frame, targs)
+                _ = frame.pop()
 
     def call_method(
-        mut self, m: Int, recv_ty: Int, var vals: List[Int]
+        mut self, m: Int, recv_ty: Int, mut frame: List[Int]
     ) raises -> Int:
         """Static dispatch on the receiver's type, resolved: the struct's
         own body, its implementation, or the trait's default."""
@@ -1199,7 +2134,7 @@ struct Program(Movable):
             targs.append(self.targ[recv_ty])
         if self.methods[m].struct_id >= 0:
             self.stats[STAT_OWN] += 1
-            return self.run_body(self.methods[m].body, vals^, targs)
+            return self.run_body(self.methods[m].body, frame, targs)
         if self.methods[m].is_static:
             self.stats[STAT_STATIC] += 1
         var i = index_of(self.structs[s].impl_methods, m)
@@ -1207,9 +2142,9 @@ struct Program(Movable):
             self.stats[
                 STAT_OVERRIDE if self.methods[m].has_default else STAT_REQUIRED
             ] += 1
-            return self.run_body(self.structs[s].impl_bodies[i], vals^, targs)
+            return self.run_body(self.structs[s].impl_bodies[i], frame, targs)
         self.stats[STAT_DEFAULT] += 1
-        return self.run_body(self.methods[m].body, vals^, [recv_ty])
+        return self.run_body(self.methods[m].body, frame, [recv_ty])
 
     def k_value(mut self, ty: Int, t: Int) raises -> Int:
         var s = self.tid[ty]
@@ -1225,13 +2160,63 @@ struct Program(Movable):
 
     # ---- printing
 
-    def body_text(self, b: Int, indent: String) -> String:
+    def block_text(self, stmts: List[Int], indent: String) -> String:
+        if len(stmts) == 0:
+            return String(indent, "pass\n")
         var s = String()
-        ref body = self.bodies[b]
-        for k in range(len(body.lets)):
-            s += String(
-                indent, "var v", k, " = ", self.exprs[body.lets[k]].text, "\n"
+        for st in stmts:
+            s += self.stmt_text(st, indent)
+        return s^
+
+    def stmt_text(self, st: Int, indent: String) -> String:
+        ref s = self.stmts[st]
+        if s.kind == S_VAR:
+            return String(
+                indent, "var ", s.name, " = ", self.exprs[s.e].text, "\n"
             )
+        if s.kind == S_ASSIGN:
+            return String(
+                indent,
+                self.exprs[s.target].text,
+                " = ",
+                self.exprs[s.e].text,
+                "\n",
+            )
+        if s.kind == S_EXPR:
+            return String(indent, "_ = ", self.exprs[s.e].text, "\n")
+        if s.kind == S_USE:
+            if s.e >= 0:
+                return String(indent, "_use(", self.exprs[s.e].text, ")\n")
+            var group = String()
+            for st in s.body:
+                group += self.stmt_text(st, indent)
+            return group^
+        var inner = String(indent, "    ")
+        if s.kind == S_IF:
+            var ops = materialize[CMP_OPS]()
+            var text = String(
+                indent,
+                "if ",
+                self.exprs[s.e].text,
+                " ",
+                ops[s.a],
+                " ",
+                self.exprs[s.e2].text,
+                ":\n",
+            )
+            text += self.block_text(s.body, inner)
+            text += String(indent, "else:\n")
+            text += self.block_text(s.orelse, inner)
+            return text^
+        var text = String(indent, "for ", s.name, " in range(", s.a, "):\n")
+        text += self.block_text(s.body, inner)
+        return text^
+
+    def body_text(self, b: Int, indent: String) -> String:
+        ref body = self.bodies[b]
+        var s = String()
+        for st in body.stmts:
+            s += self.stmt_text(st, indent)
         s += String(indent, "return ", self.exprs[body.ret].text, "\n")
         return s^
 
@@ -1251,26 +2236,41 @@ struct Program(Movable):
                 self.ty_str(ret, names, self_print),
                 ":\n",
             )
-        var s = String("    def ", self.methods[m].name, "(self")
+        var prefixes = materialize[CONV_PREFIX]()
+        var s = String(
+            "    def ",
+            self.methods[m].name,
+            "(",
+            prefixes[self.methods[m].self_conv],
+            "self",
+        )
         for i in range(len(params)):
             s += String(
-                ", p", i, ": ", self.ty_str(params[i], names, self_print)
+                ", ",
+                prefixes[self.methods[m].convs[i]],
+                "p",
+                i,
+                ": ",
+                self.ty_str(params[i], names, self_print),
             )
         s += String(") -> ", self.ty_str(ret, names, self_print), ":\n")
         return s^
 
     def declarations_text(mut self) -> String:
-        var s = String("from std.benchmark import black_box\n\n\n")
+        var s = String()
         var self_names: List[String] = ["Self"]
+        var cap_names = materialize[CAP_NAMES]()
         for t in range(len(self.traits)):
             s += String("trait Tr", t, "(")
             ref parents = self.traits[t].parents
             if len(parents) == 0:
-                s += "ImplicitlyCopyable, Deinitable"
+                s += String(cap_names[self.traits[t].cap], ", Deinitable")
             for i in range(len(parents)):
                 if i > 0:
                     s += ", "
                 s += String("Tr", parents[i])
+            if self.traits[t].strengthens:
+                s += ", ImplicitlyCopyable"
             s += "):\n"
             if self.traits[t].has_k:
                 s += String("    comptime K", t, ": Int\n")
@@ -1295,14 +2295,9 @@ struct Program(Movable):
             s += String("@fieldwise_init\nstruct ", self.structs[st].name)
             if generic:
                 s += String("[T: Tr", self.structs[st].bound, "]")
-            s += "("
-            ref traits = self.structs[st].traits
-            if len(traits) == 0:
-                s += "ImplicitlyCopyable"
-            for i in range(len(traits)):
-                if i > 0:
-                    s += ", "
-                s += String("Tr", traits[i])
+            s += String("(", cap_names[self.structs[st].cap])
+            for t in self.structs[st].traits:
+                s += String(", Tr", t)
             s += "):\n"
             for f in range(len(self.structs[st].fields)):
                 s += String(
@@ -1348,6 +2343,7 @@ struct Program(Movable):
                 s += self.body_text(b, "        ")
             s += "\n\n"
         var fn_names: List[String] = ["T", "U"]
+        var prefixes = materialize[CONV_PREFIX]()
         for f in range(len(self.fns)):
             ref fd = self.fns[f]
             s += String("def ", fd.name)
@@ -1363,7 +2359,11 @@ struct Program(Movable):
                 if i > 0:
                     s += ", "
                 s += String(
-                    "p", i, ": ", self.ty_str(fd.params[i], fn_names, -1)
+                    prefixes[fd.convs[i]],
+                    "p",
+                    i,
+                    ": ",
+                    self.ty_str(fd.params[i], fn_names, -1),
                 )
             s += String(") -> ", self.ty_str(fd.ret, fn_names, -1), ":\n")
             s += self.body_text(fd.body, "    ")
@@ -1380,8 +2380,16 @@ def draw_program(
 ) raises -> Tuple[String, String, String]:
     """The program, its compile-time twin, and the expected output."""
     var p = Program()
-    p.draw_declarations(data)
-    p.draw_bodies(data)
+    try:
+        p.draw_declarations(data)
+        p.draw_bodies(data)
+    except e:
+        # an expression whose `mut` places were taken by earlier arguments
+        if String(e) == "STUCK":
+            if getenv("DECL_FUZZ_STATS") != "":
+                print("stuck")
+            assume(False)
+        raise e^
     var arg_lists = List[List[Int]]()
     for _ in range(data.draw(integers(1, 3))):
         var args = List[Int]()
@@ -1393,8 +2401,11 @@ def draw_program(
         arg_lists.append(args^)
 
     var decls = p.declarations_text()
-    var program = String(decls, "def main():\n")
-    var comptime_program = String(decls, "def main():\n")
+    var program = String(PRELUDE_HEAD, RUN_TIME_RES, decls, "def main():\n")
+    program += "    _ledger_init()\n"
+    var comptime_program = String(
+        PRELUDE_HEAD, COMPILE_TIME_RES, decls, "def main():\n"
+    )
     var expected = String()
     for i in range(len(p.entries)):
         for j in range(len(arg_lists)):
@@ -1411,6 +2422,7 @@ def draw_program(
             program += String(
                 '    print("c", ', i, ", run_f", i, "(", args, "))\n"
             )
+            program += String("    _check(", i, ")\n")
             program += String(
                 '    print("b", ',
                 i,
@@ -1420,17 +2432,18 @@ def draw_program(
                 hidden,
                 ")))\n",
             )
+            program += String("    _check(", i, ")\n")
             var name = String("k", i, "_", j)
             comptime_program += String(
                 "    comptime ", name, " = run_f", i, "(", args, ")\n"
             )
             comptime_program += String('    print("c", ', i, ", ", name, ")\n")
-            var vals = List[Int]()
+            var frame = List[Int]()
             for k in range(3):
-                vals.append(p.new_int(arg_lists[j][k]))
+                frame.append(p.new_int(arg_lists[j][k]))
             var v: Int
             try:
-                v = p.vint[p.run_body(p.entries[i], vals^, [])]
+                v = p.vint[p.run_body(p.entries[i], frame, [])]
             except e:
                 if String(e) == "STEP_LIMIT":
                     assume(False)

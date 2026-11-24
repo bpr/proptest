@@ -11,6 +11,7 @@
 #   BUILD_TIMEOUT <which>     the compiler ran for over $BUILD_TIMEOUT s
 #   BUILD_FAIL <which>        the compiler rejected the program
 #   RUN_FAIL O0=s O3=s        a build crashed or hung (exit statuses)
+#   UNBALANCED                a Res wasn't destroyed exactly once
 #   DIFF_O3                   -O0 and -O3 print different results
 #   DIFF_COMPTIME             compile time and run time (-O0) differ
 #   DIFF_EXPECTED             -O0 differs from the generator's evaluation
@@ -62,6 +63,11 @@ run_o3=$?
 if [ $run_o0 -ne 0 ] || [ $run_o3 -ne 0 ]; then
     echo "RUN_FAIL O0=$run_o0 O3=$run_o3"
     diff out_o0.txt out_o3.txt | head -10
+    exit 0
+fi
+if grep -q UNBALANCED out_o0.txt out_o3.txt; then
+    echo UNBALANCED
+    grep -H UNBALANCED out_o0.txt out_o3.txt | head -10
     exit 0
 fi
 if ! cmp -s out_o0.txt out_o3.txt; then

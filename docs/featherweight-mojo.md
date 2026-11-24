@@ -13,13 +13,20 @@ well-typed programs.
 FM is to the declaration side of Mojo what FJ is to Java: traits with
 refinement, required and default methods, static constructors and
 associated constants; concrete and generic structs conforming to them;
-and generic functions over trait bounds. Like FJ, it is purely
-functional. Every program terminates.
+and generic functions over trait bounds. Every program terminates.
 
-This is stage 1. Stage 2 adds ownership (`var`/`mut` arguments, moves
-with `^`, `ref` results). Stage 3 adds programs made ill-typed on
-purpose, which the compiler must reject without crashing. See "Beyond
-stage 1" at the end.
+FM comes in two stages, both implemented:
+- **Stage 1** (the sections from "Syntax" to "Differences from fj-qc")
+  is the purely functional core. Every type is `ImplicitlyCopyable`.
+- **Stage 2** ("Stage 2: ownership") adds ownership on top:
+  - `Copyable` and `Movable`-only types, with `.copy()` and moves (`^`);
+  - `mut` and `var` arguments and `mut self`;
+  - statements that assign variables and fields, `if`, and bounded `for`;
+  - a resource type that counts its destructions.
+
+Stage 2 found two compiler bugs in its first rounds (see "Findings").
+Stage 3 would add programs made ill-typed on purpose, which the compiler
+must reject without crashing ("Beyond stage 2").
 
 ## Syntax
 
@@ -301,6 +308,7 @@ evaluation:
 | `BUILD_FAIL` | The compiler rejected the program: a generator bug, or a front-end bug rejecting a well-typed program |
 | `BUILD_CRASH`, `BUILD_TIMEOUT` | The compiler crashed or ran too long |
 | `RUN_FAIL` | A build crashed or hung |
+| `UNBALANCED` | (Stage 2) A `Res` was destroyed fewer or more times than it was made |
 | `DIFF_O3` | -O0 and -O3 disagree: an optimizer bug |
 | `DIFF_COMPTIME` | The compile-time interpreter disagrees with -O0 |
 | `DIFF_EXPECTED` | All three builds agree, but with each other, not with the reference semantics |
@@ -362,14 +370,228 @@ results agreed.
 - fj-qc's `T-DCast` and `T-SCast` candidates are computed but never used.
   FM has no casts.
 
-## Beyond stage 1
+## Stage 2: ownership
+
+Stage 2 extends every part of stage 1: the syntax, Γ, the typing rules,
+the evaluator and the generator. Its environment is close to the
+effect-tracking one of Midtgaard et al., *Effect-driven QuickChecking of
+compilers* (ICFP 2017): the generator knows, at each point, which
+variables are live and what the current statement has done with them.
+
+### Syntax
+
+```text
+TD  ::= trait Tr_t(Copyable, Deinitable | ImplicitlyCopyable, Deinitable
+                   | Tr_p, ... [, ImplicitlyCopyable]): ...
+SD  ::= @fieldwise_init struct S_s(κ, Tr_t, ...): ...
+κ   ::= Movable | Copyable | ImplicitlyCopyable          capability
+
+MS, M ::= def m_i(ς self, c p0: τ, ...) -> τ: ...
+ς   ::= (read) | mut                                    self convention
+c   ::= (read) | mut | var                              argument convention
+
+τ   ::= ... | Res          prelude: Copyable, one field `val: Int`
+
+BODY ::= s* return e
+s   ::= var v = e | x = e | x.f_k = e | _ = e
+      | if e ⋈ e: s* else: s*
+      | for i in range(n): s*                            n in 0..3
+
+e   ::= ... | x^ | e.copy() | Res(e)
+```
+
+### Capabilities
+
+A type's capability is one of `Movable`, `Copyable` and
+`ImplicitlyCopyable`, ordered from weakest to strongest:
+- `Int` is `ImplicitlyCopyable` and `Res` is `Copyable`;
+- a struct has the capability it declares;
+- a type parameter has its bound's.
+
+Well-formedness gains three conditions:
+
+7. **Traits are copyable.** A root trait refines `Copyable` or
+   `ImplicitlyCopyable` (and `Deinitable`). A refining trait inherits
+   the strongest capability of its parents and may add
+   `ImplicitlyCopyable`. So type parameters are always at least
+   `Copyable`: a read variable of type `T` gives a `T` with `.copy()`,
+   and every context has ground terms of its type parameters.
+8. **Fields are at least as capable as their struct.** A struct's field
+   types have its capability or a stronger one. A generic struct is at
+   most as capable as its bound.
+9. **Conformance needs capability.** A struct conforms only to traits
+   whose capability is no stronger than its own. So `Movable` structs
+   conform to no trait, and are never type arguments.
+
+### Γ and positions
+
+Γ maps each variable to its type, a **kind** and a **liveness**:
+
+| Kind | Variables | Assignable | Movable |
+|---|---|---|---|
+| read | read arguments, read `self`, loop variables | no | no |
+| mut | `mut` arguments, `mut self` | yes | no |
+| owned | `var` locals, `var` arguments | yes | yes |
+
+Every expression is drawn for a **position**:
+- **read (borrowed):** a read argument, a receiver, an operand.
+- **owned (consumed):** a `var` argument, a field of `τ(ē)`, the value
+  of a `var` or an assignment, a result, or a ternary branch.
+
+A place `x` or `x.f_k` of type τ can be used as follows:
+
+| Position | `ImplicitlyCopyable` | `Copyable` | `Movable` |
+|---|---|---|---|
+| read | `x` | `x` | `x` |
+| owned | `x` | `x.copy()` or `x^` | `x^` |
+
+Only a live variable of kind owned can be moved, and only as a whole
+(no partial moves in stage 2). Moving it makes it dead. Assigning a dead
+variable makes it live again.
+
+### Exclusivity within a statement
+
+Each statement keeps two sets: the variables it has **touched**
+(used in any way), and the ones it has passed as **`mut`**. Arguments
+are drawn left to right, receiver first, the same order Mojo evaluates
+them in. The rules:
+- **Reading** `x` needs x live and not passed as `mut`.
+- **Moving** `x` needs x untouched (and then kills it).
+- **Passing** `x` or `x.f_k` as `mut` needs x untouched. It then marks
+  x as passed, so the rest of the statement can't use it.
+
+So `g(x, x^)`, `x.m(x^)` and `g(x.f0, x)` with a `mut x` are never
+generated. A call with a `mut` argument (or `mut self`) appears only at
+the root of a statement, so its arguments contain no other `mut` calls.
+
+Moves happen only where they're unconditional: never inside a ternary
+branch.
+
+### Statements
+
+- `var v = e`: e is owned; v enters Γ as owned and live.
+- `x = e`: x is assignable, and live (or moved in the current block). e
+  may use x, and even move it (`x = g(x^)`). Then x is live.
+- `x.f_k = e`: x is live and assignable. Before e is drawn, x is marked
+  touched, so e may read x but not move it or pass it as `mut`.
+- `_ = e`: drawn as a call with `mut` arguments when one is possible.
+- **Blocks** (`if` branches and `for` bodies, nested at most twice):
+  - their locals go out of scope at the end;
+  - an outer variable live at a block's start is live at its end: a
+    variable the block moved gets reassigned at its end;
+  - outer variables that were dead at the start can't be reassigned in
+    the block.
+
+  So after an `if` every variable is either surely live or surely dead.
+  Mojo would have to track a "maybe moved" state, which FM avoids.
+
+### Evaluation with a store
+
+The evaluator keeps a frame of variable slots, with a hole for a moved
+variable. Values are immutable trees, so a field assignment rebuilds
+the path to the field.
+- **`mut` arguments:** the callee gets a copy, and when it returns,
+  the copy is written back to the caller's place (copy-in/copy-out).
+  Mojo's exclusivity rules make that the same as passing by reference.
+- **`var` arguments and `.copy()`** just pass the value. With value
+  semantics, a copy is indistinguishable from the original.
+- **Block locals** are popped at the end of the block.
+- **Moves** read the slot and empty it, so a generator bug that uses a
+  moved variable shows up as an evaluator error.
+
+**Checksums.** An entry point keeps its result in a variable. It then
+returns that result plus every Int reachable from its live owned
+variables (field paths up to 3 deep, at most 8 per variable), as Csmith
+does. Without this, `mut` calls and field assignments rarely reached the
+printed output: an evaluator that never wrote `mut` arguments back went
+unnoticed in 400 programs.
+
+**Destruction.** The evaluator doesn't model destruction. `Res`
+counts its constructions and copies minus its destructions, at a fixed
+address (`mmap`, since Mojo has no globals). `main` checks the count
+after each entry point and prints `UNBALANCED` if it isn't zero. The
+`comptime` twin gets a `Res` without the count.
+
+### Generation
+
+Stage 2 adds the following to the generator:
+- **Capabilities:** a struct's capability is drawn first (its
+  strongest possible one is where shrinking leads), then its fields and
+  conformances to match.
+- **Conventions:** read 1/2, `var` 1/3 and `mut` 1/6 for arguments,
+  and `mut self` 1/4. `mut` arguments are rarer because they confine a
+  call to the roots of statements.
+- **Statements:** bodies have 0 to 3 statements before the result, and
+  entry points up to 5. A `var` picks a type with `mut` methods half
+  the time. `_ = e` statements are weighted up when a `mut` call is
+  possible.
+- **Backtracking:** after a statement has moved or `mut`-borrowed the
+  only variable of some type, a later argument of that type can get
+  stuck. `gen` then restores Γ and tries another rule; a statement that
+  still gets stuck becomes `var vN = <an Int>`. This is the backtracking
+  fj-qc avoids and Pałka et al. use. It brought rejected test cases
+  from 22% down to 1 to 3%.
+
+Coverage, number of programs out of 200 (seed 1) whose evaluation
+reached each path (`DECL_FUZZ_STATS=1`), after the tuning above:
+
+| own | required | override | default | static | generic | K | `mut` call | move | copy | assign | loop | Res |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 92 | 55 | 12 | 16 | 33 | 4 | 47 | 38 | 60 | 81 | 101 | 101 | 138 |
+
+### Findings
+
+**Loop field-store double destroy.** The first stage-2 round on nightly
+1.3.0.dev2026112316 printed `UNBALANCED 0 -3`. Reduced by hand:
+
+```mojo
+def f():
+    var v = Res(1)
+    for i in range(2):
+        v.val = i + 10      # last use of v
+```
+
+When a variable's last use is a field assignment in a loop, Mojo
+destroys it at the end of every iteration and once more after the loop.
+A struct holding a `List` gets a double free (AddressSanitizer
+confirms). It happens at -O0 and -O3 and on 1.3.0.dev2026111705 too.
+Filed as [#7759](https://github.com/modular/modular/issues/7759).
+
+The generator works around it: each `for` loop is followed by
+`_use(v)` (a no-op generic function) for every live owned variable.
+`DECL_FUZZ_NO_LOOP_STORE_WORKAROUND=1` turns this off.
+
+**Self-assignment.** With that workaround off, the next round found a
+`DIFF_O3` instead (-O3 printed 3 and 0, -O0 and the evaluator 4):
+
+```mojo
+@fieldwise_init
+struct P1(ImplicitlyCopyable):
+    var x: Int
+
+
+def f1(a: Int) -> Int:
+    var v = P1(a)
+    v = v               # garbage at -O1 and above
+    return v.x
+```
+
+Only a whole local variable of a struct type is affected. `Int`,
+`v = v.copy()`, `v = w`, `o.p = o.p`, a `mut` argument, and generic code
+are fine. Filed as [#7760](https://github.com/modular/modular/issues/7760).
+The generator writes `_use(v)` instead of `v = v`;
+`DECL_FUZZ_NO_SELF_ASSIGN_WORKAROUND=1` turns this off.
+
+With both workarounds on, 600 more programs (seeds 201 to 203, nightly
+1.3.0.dev2026112316) were clean.
+
+## Beyond stage 2
 
 Mojo features FM leaves out for now:
-- **Ownership (stage 2):** `var` and `mut` arguments, moves with `^`
-  (Γ loses the variable), partial moves of fields, `ref` results and
-  origins, and non-`ImplicitlyCopyable` types with `.copy()`. Γ then
-  needs an init state and live loans per variable, as in Midtgaard et
-  al., *Effect-driven QuickChecking of compilers* (ICFP 2017).
+- **More ownership:** partial moves of fields, `ref` results and
+  origins, `deinit`/consuming methods, "maybe moved" states after
+  branches, `while` loops with `break`, and custom `__deinit__`s in
+  generated structs.
 - **Ill-typed mutants (stage 3):** use after `^`, an argument of the
   wrong type, a missing required method, overlapping `mut` borrows. The
   compiler must reject each one and must not crash.
