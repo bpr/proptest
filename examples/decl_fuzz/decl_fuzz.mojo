@@ -21,6 +21,14 @@
 # destructions, and `main` checks that every one was destroyed (UNBALANCED
 # otherwise).
 #
+# Stage 3 (DECL_FUZZ_MUTANTS=1) makes ill-typed mutants instead: each
+# program gets exactly one error of a kind drawn first (MU_*: a wrong
+# type, a use after `^`, an overlapping `mut` argument, a missing method,
+# ...), made at one of the places the generator could make it, and the
+# line it's on is marked `# MUTANT`. check_rejected.sh then wants the
+# compiler to reject the program, with an error on a marked line, and not
+# to crash. DECL_FUZZ_MUTANTS=alias,sig asks for only those kinds.
+#
 # Every program terminates: each method and function has a rank, and a
 # body calls only methods and functions of lower rank; loops have constant
 # bounds. The generator also evaluates the program itself (`Program.eval`,
@@ -37,12 +45,14 @@
 #
 # The compiler under test is $MOJO (default `mojo`); see
 # build_and_compare.sh. DECL_FUZZ_NO_SHRINK=1 skips shrinking;
-# DECL_FUZZ_STATS=1 prints what evaluation reached in each program;
+# DECL_FUZZ_STATS=1 prints what evaluation reached in each program (for
+# mutants, which kind each got);
 # PROPTEST_SEED, PROPTEST_MAX_EXAMPLES and PROPTEST_WORKERS set the seed,
 # the number of programs, and the worker processes (0: one per physical
 # core). The failing program is kept as failing_program.mojo in the work
-# directory. A second argument replaces build_and_compare.sh (for example
-# with a script that just echoes OK, to check the generator alone).
+# directory. A second argument replaces build_and_compare.sh or
+# check_rejected.sh (for example with a script that just echoes OK, to
+# check the generator alone).
 
 from std.ffi import external_call
 from std.os import getenv
@@ -174,6 +184,56 @@ comptime STAT_NAMES: List[String] = [
     "loop",
     "res",
 ]
+
+# Stage 3: ill-typed mutants (DECL_FUZZ_MUTANTS=1). Each program gets one
+# error of one kind; the compiler must reject it on a line marked
+# `# MUTANT`.
+comptime MU_TYPE = 0
+"""An expression of another type where a type is expected."""
+comptime MU_USE_MOVED = 1
+"""A use of a moved variable."""
+comptime MU_IMPLICIT_COPY = 2
+"""`.copy()` or `^` left out on a value that isn't `ImplicitlyCopyable`."""
+comptime MU_ASSIGN_READ = 3
+"""An assignment to a read variable or its field."""
+comptime MU_MUT_READ = 4
+"""A read variable passed `mut`."""
+comptime MU_ALIAS = 5
+"""An argument overlapping a `mut` argument of the same call."""
+comptime MU_MOVE_READ = 6
+"""`^` on a read variable that isn't an Int."""
+comptime MU_LOOP_MOVE = 7
+"""A loop that moves an outer variable without reinitializing it."""
+comptime MU_NO_METHOD = 8
+"""A call of a method that the receiver's type doesn't have."""
+comptime MU_BOUND = 9
+"""A type argument that doesn't conform to its bound."""
+comptime MU_MISSING = 10
+"""A struct missing a required method or associated constant."""
+comptime MU_SIG = 11
+"""A method whose signature differs from its trait's."""
+comptime MU_CAP = 12
+"""A struct declared more copyable than its fields."""
+comptime N_MU = 13
+comptime MU_NAMES: List[String] = [
+    "type",
+    "use_moved",
+    "implicit_copy",
+    "assign_read",
+    "mut_read",
+    "alias",
+    "move_read",
+    "loop_move",
+    "no_method",
+    "bound",
+    "missing",
+    "sig",
+    "cap",
+]
+comptime MU_ODDS = 6
+"""Each chance to apply the mutation is taken 1 time in MU_ODDS."""
+comptime MARK = "@@M@@"
+"""In generated text, marks the line of the mutation."""
 
 comptime BIN_OPS: List[String] = ["+", "-", "*", "&", "|", "^"]
 comptime CMP_OPS: List[String] = ["<", "==", "!="]
@@ -425,6 +485,9 @@ struct Ctx(Copyable):
     """Used in the current statement (so no longer movable or mut-able)."""
     var excl: List[Bool]
     """Passed as `mut` in the current statement (so unusable in it)."""
+    var taken: List[Int]
+    """The places passed as `mut` in the current statement (v * 64 + f +
+    1), for mutants that overlap them."""
     var bounds: List[Int]
     var param_names: List[String]
     var rank: Int
@@ -434,6 +497,9 @@ struct Ctx(Copyable):
     var depth: Int
     var no_move: Int
     """Inside a ternary branch, where moves would be conditional."""
+    var discard: Bool
+    """The next expression drawn is the root of `_ = e`, which Mojo
+    evaluates without copying (`_ = x.f` of a `Copyable` field is fine)."""
     var counter: Int
     """For fresh local names."""
 
@@ -452,6 +518,7 @@ struct Ctx(Copyable):
         self.move_depth = []
         self.touched = []
         self.excl = []
+        self.taken = []
         self.bounds = bounds^
         self.param_names = param_names^
         self.rank = rank
@@ -459,6 +526,7 @@ struct Ctx(Copyable):
         self.pool = pool^
         self.depth = 0
         self.no_move = 0
+        self.discard = False
         self.counter = 0
 
     def push(mut self, var name: String, ty: Int, kind: Int):
@@ -484,6 +552,7 @@ struct Ctx(Copyable):
         for i in range(len(self.names)):
             self.touched[i] = False
             self.excl[i] = False
+        self.taken = []
 
 
 def kind_of_conv(conv: Int) -> Int:
@@ -534,6 +603,21 @@ struct Program(Movable):
     var int_ty: Int
     var res_ty: Int
     var p0_ty: Int
+    var mutant: Int
+    """The kind of mutation to make (MU_*), or -1 for a well-typed program."""
+    var mutated: Bool
+    """Whether the mutation has been made."""
+    var loop_mark: Int
+    """The depth of the loop body where MU_LOOP_MOVE moved an outer
+    variable, until its loop is made (and marked); else -1."""
+    var marked_stmts: List[Int]
+    """Statements whose every line is marked."""
+    var mark_struct: Int
+    """The struct whose header line is marked, or -1..."""
+    var mark_fields: Bool
+    """...and its field lines..."""
+    var mark_impl: Int
+    """...and the signature of this one of its impl_methods, or -1."""
 
     def __init__(out self):
         self.tkind = []
@@ -557,6 +641,13 @@ struct Program(Movable):
         self.int_ty = 0
         self.res_ty = 0
         self.p0_ty = 0
+        self.mutant = -1
+        self.mutated = False
+        self.loop_mark = -1
+        self.marked_stmts = []
+        self.mark_struct = -1
+        self.mark_fields = False
+        self.mark_impl = -1
         self.int_ty = self.intern(INT, -1, -1)
         self.res_ty = self.intern(RES, -1, -1)
         self.p0_ty = self.intern(PARAM, 0, -1)
@@ -988,6 +1079,238 @@ struct Program(Movable):
                 )
             )
 
+    # ---- mutants (stage 3)
+
+    def wants(self, kind: Int) -> Bool:
+        """Whether a mutation of this kind is still to be made."""
+        return self.mutant == kind and not self.mutated
+
+    def chance(mut self, mut data: ConjectureData, kind: Int) raises -> Bool:
+        """Whether to make the mutation here. Call it only where the
+        mutation is possible, so that every chance is a real one; the
+        shrinker moves the mutation to the first chance."""
+        if not self.wants(kind):
+            return False
+        return data.draw(integers(0, MU_ODDS - 1)) == 0
+
+    def in_branch(self, ctx: Ctx) -> Bool:
+        """Whether ctx is inside a ternary branch, where use_moved and
+        implicit_copy mutants aren't made: Mojo drops the dead branch of
+        a ternary with a constant condition before it checks uses of moved
+        values (and implicit copies of a type parameter's values,
+        modular/modular#7770), so the mutant could be accepted.
+        DECL_FUZZ_NO_DEAD_BRANCH_WORKAROUND=1
+        makes them there too."""
+        return (
+            ctx.no_move > 0
+            and getenv("DECL_FUZZ_NO_DEAD_BRANCH_WORKAROUND") == ""
+        )
+
+    def mark(mut self, e: Int) -> Int:
+        """Marks e as the mutation: the line holding it gets `# MUTANT`."""
+        self.exprs[e].text = String(MARK, self.exprs[e].text)
+        self.mutated = True
+        return e
+
+    def mutation_state(self) -> Int:
+        """For backtracking: a mutation in a discarded attempt is undone."""
+        return Int(self.mutated) + 2 * (self.loop_mark + 1)
+
+    def restore_mutation(mut self, state: Int):
+        self.mutated = state % 2 == 1
+        self.loop_mark = state // 2 - 1
+
+    def moved_vars(self, ctx: Ctx) -> List[Int]:
+        """The dead variables, except Ints and those moved in the current
+        statement. `^` on an Int (a trivial register type) has no effect
+        in Mojo, and an argument `x^` is moved at the call, after the
+        other arguments are evaluated: `f(x^, x.copy())` is fine."""
+        var out = List[Int]()
+        for v in range(len(ctx.names)):
+            if (
+                not ctx.live[v]
+                and not ctx.touched[v]
+                and ctx.types[v] != self.int_ty
+            ):
+                out.append(v)
+        return out^
+
+    def read_places(mut self, ctx: Ctx, ty: Int) -> List[Int]:
+        """Places of type ty in live read variables (MU_MUT_READ)."""
+        var out = List[Int]()
+        for v in range(len(ctx.names)):
+            if ctx.kinds[v] != V_READ or not ctx.live[v] or ctx.excl[v]:
+                continue
+            if ctx.types[v] == ty:
+                out.append(v * 64)
+            var fs = self.fields_of(ctx.types[v])
+            for f in range(len(fs)):
+                if fs[f] == ty:
+                    out.append(v * 64 + f + 1)
+        return out^
+
+    def alias_places(mut self, ctx: Ctx, ty: Int) -> List[Int]:
+        """Places of type ty overlapping a place passed `mut` in this
+        statement (MU_ALIAS). Disjoint fields of one variable don't."""
+        var out = List[Int]()
+        for q in ctx.taken:
+            var v = q // 64
+            if ctx.types[v] == ty and not has(out, v * 64):
+                out.append(v * 64)
+            var fs = self.fields_of(ctx.types[v])
+            for f in range(len(fs)):
+                var p = v * 64 + f + 1
+                if fs[f] == ty and (q % 64 == 0 or q == p) and not has(out, p):
+                    out.append(p)
+        return out^
+
+    def gen_typed(
+        mut self,
+        mut data: ConjectureData,
+        mut ctx: Ctx,
+        ty: Int,
+        size: Int,
+        pos: Int,
+        stmt_root: Bool = False,
+    ) raises -> Int:
+        """An expression for a position that expects type ty: for
+        MU_TYPE, perhaps one of another type (no two types in the pool
+        convert to each other)."""
+        if self.wants(MU_TYPE) and self.chance(data, MU_TYPE):
+            var others = List[Int]()
+            for t in ctx.pool:
+                if t != ty:
+                    others.append(t)
+            var saved = ctx.copy()
+            self.mutated = True
+            try:
+                var t = others[pick(data, len(others))]
+                return self.mark(
+                    self.gen(data, ctx, t, size, pos, False, stmt_root)
+                )
+            except e:
+                if String(e) != "STUCK":
+                    raise e^
+                ctx = saved^
+                self.mutated = False
+        return self.gen(data, ctx, ty, size, pos, False, stmt_root)
+
+    def mutate_declarations(mut self, mut data: ConjectureData) raises:
+        """The mutations of declarations, made after the bodies are drawn:
+        MU_MISSING, MU_SIG and MU_CAP."""
+        var kind = self.mutant
+        if kind == MU_MISSING:
+            # (struct, index, 0 for a method or 1 for a constant)
+            var cands = List[Int]()
+            for s in range(len(self.structs)):
+                ref sd = self.structs[s]
+                for i in range(len(sd.impl_methods)):
+                    if not self.methods[sd.impl_methods[i]].has_default:
+                        cands.append((s * 64 + i) * 2)
+                for i in range(len(sd.k_traits)):
+                    cands.append((s * 64 + i) * 2 + 1)
+            if len(cands) == 0:
+                return
+            var c = cands[pick(data, len(cands))]
+            var s = c // 128
+            var i = (c // 2) % 64
+            if c % 2 == 0:
+                _ = self.structs[s].impl_methods.pop(i)
+                _ = self.structs[s].impl_bodies.pop(i)
+            else:
+                _ = self.structs[s].k_traits.pop(i)
+                _ = self.structs[s].k_values.pop(i)
+                _ = self.structs[s].k_sources.pop(i)
+            self.mark_struct = s
+            self.mutated = True
+            return
+        if kind == MU_SIG:
+            # (not an override: with a default, a method of another
+            # signature is just an overload)
+            var cands = List[Int]()
+            for s in range(len(self.structs)):
+                ref sd = self.structs[s]
+                for i in range(len(sd.impl_methods)):
+                    if not self.methods[sd.impl_methods[i]].has_default:
+                        cands.append(s * 64 + i)
+            if len(cands) == 0:
+                return
+            var c = cands[pick(data, len(cands))]
+            var s = c // 64
+            var i = c % 64
+            var md = self.methods[self.structs[s].impl_methods[i]].copy()
+            var self_ty = self.self_type(s)
+            # concrete types, which substitution leaves alone
+            var concrete: List[Int] = [self.int_ty, self.res_ty]
+            for x in range(len(self.structs)):
+                if not self.structs[x].generic:
+                    concrete.append(self.intern(STRUCT, x, -1))
+            # what to change: the result type, the convention of `self`,
+            # or a parameter's type or convention
+            var changes: List[Int] = [0]
+            if not md.is_static:
+                if md.self_conv == CONV_READ:
+                    changes.append(1)
+                if len(md.params) > 0:
+                    changes += [2, 3]
+            var change = changes[pick(data, len(changes))]
+            if change == 0:
+                var old = self.subst(md.ret, [self_ty])
+                var others = List[Int]()
+                for t in concrete:
+                    if t != old:
+                        others.append(t)
+                md.ret = others[pick(data, len(others))]
+            elif change == 1:
+                md.self_conv = CONV_MUT
+            else:
+                var j = pick(data, len(md.params))
+                if change == 2:
+                    var old = self.subst(md.params[j], [self_ty])
+                    var others = List[Int]()
+                    for t in concrete:
+                        if t != old:
+                            others.append(t)
+                    md.params[j] = others[pick(data, len(others))]
+                else:
+                    # an implementation may take read where its trait
+                    # says `mut` or `var`, so the change is never to read
+                    var old = md.convs[j]
+                    if old == CONV_READ:
+                        md.convs[j] = CONV_MUT if data.draw(
+                            booleans()
+                        ) else CONV_VAR
+                    else:
+                        md.convs[j] = CONV_VAR if old == CONV_MUT else CONV_MUT
+            self.methods.append(md^)
+            self.structs[s].impl_methods[i] = len(self.methods) - 1
+            self.mark_struct = s
+            self.mark_impl = i
+            self.mutated = True
+            return
+        if kind == MU_CAP:
+            # (struct, the least capability of its fields)
+            var cands = List[Int]()
+            for s in range(len(self.structs)):
+                ref sd = self.structs[s]
+                var bounds = [sd.bound] if sd.generic else List[Int]()
+                var least = CAP_IC
+                for t in sd.fields:
+                    least = min(least, self.cap_of(t, bounds))
+                if least < CAP_IC:
+                    cands.append(s * 4 + least)
+            if len(cands) == 0:
+                return
+            var c = cands[pick(data, len(cands))]
+            var s = c // 4
+            var least = c % 4
+            # more than the least field allows: a copy (or implicit copy)
+            # constructor can't be synthesized
+            self.structs[s].cap = least + 1 + pick(data, CAP_IC - least)
+            self.mark_struct = s
+            self.mark_fields = True
+            self.mutated = True
+
     # ---- bodies
 
     def push_params(
@@ -1061,7 +1384,11 @@ struct Program(Movable):
         # entry points (root) drive everything: give them more statements
         var stmts = self.gen_block(data, ctx, 5 if root else 3)
         ctx.new_statement()
-        var r = self.gen(data, ctx, ret, size, P_OWNED, root, True)
+        var r: Int
+        if root:
+            r = self.gen(data, ctx, ret, size, P_OWNED, True, True)
+        else:
+            r = self.gen_typed(data, ctx, ret, size, P_OWNED, True)
         if root:
             # A checksum, as in Csmith: the entry point keeps its result in
             # a variable, then returns it plus every Int reachable from its
@@ -1177,7 +1504,11 @@ struct Program(Movable):
         return len(self.stmts) - 1
 
     def gen_block(
-        mut self, mut data: ConjectureData, mut ctx: Ctx, n_max: Int
+        mut self,
+        mut data: ConjectureData,
+        mut ctx: Ctx,
+        n_max: Int,
+        loop: Bool = False,
     ) raises -> List[Int]:
         """Statements; in a nested block, variables live at its start are
         live at its end (moved ones are reinitialized), and its locals go
@@ -1185,11 +1516,47 @@ struct Program(Movable):
         var n_outer = len(ctx.names)
         var live_at_start = ctx.live.copy()
         var out = List[Int]()
+        var moved = -1
         for _ in range(data.draw(integers(0, n_max))):
+            if loop and self.wants(MU_LOOP_MOVE):
+                # move an outer variable, and don't reinitialize it: the
+                # next iteration uses it (the whole loop is marked)
+                var outer = List[Int]()
+                for v in range(n_outer):
+                    if (
+                        ctx.kinds[v] == V_OWNED
+                        and ctx.live[v]
+                        and ctx.types[v] != self.int_ty
+                    ):
+                        outer.append(v)
+                if len(outer) > 0 and self.chance(data, MU_LOOP_MOVE):
+                    moved = outer[pick(data, len(outer))]
+                    ctx.new_statement()
+                    var ty = ctx.types[moved]
+                    var text = String(ctx.names[moved], "^")
+                    var e = self.add(E_MOVE, moved, ty, [], [], text^)
+                    var name = String("v", ctx.counter)
+                    ctx.counter += 1
+                    ctx.push(name.copy(), ty, V_OWNED)
+                    out.append(
+                        self.add_stmt(Stmt(S_VAR, -1, e, -1, 0, [], [], name^))
+                    )
+                    ctx.live[moved] = False
+                    ctx.move_depth[moved] = -2  # not assignable either
+                    self.mutated = True
+                    self.loop_mark = ctx.depth
+            if self.wants(MU_USE_MOVED):
+                var dead = self.moved_vars(ctx)
+                if len(dead) > 0 and self.chance(data, MU_USE_MOVED):
+                    var v = dead[pick(data, len(dead))]
+                    var e = self.mark(self.place_expr(ctx, v, -1))
+                    out.append(
+                        self.add_stmt(Stmt(S_USE, -1, e, -1, 0, [], [], ""))
+                    )
             out.append(self.gen_stmt(data, ctx))
         if ctx.depth > 0:
             for v in range(n_outer):
-                if live_at_start[v] and not ctx.live[v]:
+                if live_at_start[v] and not ctx.live[v] and v != moved:
                     out.append(self.gen_reinit(data, ctx, v))
             ctx.truncate(n_outer)
         return out^
@@ -1207,7 +1574,7 @@ struct Program(Movable):
         mut self, mut data: ConjectureData, mut ctx: Ctx, v: Int
     ) raises -> Int:
         ctx.new_statement()
-        var e = self.gen(data, ctx, ctx.types[v], BODY_SIZE - 2, P_OWNED)
+        var e = self.gen_typed(data, ctx, ctx.types[v], BODY_SIZE - 2, P_OWNED)
         var target = self.place_expr(ctx, v, -1)
         ctx.live[v] = True
         ctx.move_depth[v] = -1
@@ -1218,12 +1585,14 @@ struct Program(Movable):
     ) raises -> Int:
         """A statement; if it gets stuck, `var vN = <an Int>` instead."""
         var saved = ctx.copy()
+        var state = self.mutation_state()
         try:
             return self.try_stmt(data, ctx)
         except e:
             if String(e) != "STUCK":
                 raise e^
         ctx = saved^
+        self.restore_mutation(state)
         ctx.new_statement()
         var x = self.gen(data, ctx, self.int_ty, 1, P_OWNED)
         var name = String("v", ctx.counter)
@@ -1251,6 +1620,29 @@ struct Program(Movable):
                 for f in range(len(fs)):
                     t_var.append(v)
                     t_field.append(f)
+        if self.wants(MU_ASSIGN_READ):
+            var places = List[Int]()
+            for v in range(len(ctx.names)):
+                if ctx.kinds[v] == V_READ and ctx.live[v]:
+                    places.append(v * 64)
+                    for f in range(len(self.fields_of(ctx.types[v]))):
+                        places.append(v * 64 + f + 1)
+            if len(places) > 0 and self.chance(data, MU_ASSIGN_READ):
+                self.mutated = True
+                var p = places[pick(data, len(places))]
+                var v = p // 64
+                var f = p % 64 - 1
+                var ty = (
+                    ctx.types[v] if f < 0 else self.fields_of(ctx.types[v])[f]
+                )
+                ctx.touched[v] = True
+                var e = self.gen(
+                    data, ctx, ty, BODY_SIZE - 1, P_OWNED, False, True
+                )
+                var target = self.mark(self.place_expr(ctx, v, f))
+                return self.add_stmt(
+                    Stmt(S_ASSIGN, target, e, -1, 0, [], [], String())
+                )
         var mut_types = self.mut_call_types(ctx)
         var kinds: List[Int] = [S_VAR, S_EXPR]
         if len(mut_types) > 0:
@@ -1281,6 +1673,7 @@ struct Program(Movable):
             var ty = mut_types[pick(data, len(mut_types))] if len(
                 mut_types
             ) > 0 else self.draw_type(data, ctx.pool)
+            ctx.discard = True
             var e = self.gen(
                 data, ctx, ty, BODY_SIZE - 1, P_OWNED, True, True, True
             )
@@ -1294,7 +1687,7 @@ struct Program(Movable):
             if f >= 0:
                 # the value may read `v` but not move or mut-borrow it
                 ctx.touched[v] = True
-            var e = self.gen(data, ctx, ty, BODY_SIZE - 1, P_OWNED, False, True)
+            var e = self.gen_typed(data, ctx, ty, BODY_SIZE - 1, P_OWNED, True)
             var target = self.place_expr(ctx, v, f)
             if f < 0:
                 ctx.live[v] = True
@@ -1303,6 +1696,7 @@ struct Program(Movable):
                 f < 0
                 and self.exprs[e].kind == E_VAR
                 and self.exprs[e].a == v
+                and MARK not in self.exprs[e].text  # (an implicit_copy)
                 and getenv("DECL_FUZZ_NO_SELF_ASSIGN_WORKAROUND") == ""
             ):
                 # `v = v` on an ImplicitlyCopyable struct gives garbage at
@@ -1316,8 +1710,8 @@ struct Program(Movable):
 
         if kind == S_IF:
             var op = pick(data, comptime (len(CMP_OPS)))
-            var x = self.gen(data, ctx, self.int_ty, 1, P_READ)
-            var y = self.gen(data, ctx, self.int_ty, 1, P_READ)
+            var x = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
+            var y = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
             ctx.depth += 1
             var then = self.gen_block(data, ctx, 2)
             var orelse = self.gen_block(data, ctx, 2)
@@ -1333,12 +1727,17 @@ struct Program(Movable):
         var n = len(ctx.names)
         ctx.push(name.copy(), self.int_ty, V_READ)
         ctx.depth += 1
-        var body = self.gen_block(data, ctx, 2)
+        var body = self.gen_block(data, ctx, 2, True)
         ctx.depth -= 1
         ctx.truncate(n)
         var loop = self.add_stmt(
             Stmt(S_FOR, -1, -1, -1, count, body^, [], name^)
         )
+        if (
+            self.loop_mark == ctx.depth + 1
+        ):  # this loop's body, not a nested one
+            self.marked_stmts.append(loop)
+            self.loop_mark = -1
         if getenv("DECL_FUZZ_NO_LOOP_STORE_WORKAROUND") != "":
             return loop
         # A variable whose last use is a field assignment in a loop is
@@ -1416,8 +1815,28 @@ struct Program(Movable):
         return out^
 
     def take_place(
-        mut self, mut data: ConjectureData, mut ctx: Ctx, ty: Int
+        mut self,
+        mut data: ConjectureData,
+        mut ctx: Ctx,
+        ty: Int,
+        recv: Bool = False,
     ) raises -> Int:
+        # mutants: a read place, one overlapping an earlier `mut` argument,
+        # or one of another type (not for a receiver: another type may
+        # have the same method)
+        var bad = List[Int]()
+        if self.wants(MU_MUT_READ):
+            bad = self.read_places(ctx, ty)
+        elif self.wants(MU_ALIAS):
+            bad = self.alias_places(ctx, ty)
+        elif self.wants(MU_TYPE) and not recv:
+            for t in ctx.pool.copy():
+                if t != ty:
+                    bad += self.mut_places(ctx, t)
+        if len(bad) > 0 and self.chance(data, self.mutant):
+            var p = bad[pick(data, len(bad))]
+            ctx.touched[p // 64] = True
+            return self.mark(self.place_expr(ctx, p // 64, p % 64 - 1))
         var places = self.mut_places(ctx, ty)
         if len(places) == 0:
             raise Error("STUCK")
@@ -1425,6 +1844,7 @@ struct Program(Movable):
         var v = p // 64
         ctx.excl[v] = True
         ctx.touched[v] = True
+        ctx.taken.append(p)
         return self.place_expr(ctx, v, p % 64 - 1)
 
     def callable_here(
@@ -1514,10 +1934,24 @@ struct Program(Movable):
         ty: Int,
         conv: Int,
         size: Int,
+        mut_call: Bool = False,
     ) raises -> Int:
+        """An argument; mut_call says the call has `mut` arguments."""
         if conv == CONV_MUT:
             return self.take_place(data, ctx, ty)
-        return self.gen(
+        if (
+            conv == CONV_READ
+            and mut_call
+            and ty != self.int_ty
+            and self.wants(MU_ALIAS)
+        ):
+            # a read argument overlapping a `mut` one (an Int is passed by
+            # value, so it may)
+            var bad = self.alias_places(ctx, ty)
+            if len(bad) > 0 and self.chance(data, MU_ALIAS):
+                var p = bad[pick(data, len(bad))]
+                return self.mark(self.place_expr(ctx, p // 64, p % 64 - 1))
+        return self.gen_typed(
             data, ctx, ty, size, P_OWNED if conv == CONV_VAR else P_READ
         )
 
@@ -1538,6 +1972,44 @@ struct Program(Movable):
         statement; with prefer_mut, only those if there are any."""
         var kind = self.tkind[ty]
         var cap = self.cap_of(ty, ctx.bounds)
+        var discard = ctx.discard
+        ctx.discard = False
+
+        if self.wants(MU_USE_MOVED):
+            var dead = List[Int]()
+            for v in self.moved_vars(ctx):
+                if ctx.types[v] == ty:
+                    dead.append(v)
+            if (
+                len(dead) > 0
+                and not self.in_branch(ctx)
+                and self.chance(data, MU_USE_MOVED)
+            ):
+                var v = dead[pick(data, len(dead))]
+                var e = self.place_expr(ctx, v, -1)
+                if pos == P_OWNED and cap == CAP_C:
+                    var text = String(self.exprs[e].text, ".copy()")
+                    e = self.add(E_COPY, 0, ty, [e], [], text^)
+                elif pos == P_OWNED and cap == CAP_M:
+                    var text = String(ctx.names[v], "^")
+                    e = self.add(E_MOVE, v, ty, [], [], text^)
+                return self.mark(e)
+        if self.wants(MU_MOVE_READ) and pos == P_OWNED and kind != INT:
+            # (a read Int is passed by value, so it may be moved)
+            var reads = List[Int]()
+            for v in range(len(ctx.names)):
+                if (
+                    ctx.kinds[v] == V_READ
+                    and ctx.live[v]
+                    and not ctx.excl[v]
+                    and ctx.types[v] == ty
+                ):
+                    reads.append(v)
+            if len(reads) > 0 and self.chance(data, MU_MOVE_READ):
+                var v = reads[pick(data, len(reads))]
+                ctx.touched[v] = True
+                var text = String(ctx.names[v], "^")
+                return self.mark(self.add(E_MOVE, v, ty, [], [], text^))
 
         # T-Var, and fields of variables (so that `self.f0` is a ground
         # term for `Self.T`), each used as the position allows
@@ -1556,11 +2028,15 @@ struct Program(Movable):
                     atom_vars.append(v)
                     atom_fields.append(-1)
                     atom_modes.append(A_COPY)
+                # `_ = x^` doesn't move x in Mojo (it keeps x alive, like
+                # `_ = x`), so mutants have no moves there; stage 2 keeps
+                # them, as treating x as moved is only stricter
                 if (
                     pos == P_OWNED
                     and ctx.kinds[v] == V_OWNED
                     and not ctx.touched[v]
                     and ctx.no_move == 0
+                    and not (discard and self.mutant >= 0)
                 ):
                     atom_vars.append(v)
                     atom_fields.append(-1)
@@ -1706,12 +2182,16 @@ struct Program(Movable):
         while len(rules) > 0:
             var rule = rules[pick(data, len(rules))]
             var saved = ctx.copy()
+            var state = self.mutation_state()
             try:
-                return self.apply_rule(data, ctx, rule, ty, size, pos, c)
+                return self.apply_rule(
+                    data, ctx, rule, ty, size, pos, c, discard
+                )
             except e:
                 if String(e) != "STUCK":
                     raise e^
                 ctx = saved^
+                self.restore_mutation(state)
                 var rest = List[Int]()
                 for r in rules:
                     if r != rule:
@@ -1728,6 +2208,7 @@ struct Program(Movable):
         size: Int,
         pos: Int,
         c: Cands,
+        discard: Bool = False,
     ) raises -> Int:
         var kind = self.tkind[ty]
         var cap = self.cap_of(ty, ctx.bounds)
@@ -1749,6 +2230,14 @@ struct Program(Movable):
                 )
             var v = c.atom_vars[i]
             var mode = c.atom_modes[i]
+            if (
+                not discard
+                and not self.in_branch(ctx)
+                and (mode == A_COPY or (mode == A_MOVE and cap < CAP_IC))
+                and self.chance(data, MU_IMPLICIT_COPY)
+            ):
+                ctx.touched[v] = True
+                return self.mark(self.place_expr(ctx, v, c.atom_fields[i]))
             if mode == A_MOVE:
                 ctx.live[v] = False
                 ctx.move_depth[v] = ctx.depth
@@ -1764,31 +2253,38 @@ struct Program(Movable):
             return place
 
         if rule == R_NEW:  # T-New: the fields are consumed
+            var bad = self.bad_type_text(data, ctx, ty)
             var kids = List[Int]()
             for ft in self.fields_of(ty):
-                kids.append(self.gen(data, ctx, ft, sub, P_OWNED))
+                kids.append(self.gen_typed(data, ctx, ft, sub, P_OWNED))
             var text = String(
-                self.cty(ty, ctx), "(", self.args_text(kids, 0), ")"
+                self.cty(ty, ctx) if bad == "" else bad,
+                "(",
+                self.args_text(kids, 0),
+                ")",
             )
-            return self.add(E_NEW, 0, ty, kids^, [], text^)
+            var e = self.add(E_NEW, 0, ty, kids^, [], text^)
+            return self.mark(e) if bad != "" else e
 
         if rule == R_MAKE:  # static call: τ.make<t>(e)
             var m = c.makes[pick(data, len(c.makes))]
-            var arg = self.gen(data, ctx, self.int_ty, sub, P_READ)
+            var bad = self.bad_type_text(data, ctx, ty)
+            var arg = self.gen_typed(data, ctx, self.int_ty, sub, P_READ)
             var text = String(
-                self.cty(ty, ctx),
+                self.cty(ty, ctx) if bad == "" else bad,
                 ".",
                 self.methods[m].name,
                 "(",
                 self.exprs[arg].text,
                 ")",
             )
-            return self.add(E_STATIC, m, ty, [arg], [ty], text^)
+            var e = self.add(E_STATIC, m, ty, [arg], [ty], text^)
+            return self.mark(e) if bad != "" else e
 
         if rule == R_BIN:
             var op = pick(data, comptime (len(BIN_OPS)))
-            var l = self.gen(data, ctx, ty, half, P_READ)
-            var r = self.gen(data, ctx, ty, half, P_READ)
+            var l = self.gen_typed(data, ctx, ty, half, P_READ)
+            var r = self.gen_typed(data, ctx, ty, half, P_READ)
             var ops = materialize[BIN_OPS]()
             var text = String(
                 "(",
@@ -1803,11 +2299,11 @@ struct Program(Movable):
 
         if rule == R_TERN:  # the branches are owned values, never moves
             var op = pick(data, comptime (len(CMP_OPS)))
-            var x = self.gen(data, ctx, self.int_ty, half, P_READ)
-            var y = self.gen(data, ctx, self.int_ty, half, P_READ)
+            var x = self.gen_typed(data, ctx, self.int_ty, half, P_READ)
+            var y = self.gen_typed(data, ctx, self.int_ty, half, P_READ)
             ctx.no_move += 1
-            var t = self.gen(data, ctx, ty, half, P_OWNED)
-            var e = self.gen(data, ctx, ty, half, P_OWNED)
+            var t = self.gen_typed(data, ctx, ty, half, P_OWNED)
+            var e = self.gen_typed(data, ctx, ty, half, P_OWNED)
             ctx.no_move -= 1
             var ops = materialize[CMP_OPS]()
             var text = String(
@@ -1834,6 +2330,14 @@ struct Program(Movable):
                 self.field_name(c.field_recv[i], c.field_idx[i]),
             )
             var fe = self.add(E_FIELD, c.field_idx[i], ty, [recv], [], text^)
+            if (
+                pos == P_OWNED
+                and cap == CAP_C
+                and not discard
+                and not self.in_branch(ctx)
+                and self.chance(data, MU_IMPLICIT_COPY)
+            ):
+                return self.mark(fe)
             if pos == P_OWNED and cap == CAP_C:
                 var ctext = String(self.exprs[fe].text, ".copy()")
                 return self.add(E_COPY, 0, ty, [fe], [], ctext^)
@@ -1843,24 +2347,41 @@ struct Program(Movable):
             var i = pick(data, len(c.meth_recv))
             var r = c.meth_recv[i]
             var m = c.meth_id[i]
+            var name = self.methods[m].name
+            var wrong = False
+            if self.wants(MU_NO_METHOD):
+                # the name of a method r doesn't have
+                var avail = self.methods_on(r, ctx.bounds)
+                var others = List[Int]()
+                for m2 in range(len(self.methods)):
+                    if not self.methods[m2].is_static and not has(avail, m2):
+                        others.append(m2)
+                if len(others) > 0 and self.chance(data, MU_NO_METHOD):
+                    name = self.methods[others[pick(data, len(others))]].name
+                    self.mutated = True
+                    wrong = True
             var kids = List[Int]()
             if self.methods[m].self_conv == CONV_MUT:
-                kids.append(self.take_place(data, ctx, r))
+                kids.append(self.take_place(data, ctx, r, True))
             else:
                 kids.append(self.gen(data, ctx, r, sub, P_READ))
             var params = self.method_params(m, r)
             var convs = self.methods[m].convs.copy()
+            var mut_call = self.has_mut(m)
             for j in range(len(params)):
-                kids.append(self.gen_arg(data, ctx, params[j], convs[j], half))
+                kids.append(
+                    self.gen_arg(data, ctx, params[j], convs[j], half, mut_call)
+                )
             var text = String(
                 self.exprs[kids[0]].text,
                 ".",
-                self.methods[m].name,
+                name,
                 "(",
                 self.args_text(kids, 1),
                 ")",
             )
-            return self.add(E_METHOD, m, ty, kids^, [], text^)
+            var e = self.add(E_METHOD, m, ty, kids^, [], text^)
+            return self.mark(e) if wrong else e
 
         if rule == R_K:  # an associated constant: τ.K<t>
             var i = pick(data, len(c.k_recv))
@@ -1878,23 +2399,67 @@ struct Program(Movable):
                 if targs[i] < 0:
                     var ok = self.conforming(ctx, self.fns[f].bounds[i])
                     targs[i] = ok[pick(data, len(ok))]
+        # MU_BOUND: a type argument that doesn't conform, (i, type)
+        var bad_i = -1
+        var bad_t = -1
+        if n_tp > 0 and self.wants(MU_BOUND):
+            var cands = List[Int]()
+            for i in range(n_tp):
+                for t in ctx.pool:
+                    if not self.conforms(t, self.fns[f].bounds[i], ctx.bounds):
+                        cands.append(i * 1024 + t)
+            if len(cands) > 0 and self.chance(data, MU_BOUND):
+                var x = cands[pick(data, len(cands))]
+                bad_i = x // 1024
+                bad_t = x % 1024
+                self.mutated = True
         var params = self.fns[f].params.copy()
         if n_tp > 0:
             params = self.subst_all(params, targs)
         var convs = self.fns[f].convs.copy()
+        var mut_call = has(convs, CONV_MUT)
+        var mutated_before = self.mutated
         var kids = List[Int]()
         for j in range(len(params)):
-            kids.append(self.gen_arg(data, ctx, params[j], convs[j], half))
+            kids.append(
+                self.gen_arg(data, ctx, params[j], convs[j], half, mut_call)
+            )
+        # an argument of another type might change what the type
+        # arguments are inferred to be, so they're explicit then
+        var forced = bad_i >= 0 or (self.mutated and not mutated_before)
         var text = self.fns[f].name
-        if n_tp > 0 and data.draw(booleans()):  # explicit type arguments
+        if n_tp > 0 and (data.draw(booleans()) or forced):
             text += "["
             for i in range(n_tp):
                 if i > 0:
                     text += ", "
-                text += self.cty(targs[i], ctx)
+                text += self.cty(bad_t if i == bad_i else targs[i], ctx)
             text += "]"
         text += String("(", self.args_text(kids, 0), ")")
-        return self.add(E_CALL, f, ty, kids^, targs^, text^)
+        var e = self.add(E_CALL, f, ty, kids^, targs^, text^)
+        return self.mark(e) if bad_i >= 0 else e
+
+    def bad_type_text(
+        mut self, mut data: ConjectureData, ctx: Ctx, ty: Int
+    ) raises -> String:
+        """For MU_BOUND, ty (a generic struct type) written with a type
+        argument that doesn't conform to its bound; otherwise ""."""
+        if (
+            not self.wants(MU_BOUND)
+            or self.tkind[ty] != STRUCT
+            or self.targ[ty] < 0
+        ):
+            return ""
+        var s = self.tid[ty]
+        var cands = List[Int]()
+        for t in ctx.pool:
+            if not self.conforms(t, self.structs[s].bound, ctx.bounds):
+                cands.append(t)
+        if len(cands) == 0 or not self.chance(data, MU_BOUND):
+            return ""
+        self.mutated = True
+        var t = cands[pick(data, len(cands))]
+        return String(self.structs[s].name, "[", self.cty(t, ctx), "]")
 
     def conforming(self, ctx: Ctx, t: Int) -> List[Int]:
         var out = List[Int]()
@@ -2169,6 +2734,12 @@ struct Program(Movable):
         return s^
 
     def stmt_text(self, st: Int, indent: String) -> String:
+        var text = self.stmt_lines(st, indent)
+        if has(self.marked_stmts, st):
+            return text.replace("\n", String(MARK, "\n"))
+        return text^
+
+    def stmt_lines(self, st: Int, indent: String) -> String:
         ref s = self.stmts[st]
         if s.kind == S_VAR:
             return String(
@@ -2292,19 +2863,21 @@ struct Program(Movable):
             var generic = self.structs[st].generic
             var names = ["Self.T"] if generic else List[String]()
             var self_ty = self.self_type(st)
+            var marked = st == self.mark_struct
             s += String("@fieldwise_init\nstruct ", self.structs[st].name)
             if generic:
                 s += String("[T: Tr", self.structs[st].bound, "]")
             s += String("(", cap_names[self.structs[st].cap])
             for t in self.structs[st].traits:
                 s += String(", Tr", t)
-            s += "):\n"
+            s += String("):", MARK if marked else "", "\n")
             for f in range(len(self.structs[st].fields)):
                 s += String(
                     "    var f",
                     f,
                     ": ",
                     self.ty_str(self.structs[st].fields[f], names, -1),
+                    MARK if marked and self.mark_fields else "",
                     "\n",
                 )
             for i in range(len(self.structs[st].k_traits)):
@@ -2326,9 +2899,12 @@ struct Program(Movable):
                 )
                 var ret = self.subst(self.methods[m].ret, [self_ty])
                 s += "\n"
-                s += self.sig_text(
+                var sig = self.sig_text(
                     m, params, ret, names, self.bodies[b].self_print
                 )
+                if marked and i == self.mark_impl:
+                    sig = sig.replace("\n", String(MARK, "\n"))
+                s += sig
                 s += self.body_text(b, "        ")
             for m in self.structs[st].own:
                 var b = self.methods[m].body
@@ -2375,14 +2951,57 @@ struct Program(Movable):
         return s^
 
 
+def resolve_marks(text: String) -> String:
+    """Moves each line's marks to a `# MUTANT` comment at its end."""
+    var out = String()
+    var lines = text.split("\n")
+    for i in range(len(lines)):
+        var line = String(lines[i])
+        if i > 0:
+            out += "\n"
+        if MARK in line:
+            out += String(line.replace(MARK, ""), "  # MUTANT")
+        else:
+            out += line
+    return out^
+
+
+def mutant_kinds() raises -> List[Int]:
+    """The mutation kinds DECL_FUZZ_MUTANTS asks for: none if it's unset,
+    every kind for 1 or `all`, else the kinds named (comma-separated)."""
+    var spec = getenv("DECL_FUZZ_MUTANTS")
+    var out = List[Int]()
+    if spec == "":
+        return out^
+    if spec == "1" or spec == "all":
+        for k in range(N_MU):
+            out.append(k)
+        return out^
+    var names = materialize[MU_NAMES]()
+    for part in spec.split(","):
+        var found = False
+        for k in range(N_MU):
+            if names[k] == String(part):
+                out.append(k)
+                found = True
+        if not found:
+            raise Error(String("unknown mutation kind: ", part))
+    return out^
+
+
 def draw_program(
-    mut data: ConjectureData,
+    mut data: ConjectureData, kinds: List[Int]
 ) raises -> Tuple[String, String, String]:
-    """The program, its compile-time twin, and the expected output."""
+    """The program, its compile-time twin, and the expected output; with
+    mutation kinds, an ill-typed mutant (and no twin or output)."""
     var p = Program()
+    if len(kinds) > 0:
+        p.mutant = kinds[pick(data, len(kinds))]
     try:
         p.draw_declarations(data)
         p.draw_bodies(data)
+        if p.mutant >= MU_MISSING:
+            p.mutate_declarations(data)
     except e:
         # an expression whose `mut` places were taken by earlier arguments
         if String(e) == "STUCK":
@@ -2390,6 +3009,15 @@ def draw_program(
                 print("stuck")
             assume(False)
         raise e^
+    if p.mutant >= 0:
+        if getenv("DECL_FUZZ_STATS") != "":
+            var names = materialize[MU_NAMES]()
+            print(
+                "mutant" if p.mutated else "unmutated",
+                names[p.mutant],
+            )
+        if not p.mutated:  # no chance was taken
+            assume(False)
     var arg_lists = List[List[Int]]()
     for _ in range(data.draw(integers(1, 3))):
         var args = List[Int]()
@@ -2438,6 +3066,8 @@ def draw_program(
                 "    comptime ", name, " = run_f", i, "(", args, ")\n"
             )
             comptime_program += String('    print("c", ', i, ", ", name, ")\n")
+            if p.mutant >= 0:
+                continue  # not evaluated: it doesn't have a meaning
             var frame = List[Int]()
             for k in range(3):
                 frame.append(p.new_int(arg_lists[j][k]))
@@ -2450,6 +3080,10 @@ def draw_program(
                 raise e^
             expected += String("c ", i, " ", v, "\n")
             expected += String("b ", i, " ", v, "\n")
+    if p.mutant >= 0:
+        var names = materialize[MU_NAMES]()
+        var text = String("# FM mutant: ", names[p.mutant], "\n", program)
+        return (resolve_marks(text), String(), String())
     if getenv("DECL_FUZZ_STATS") != "":
         var line = String("stats")
         var names = materialize[STAT_NAMES]()
@@ -2470,16 +3104,19 @@ def main() raises:
     var work_dir = (
         String(argv()[1]) if len(argv()) > 1 else "build/decl_fuzz_work"
     )
-    var script = (
-        String(argv()[2]) if len(argv())
-        > 2 else "examples/decl_fuzz/build_and_compare.sh"
+    var kinds = mutant_kinds()
+    var script = String(
+        "examples/decl_fuzz/check_rejected.sh" if len(kinds)
+        > 0 else "examples/decl_fuzz/build_and_compare.sh"
     )
+    if len(argv()) > 2:
+        script = String(argv()[2])
     _ = run(String("mkdir -p ", work_dir))
 
     def differential(
         mut data: ConjectureData,
-    ) raises {imm work_dir, imm script}:
-        var programs = draw_program(data)
+    ) raises {imm work_dir, imm script, imm kinds}:
+        var programs = draw_program(data, kinds)
         var dir = process_dir(work_dir)
         with open(String(dir, "/program.mojo"), "w") as f:
             f.write(programs[0])
@@ -2498,7 +3135,8 @@ def main() raises:
                     )
                 )
             # BUILD_FAIL: the generator wrote ill-typed Mojo, or the
-            # compiler rejected a well-typed program
+            # compiler rejected a well-typed program; ACCEPTED: the
+            # compiler accepted a mutant
             fail(String(verdict.split("\n")[0]))
 
     var settings = Settings(

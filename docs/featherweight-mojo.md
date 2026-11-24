@@ -15,7 +15,7 @@ refinement, required and default methods, static constructors and
 associated constants; concrete and generic structs conforming to them;
 and generic functions over trait bounds. Every program terminates.
 
-FM comes in two stages, both implemented:
+FM comes in three stages, all implemented:
 - **Stage 1** (the sections from "Syntax" to "Differences from fj-qc")
   is the purely functional core. Every type is `ImplicitlyCopyable`.
 - **Stage 2** ("Stage 2: ownership") adds ownership on top:
@@ -24,9 +24,12 @@ FM comes in two stages, both implemented:
   - statements that assign variables and fields, `if`, and bounded `for`;
   - a resource type that counts its destructions.
 
-Stage 2 found two compiler bugs in its first rounds (see "Findings").
-Stage 3 would add programs made ill-typed on purpose, which the compiler
-must reject without crashing ("Beyond stage 2").
+- **Stage 3** ("Stage 3: ill-typed mutants") turns the generator around:
+  each program gets exactly one error, and the compiler must reject it,
+  on the line of the error, without crashing.
+
+Stage 2 found two compiler bugs in its first rounds, and stage 3 one
+more (see each stage's "Findings").
 
 ## Syntax
 
@@ -585,16 +588,193 @@ The generator writes `_use(v)` instead of `v = v`;
 With both workarounds on, 600 more programs (seeds 201 to 203, nightly
 1.3.0.dev2026112316) were clean.
 
-## Beyond stage 2
+## Stage 3: ill-typed mutants
+
+Stages 1 and 2 test that the compiler accepts every well-typed program
+and runs it correctly. Stage 3 tests the converse: that it rejects
+ill-typed ones. A soundness hole in the type or ownership checker, such
+as a missed use after `^` or an aliased `mut` argument, lets through a
+program with undefined behavior. A well-typed generator never produces
+one.
+
+A **mutant** is a stage-2 program with exactly one error. Its kind is
+drawn first. The generator then draws the program as usual, and at each
+place where it could make that error, it does so with probability 1/6
+(`MU_ODDS`), at most once. Reading the typing rules backwards also
+tells it which places those are. This follows the type-overwriting
+mutations of Hephaestus (Chaliasos et al., *Finding typing compiler
+bugs*, PLDI 2022), but the generator makes the error while it draws the
+program, so it knows Γ at the mutation. A program where no chance came
+up is rejected (`assume(False)`), at no compile cost. The shrinker moves
+the mutation to the first chance and shrinks the rest of the program
+around it, as in stage 2.
+
+### Mutation kinds
+
+Each kind breaks one rule from stages 1 and 2:
+
+| Kind | Rule broken | Example | Mojo's error |
+|---|---|---|---|
+| `type` | an expression of type τ where τ' ≠ τ is expected (argument, field, operand, condition, ternary branch, result, assigned value, `mut` place) | `g0(S1(1))` for `p0: S0` | cannot be converted from 'S1' to 'S0' |
+| `use_moved` | use of a dead variable | `var y = x^` then `_use(x)` | use of uninitialized value 'x' |
+| `implicit_copy` | an owned place of a type that isn't `ImplicitlyCopyable`, without `.copy()` or `^` | `var y = x` for a `Copyable` x | cannot be implicitly copied |
+| `assign_read` | assignment to a read variable or its field | `p0.f0 = 1` for a read `p0` | expression must be mutable in assignment |
+| `mut_read` | a read variable passed as `mut` (or as `mut self`) | `h(p0)` | value passed to mutable argument must be mutable |
+| `alias` | an argument overlapping a `mut` argument of the same call | `hm(x, x)`, `h(x, x.f1)` | aliasing values passed mutably to 'a' argument and ... to 'b' argument |
+| `move_read` | `^` on a read variable | `var y = p0^` | cannot transfer out of immutable reference |
+| `loop_move` | a loop moves an outer variable without reinitializing it | `for i in range(2): var y = x^` | use of uninitialized value 'x' |
+| `no_method` | a method the receiver's type doesn't have (for a type parameter: one its bound doesn't give) | `p0.m1()` for `p0: T`, `T: Tr0` | 'T' value has no attribute 'm1' |
+| `bound` | a type argument that doesn't conform to its bound | `g0[S1](...)`, `B0[Res](...)` | parameter 'T' has 'Tr0' type, but value has type ... |
+| `missing` | a struct without a required method or associated constant | `S0` conforming to `Tr0` without `m0` | 'S0' does not implement all requirements for 'Tr0' |
+| `sig` | an implementation whose result type, parameter type, or convention of `self` or a parameter differs from the trait's | `def m0(mut self, ...)` for a read `self` | 'S0' does not implement all requirements for 'Tr0' |
+| `cap` | a struct declared more capable than a field | `struct S0(Copyable)` with a `Movable` field | cannot synthesize copy constructor because field 'f0' has non-copyable type |
+
+A mutant is only useful where FM is no stricter than Mojo: a program FM
+rejects and Mojo rightly accepts says nothing. Small probes settled the
+first rules below before any mutant was made. The `ACCEPTED` verdicts of
+the first rounds found the rest, each time a rule of Mojo's that FM
+didn't have:
+- **A read `Int` is passed by value.** So `h(x, x.f0)` with `mut x` and
+  a read `Int` parameter is accepted, and `a^` on a read `Int` argument
+  too. `alias` and `move_read` leave `Int` out.
+- **Disjoint fields don't alias.** `f(q.a, q.b)`, with `q.a` passed as
+  `mut`, is accepted. Stage 2 never generates it (it treats a `mut`
+  argument as using its whole root variable). `alias` overlaps only a
+  whole variable with its fields, or a field with itself.
+- **Type inference.** `g0(S2(1))` is well typed for `g0[T: Tr0](p0: T)`
+  when `S2` conforms to `Tr0`. A generic call with a mutated argument is
+  always written with explicit type arguments.
+- **Receivers.** Another type's receiver may well have the same method
+  (two structs conforming to one trait), so `type` never changes a
+  receiver.
+- **No implicit conversions.** None of the types in a pool converts to
+  another: Int's `@implicit` constructors take only literals, `Bool` and
+  SIMD values.
+- **An implementation may take read where its trait says `mut` or
+  `var`**, for a parameter or for `self` (found by `ACCEPTED`). A read
+  parameter can take a `mut` reference or an owned value, so this is
+  sound, though the manual doesn't say so. `sig` changes a convention
+  only to `mut` or `var`.
+- **A method with another signature than a trait default is an
+  overload** (`ACCEPTED`), and the default still satisfies the trait.
+  `sig` changes only methods without defaults.
+- **`^` on an `Int` has no effect** (`ACCEPTED`; Mojo warns "transfer
+  from a value of trivial register type 'Int' has no effect"). The
+  variable stays initialized, so `use_moved` and `loop_move` leave Ints
+  out.
+- **`_ = x^` doesn't move x** (`ACCEPTED`). The manual says so: "`_ =
+  t^` keeps `t` alive exactly as `_ = t` does." For the same reason,
+  `_ = x.f` needs no `.copy()`. Mutants have no moves, and no
+  `implicit_copy`, at the root of `_ = e`.
+- **An argument `x^` is moved at the call**, after the other arguments
+  are evaluated (`ACCEPTED`). So `f(x^, x.copy())` is fine, and
+  `use_moved` leaves out variables moved in the current statement.
+
+Other things that are errors in FM proved to be errors in Mojo too:
+`return x` of a local `Copyable` variable (no implicit move on return),
+and comparing two structs (no synthesized `__eq__`).
+
+### Oracle
+
+`examples/decl_fuzz/check_rejected.sh` builds the mutant at -O0 (where
+an error is found doesn't depend on optimization). The generator marks
+the mutation's line by putting a marker in the mutated expression's
+text, which then appears in every expression that contains it. When the
+program is printed, each line holding the marker gets a `# MUTANT`
+comment. A `loop_move` marks the whole loop, since Mojo reports the
+first use in the next iteration, which may be on any line of the body.
+Declaration kinds mark the struct's header, plus its fields (`cap`) or
+the changed signature (`sig`).
+
+| Verdict | Meaning |
+|---|---|
+| `OK` | Rejected, with an error on a marked line |
+| `ACCEPTED` | The compiler accepted the mutant: a soundness bug, or a rule FM has that Mojo doesn't |
+| `BUILD_CRASH`, `BUILD_TIMEOUT` | The compiler crashed or ran too long |
+| `WRONG_LINE` | Rejected, but with no error on a marked line: a generator bug, or a misplaced error |
+| `NO_MARK` | No line is marked: a generator bug |
+
+`DECL_FUZZ_MUTANTS=1` turns stage 3 on, and `DECL_FUZZ_MUTANTS=alias,sig`
+restricts it to the kinds named. `DECL_FUZZ_STATS=1` prints each
+program's kind and whether a chance came up. Each program starts with a
+`# FM mutant: <kind>` comment.
+
+Mutants are cheap: the compiler rejects most of them while parsing, so
+600 take about a minute on 16 cores. Rejected programs (no chance
+came up) cost no build. Out of 3000 drawn (seeds 305 to 309), the number
+of programs of each kind that got their mutation, and the number
+rejected:
+
+| Kind | Made | No chance |
+|---|---|---|
+| `type` | 457 | 55 |
+| `move_read` | 438 | 105 |
+| `assign_read` | 378 | 46 |
+| `cap` | 358 | 116 |
+| `missing` | 282 | 148 |
+| `no_method` | 276 | 144 |
+| `implicit_copy` | 258 | 217 |
+| `bound` | 232 | 222 |
+| `sig` | 188 | 206 |
+| `mut_read` | 57 | 445 |
+| `loop_move` | 48 | 318 |
+| `alias` | 24 | 455 |
+| `use_moved` | 23 | 492 |
+
+The rare kinds need a `mut` call (`alias`, `mut_read`) or a move
+(`use_moved`, `loop_move`) of a non-Int variable. Few bodies have those.
+
+**Validation.** The oracle found two generator bugs on its own. The
+first was a `WRONG_LINE`: an outer loop's `loop_move` marked a loop
+nested in its body instead. The second was a `NO_MARK`: stage 2's
+`v = v` workaround (#7760) dropped a mutated `v = v` (`implicit_copy`),
+taking the mark with it. The `ACCEPTED` verdicts above found the five
+rules FM lacked. With all of them fixed, 4200 mutants (seeds 305 to
+311, nightly 1.3.0.dev2026112316) were all rejected on a marked line.
+
+### Findings
+
+**A generic implicit copy in a dead ternary branch.** Among the first
+`ACCEPTED` verdicts were two `implicit_copy` mutants that matched none
+of the rules above. Reduced by hand:
+
+```mojo
+def take[T: Tr](var x: T) -> T:
+    return x^
+
+
+def g[T: Tr](p: T) -> T:       # Tr refines only Copyable
+    return T.make(1) if 1 == 1 else take(p)   # accepted
+```
+
+Passing `p` to a `var T` parameter implicitly copies a value that isn't
+`ImplicitlyCopyable`. Mojo accepts this, warning only that the branch
+is dead. The same call is rejected in a live branch, in a dead `if 1 ==
+0:` statement, and for a concrete type. A generic struct's constructor
+in the dead branch (`B[T](p)`) is accepted too: the generator's own
+shrunk program has `B3[Self](self)` in a trait default method. Filed as
+[#7770](https://github.com/modular/modular/issues/7770). #7664 is the
+same construct the other way around: there, valid code in the dead
+branch is rejected.
+
+Uses of a moved variable in a dead branch are accepted for any type,
+which may be by design. The generator makes neither `use_moved` nor
+`implicit_copy` mutants inside ternary branches.
+`DECL_FUZZ_NO_DEAD_BRANCH_WORKAROUND=1` lets it. With that set,
+`DECL_FUZZ_MUTANTS=implicit_copy` found and shrank the bug in six
+minutes (seed 401).
+
+## Beyond stage 3
 
 Mojo features FM leaves out for now:
 - **More ownership:** partial moves of fields, `ref` results and
   origins, `deinit`/consuming methods, "maybe moved" states after
   branches, `while` loops with `break`, and custom `__deinit__`s in
   generated structs.
-- **Ill-typed mutants (stage 3):** use after `^`, an argument of the
-  wrong type, a missing required method, overlapping `mut` borrows. The
-  compiler must reject each one and must not crash.
+- **More mutants:** errors only some paths have (a move in one `if`
+  branch, then a use), uses of a `mut` argument left uninitialized at
+  return, and `mut` borrows of disjoint fields, which are accepted (a
+  "must accept" mutant).
 - **Overloading and `@implicit` conversions:** Mojo's resolution rules
   aren't fully specified, so the evaluator would have to restrict itself
   to unambiguous overload sets.
