@@ -206,6 +206,11 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
     the others stop; 0 otherwise."""
     var stop_seen_at: Int
     """`call_count` when this worker first saw the flag set (-1 before)."""
+    var call_log: Int
+    """If not 0, the shared memory each test case run in this process is
+    logged to, as by a forked one (for `Shrinker.parallel_step`)."""
+    var call_log_id: Int
+    """The id of the test case logged at `call_log`."""
 
     def __init__(out self, var test_fn: Self.F, settings: Settings):
         self.test_fn = test_fn^
@@ -272,6 +277,8 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
         self.fork_warned = False
         self.stop_addr = 0
         self.stop_seen_at = -1
+        self.call_log = 0
+        self.call_log_id = -1
 
     # ===------------------------------------------------------------------=== #
     # Running test cases
@@ -314,7 +321,33 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
             if not self.fork_warned:
                 self.fork_warned = True
                 print("proptest: warning: can't fork; running in-process")
+        elif self.call_log != 0:
+            _Flag(unsafe_from_address=self.call_log)[] = 0  # record length
+            _Flag(unsafe_from_address=self.call_log + 8)[] = 0  # overflowed
+            data.fork_log = ForkLog(self.call_log, LOG_SIZE)
+            var msg = self._execute_here(data)
+            data.log_end(msg)
+            data.fork_log = None
+            self.call_log_id = data.id
+            return msg^
         return self._execute_here(data)
+
+    def load_logged(
+        mut self, choices: List[ChoiceValue], base: Int
+    ) raises -> Optional[Result]:
+        """The test case on `choices` that another process ran and logged
+        at `base` (see `call_log`), recorded as if it had run here. None
+        if the log doesn't hold a finished test case."""
+        var data = self.new_data(choices.copy(), max_choices=len(choices))
+        var reader = LogReader(base)
+        var msg = data.load_fork_log(reader)
+        if not msg or reader.overflowed:
+            return None
+        var result = Result(data.as_result())
+        self._record(result, msg.value())
+        if len(self.cache) < CACHE_SIZE:
+            self.cache[choices.copy()] = result
+        return result^
 
     def _execute_forked(
         mut self, mut data: ConjectureData, base: Int
@@ -497,6 +530,13 @@ struct ConjectureRunner[F: def(mut ConjectureData) raises](Movable):
                         self.save_choices(r.choices())
                 except:
                     pass
+
+    def is_cached(self, choices: List[ChoiceValue]) -> Bool:
+        """Whether `cached_test_function(choices)` wouldn't run the test."""
+        if choices in self.cache:
+            return True
+        var used = self.tree.simulate(choices)
+        return Bool(used) and used.value() in self.cache
 
     def cached_test_function(
         mut self,

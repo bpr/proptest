@@ -60,6 +60,17 @@ from proptest.internal.data import (
     Span,
 )
 from proptest.internal.engine import ConjectureRunner, MAX_SHRINKING_SECONDS
+from proptest.internal.fork import (
+    ForkLog,
+    LogReader,
+    LOG_SIZE,
+    map_shared,
+    unmap_shared,
+    fork_process,
+    wait_process,
+    exit_child,
+    prepare_child,
+)
 from proptest.internal.floats import MAX_PRECISE_INTEGER
 from proptest.internal.pareto import dominance, LEFT_DOMINATES
 from proptest.internal.shrinking import (
@@ -74,6 +85,20 @@ from proptest.internal.intervals import IntervalSet
 from proptest.internal.decomposition import Decompositions
 
 comptime STOP_SHRINKING = "proptest.StopShrinking"
+comptime NEEDS_CALL = "proptest.NeedsCall"
+"""Raised in a dry run (`Shrinker.dry_run`) by a step that would run the
+test."""
+comptime PARALLEL_SHRINK_NS = 5_000_000
+"""With `Settings(workers=k)`, shrink steps run k at a time in forked
+processes once the test cases being shrunk take this long on average."""
+comptime _EXPLAIN_SKIP = 0
+"""Outcomes of an explain variation: no usable test case,"""
+comptime _EXPLAIN_PASS = 1
+"""the test passed,"""
+comptime _EXPLAIN_SAME = 2
+"""it failed in the same way,"""
+comptime _EXPLAIN_OTHER = 3
+"""or otherwise (invalid, or a different failure)."""
 comptime N_PASSES = 14
 """The number of shrink passes: try_trivial_spans, node_program X*5..X*1, pass_to_descendant,
 reorder_spans, minimize_duplicated_choices, minimize_individual_choices,
@@ -205,6 +230,23 @@ struct Shrinker[F: def(mut ConjectureData) raises](Movable):
     var pareto: Bool
     """Pareto mode: keep any valid test case that dominates the target
     (used to shrink members of the Pareto front)."""
+    var test_ns: Int
+    """Time spent running test cases while shrinking..."""
+    var timed_calls: Int
+    """...in this many calls (to decide on `parallel_step`)."""
+    var parallel_rounds: Int
+    """How many `parallel_step`s ran."""
+    var dry_run: Bool
+    """Raise `NEEDS_CALL` instead of running a test case not cached (to
+    find the steps worth a process in `parallel_step`)."""
+    var overlapped_calls: Int
+    """The test calls `parallel_step`s made other than the longest
+    process's in each."""
+    var other_log: Int
+    """In a child of `parallel_step`: the log the next test case goes to
+    once the current one (at `runner.call_log`) becomes the target..."""
+    var kept_log: Int
+    """...and the log of the target, if it was run in this process."""
 
     def __init__(
         out self,
@@ -241,6 +283,13 @@ struct Shrinker[F: def(mut ConjectureData) raises](Movable):
         self.pareto = pareto
         self.decompositions = None
         self.call_limit = -1
+        self.test_ns = 0
+        self.timed_calls = 0
+        self.parallel_rounds = 0
+        self.overlapped_calls = 0
+        self.dry_run = False
+        self.other_log = 0
+        self.kept_log = 0
 
     def release(deinit self) -> ConjectureRunner[Self.F]:
         return self.runner^
@@ -256,7 +305,9 @@ struct Shrinker[F: def(mut ConjectureData) raises](Movable):
         return len(self.target[].nodes)
 
     def calls(self) -> Int:
-        return self.runner.call_count
+        """Test calls so far, counting only the longest of each
+        `parallel_step`'s processes (the stall limits bound time)."""
+        return self.runner.call_count - self.overlapped_calls
 
     def predicate(self, r: Result) -> Bool:
         if self.pareto:
@@ -285,6 +336,14 @@ struct Shrinker[F: def(mut ConjectureData) raises](Movable):
         )
         self.calls_at_last_shrink = self.calls()
         self.target = r
+        if self.runner.call_log != 0:
+            # keep the target's log, and log later test cases to the other
+            if r[].id == self.runner.call_log_id:
+                self.kept_log = self.runner.call_log
+                self.runner.call_log = self.other_log
+                self.other_log = self.kept_log
+            else:
+                self.kept_log = 0
         if self.runner.settings.verbosity >= Verbosity.debug:
             print(
                 "  shrunk to",
@@ -323,7 +382,15 @@ struct Shrinker[F: def(mut ConjectureData) raises](Movable):
                 return (False, Optional[Result](None))
         if sort_key_less(self.target[].nodes, attempt):
             return (False, Optional[Result](None))
-        var r = self.runner.cached_test_function(_values(attempt))
+        var values = _values(attempt)
+        if self.dry_run and not self.runner.is_cached(values):
+            raise Error(NEEDS_CALL)
+        var calls_before = self.calls()
+        var t0 = perf_counter_ns()
+        var r = self.runner.cached_test_function(values)
+        if self.calls() != calls_before:
+            self.test_ns += perf_counter_ns() - t0
+            self.timed_calls += 1
         var prev = self.target[].id
         self.incorporate(r)
         self.check_calls()
@@ -369,6 +436,10 @@ struct Shrinker[F: def(mut ConjectureData) raises](Movable):
         any other generated value"; one passing variation rules it out.
         Finally, if several arguments got comments, check whether they can
         all vary together.
+
+        With slow test cases and `Settings(workers=k)`, variations run `k`
+        at a time in forked processes (`_explain_batch`); their outcomes
+        are taken in order, as if run one at a time.
         """
         if self.stalled:
             return
@@ -438,79 +509,61 @@ struct Shrinker[F: def(mut ConjectureData) raises](Movable):
                     candidates.append(borrowed^)
             var n_same = 0
             var chunk_list = List[List[ChoiceValue]]()
-            for n_attempt in range(500 + len(candidates)):
-                if n_attempt - 10 - len(candidates) > n_same * 5:
-                    break  # mostly invalid variations
-                var replacement: List[ChoiceValue]
-                if n_attempt < len(candidates):
-                    replacement = candidates[n_attempt].copy()
-                else:
-                    replacement = List[ChoiceValue]()
-                    for i in range(start, end):
-                        if nodes[i].was_forced:
-                            replacement.append(nodes[i].value.copy())
-                        else:
-                            replacement.append(
-                                self.runner.tree_provider.draw(
-                                    nodes[i].constraints
+            var arg_span = target.arg_spans[k]
+            var total = 500 + len(candidates)
+            var n_attempt = 0
+            var done = False
+            while n_attempt < total and not done:
+                # variations are tried `explain_batch()` at a time; their
+                # outcomes are taken in order, as if one at a time
+                var batch = List[List[ChoiceValue]]()
+                for j in range(min(self.explain_batch(), total - n_attempt)):
+                    var replacement: List[ChoiceValue]
+                    if n_attempt + j < len(candidates):
+                        replacement = candidates[n_attempt + j].copy()
+                    else:
+                        replacement = List[ChoiceValue]()
+                        for i in range(start, end):
+                            if nodes[i].was_forced:
+                                replacement.append(nodes[i].value.copy())
+                            else:
+                                replacement.append(
+                                    self.runner.tree_provider.draw(
+                                        nodes[i].constraints
+                                    )
                                 )
-                            )
-                var attempt = List[ChoiceValue]()
-                for i in range(start):
-                    attempt.append(choices[i].copy())
-                for v in replacement:
-                    attempt.append(v.copy())
-                for i in range(end, len(choices)):
-                    attempt.append(choices[i].copy())
-                var result = self.runner.cached_test_function(
-                    attempt, extend=-1
-                )
-                if result[].status == Status.OVERRUN:
-                    continue
-                var arg_span = target.arg_spans[k]
-                var same_suffix = len(result[].nodes) == len(attempt)
-                if same_suffix:
-                    for i in range(end, len(choices)):
-                        if not (result[].nodes[i].value == choices[i]):
-                            same_suffix = False
-                            break
-                if not same_suffix:
-                    # a variable-length argument: take what it drew
-                    if (
-                        arg_span >= len(result[].spans)
-                        or result[].spans[arg_span].start != start
-                    ):
-                        continue
-                    var result_end = result[].spans[arg_span].end
-                    var infix = List[ChoiceValue]()
-                    for i in range(start, result_end):
-                        infix.append(result[].nodes[i].value.copy())
-                    var attempt2 = List[ChoiceValue]()
+                    var attempt = List[ChoiceValue]()
                     for i in range(start):
-                        attempt2.append(choices[i].copy())
-                    for v in infix:
-                        attempt2.append(v.copy())
+                        attempt.append(choices[i].copy())
+                    for v in replacement:
+                        attempt.append(v.copy())
                     for i in range(end, len(choices)):
-                        attempt2.append(choices[i].copy())
-                    chunk_list.append(infix^)
-                    result = self.runner.cached_test_function(attempt2)
-                    if result[].status == Status.OVERRUN:
-                        continue
-                else:
-                    var infix = List[ChoiceValue]()
-                    for i in range(start, end):
-                        infix.append(result[].nodes[i].value.copy())
-                    chunk_list.append(infix^)
-                if self.target[].id != target_id:
-                    self.arg_comments = Dict[Int, String]()
-                    return
-                if result[].status == Status.VALID:
-                    break  # this argument matters
-                if self.predicate(result):
-                    n_same += 1
-                    if n_same >= 100:
-                        self.arg_comments[k] = "or any other generated value"
+                        attempt.append(choices[i].copy())
+                    batch.append(attempt^)
+                var outcomes = self._explain_batch(
+                    batch, start, end, arg_span, choices, together=False
+                )
+                for o in outcomes:
+                    if n_attempt - 10 - len(candidates) > n_same * 5:
+                        done = True  # mostly invalid variations
                         break
+                    n_attempt += 1
+                    if o[1]:
+                        chunk_list.append(o[1].value().copy())
+                    if self.target[].id != target_id:
+                        self.arg_comments = Dict[Int, String]()
+                        return
+                    if o[0] == _EXPLAIN_PASS:
+                        done = True  # this argument matters
+                        break
+                    if o[0] == _EXPLAIN_SAME:
+                        n_same += 1
+                        if n_same >= 100:
+                            self.arg_comments[
+                                k
+                            ] = "or any other generated value"
+                            done = True
+                            break
             chunks[k] = chunk_list^
         if len(self.arg_comments) <= 1:
             return
@@ -520,38 +573,219 @@ struct Shrinker[F: def(mut ConjectureData) raises](Movable):
             if k in self.arg_comments:
                 commented.append(k)
         var n_together = 0
-        for _ in range(500):
-            var attempt = List[ChoiceValue]()
-            var prev_end = 0
-            for k in commented:
-                for i in range(prev_end, starts[k]):
-                    attempt.append(choices[i].copy())
-                ref ls = chunks[k]
-                if len(ls) == 0:
-                    for i in range(starts[k], ends[k]):
+        var n_tried = 0
+        while n_tried < 500:
+            var batch = List[List[ChoiceValue]]()
+            for _ in range(min(self.explain_batch(), 500 - n_tried)):
+                var attempt = List[ChoiceValue]()
+                var prev_end = 0
+                for k in commented:
+                    for i in range(prev_end, starts[k]):
                         attempt.append(choices[i].copy())
-                else:
-                    var pick = Int(self.runner.random.below(UInt64(len(ls))))
-                    for v in ls[pick]:
-                        attempt.append(v.copy())
-                prev_end = ends[k]
-            for i in range(prev_end, len(choices)):
-                attempt.append(choices[i].copy())
-            var result = self.runner.cached_test_function(attempt)
-            if result[].status == Status.VALID:
-                self.explain_note = (
-                    "The test sometimes passed when commented parts were"
-                    " varied together."
-                )
-                return
-            if self.predicate(result):
-                n_together += 1
-                if n_together >= 100:
+                    ref ls = chunks[k]
+                    if len(ls) == 0:
+                        for i in range(starts[k], ends[k]):
+                            attempt.append(choices[i].copy())
+                    else:
+                        var pick = Int(
+                            self.runner.random.below(UInt64(len(ls)))
+                        )
+                        for v in ls[pick]:
+                            attempt.append(v.copy())
+                    prev_end = ends[k]
+                for i in range(prev_end, len(choices)):
+                    attempt.append(choices[i].copy())
+                batch.append(attempt^)
+            var outcomes = self._explain_batch(
+                batch, 0, 0, 0, choices, together=True
+            )
+            for o in outcomes:
+                n_tried += 1
+                if o[0] == _EXPLAIN_PASS:
                     self.explain_note = (
-                        "The test always failed when commented parts were"
+                        "The test sometimes passed when commented parts were"
                         " varied together."
                     )
                     return
+                if o[0] == _EXPLAIN_SAME:
+                    n_together += 1
+                    if n_together >= 100:
+                        self.explain_note = (
+                            "The test always failed when commented parts were"
+                            " varied together."
+                        )
+                        return
+
+    def explain_batch(self) -> Int:
+        """How many explain variations to try at once: `Settings.workers`
+        when test cases are slow enough (as for `parallel_step`), else 1.
+        """
+        if self.use_parallel_steps():
+            return self.runner.settings.worker_count()
+        return 1
+
+    def _explain_attempt(
+        mut self,
+        attempt: List[ChoiceValue],
+        start: Int,
+        end: Int,
+        arg_span: Int,
+        choices: List[ChoiceValue],
+        together: Bool,
+    ) -> Tuple[Int, Optional[List[ChoiceValue]]]:
+        """Run one explain variation: its outcome (`_EXPLAIN_*`) and, for
+        an argument's variation, the choices the argument drew (None if
+        none were recorded)."""
+        var calls_before = self.calls()
+        var t0 = perf_counter_ns()
+        var outcome = self._explain_attempt_untimed(
+            attempt, start, end, arg_span, choices, together
+        )
+        if self.calls() != calls_before:
+            self.test_ns += perf_counter_ns() - t0
+            self.timed_calls += self.calls() - calls_before
+        return outcome^
+
+    def _explain_attempt_untimed(
+        mut self,
+        attempt: List[ChoiceValue],
+        start: Int,
+        end: Int,
+        arg_span: Int,
+        choices: List[ChoiceValue],
+        together: Bool,
+    ) -> Tuple[Int, Optional[List[ChoiceValue]]]:
+        var none = Optional[List[ChoiceValue]](None)
+        if together:
+            var r = self.runner.cached_test_function(attempt)
+            return (self._explain_outcome(r), none^)
+        var result = self.runner.cached_test_function(attempt, extend=-1)
+        if result[].status == Status.OVERRUN:
+            return (_EXPLAIN_SKIP, none^)
+        var same_suffix = len(result[].nodes) == len(attempt)
+        if same_suffix:
+            for i in range(end, len(choices)):
+                if not (result[].nodes[i].value == choices[i]):
+                    same_suffix = False
+                    break
+        if same_suffix:
+            var infix = List[ChoiceValue]()
+            for i in range(start, end):
+                infix.append(result[].nodes[i].value.copy())
+            return (self._explain_outcome(result), Optional(infix^))
+        # a variable-length argument: take what it drew
+        if (
+            arg_span >= len(result[].spans)
+            or result[].spans[arg_span].start != start
+        ):
+            return (_EXPLAIN_SKIP, none^)
+        var result_end = result[].spans[arg_span].end
+        var infix = List[ChoiceValue]()
+        for i in range(start, result_end):
+            infix.append(result[].nodes[i].value.copy())
+        var attempt2 = List[ChoiceValue]()
+        for i in range(start):
+            attempt2.append(choices[i].copy())
+        for v in infix:
+            attempt2.append(v.copy())
+        for i in range(end, len(choices)):
+            attempt2.append(choices[i].copy())
+        var r2 = self.runner.cached_test_function(attempt2)
+        if r2[].status == Status.OVERRUN:
+            return (_EXPLAIN_SKIP, Optional(infix^))
+        return (self._explain_outcome(r2), Optional(infix^))
+
+    def _explain_outcome(self, r: Result) -> Int:
+        if r[].status == Status.VALID:
+            return _EXPLAIN_PASS
+        if self.predicate(r):
+            return _EXPLAIN_SAME
+        return _EXPLAIN_OTHER
+
+    def _explain_batch(
+        mut self,
+        attempts: List[List[ChoiceValue]],
+        start: Int,
+        end: Int,
+        arg_span: Int,
+        choices: List[ChoiceValue],
+        *,
+        together: Bool,
+    ) -> List[Tuple[Int, Optional[List[ChoiceValue]]]]:
+        """The outcomes of explain variations `attempts`, in order: run
+        here if there is one, else each in a forked process at once (a
+        process that dies counts as `_EXPLAIN_SKIP`)."""
+        var out = List[Tuple[Int, Optional[List[ChoiceValue]]]]()
+        if len(attempts) == 1:
+            out.append(
+                self._explain_attempt(
+                    attempts[0], start, end, arg_span, choices, together
+                )
+            )
+            return out^
+        self.parallel_rounds += 1
+        var logs = List[Int]()
+        var pids = List[Int]()
+        for a in range(len(attempts)):
+            var base = map_shared(LOG_SIZE)
+            if base == 0:
+                break
+            logs.append(base)
+            var pid = fork_process()
+            if pid == 0:
+                prepare_child(None, quiet=True)
+                self.runner.db = None
+                self.runner.front = None
+                var calls_before = self.calls()
+                var o = self._explain_attempt_untimed(
+                    attempts[a], start, end, arg_span, choices, together
+                )
+                var log = ForkLog(base, LOG_SIZE)
+                log.int(self.calls() - calls_before)
+                log.int(o[0])
+                log.bool(Bool(o[1]))
+                if o[1]:
+                    ref infix = o[1].value()
+                    log.int(len(infix))
+                    for v in infix:
+                        log.value(v)
+                log.commit()
+                exit_child(0)
+            if pid < 0:
+                break
+            pids.append(pid)
+        for pid in pids:
+            _ = wait_process(pid)
+        var most_calls = 0
+        for c in range(len(attempts)):
+            var outcome = (_EXPLAIN_SKIP, Optional[List[ChoiceValue]](None))
+            if c < len(pids):
+                var r = LogReader(logs[c])
+                if r.more():
+                    try:
+                        var calls = r.int()
+                        var kind = r.int()
+                        var infix = Optional[List[ChoiceValue]](None)
+                        if r.bool():
+                            var vs = List[ChoiceValue]()
+                            for _ in range(r.length(1)):
+                                vs.append(r.value())
+                            infix = vs^
+                        if (
+                            calls >= 0
+                            and _EXPLAIN_SKIP <= kind <= _EXPLAIN_OTHER
+                        ):
+                            self.runner.call_count += calls
+                            self.overlapped_calls += calls
+                            most_calls = max(most_calls, calls)
+                            outcome = (kind, infix^)
+                    except:
+                        pass  # a corrupt log
+            out.append(outcome^)
+        self.overlapped_calls -= most_calls
+        for base in logs:
+            unmap_shared(base, LOG_SIZE)
+        return out^
 
     # ===------------------------------------------------------------------=== #
     # Pass scheduling
@@ -617,13 +851,28 @@ struct Shrinker[F: def(mut ConjectureData) raises](Movable):
         order starting where the pass last stopped, or in random order once
         the pass is stalling, and a pass is exhausted when all have been
         tried."""
+        var i = self.next_position(p, random_order)
+        if i < 0:
+            return False
+        var calls_before = self.calls()
+        var shrinks_before = self.shrinks
+        var size_before = self.num_nodes()
+        self.pass_at(p, i)
+        self.pass_calls[p] += self.calls() - calls_before
+        self.pass_shrinks[p] += self.shrinks - shrinks_before
+        self.pass_deletions[p] += size_before - self.num_nodes()
+        return True
+
+    def next_position(mut self, p: Int, random_order: Bool) -> Int:
+        """A position not yet tried for pass `p` on the current target
+        (now marked as tried), or -1 if there are none."""
         if self.tried_target != self.target[].id:
             self.tried_target = self.target[].id
             for k in range(N_PASSES):
                 self.tried[k] = Set[Int]()
         var n = self.positions(p)
         if len(self.tried[p]) >= n:
-            return False
+            return -1
         var i = -1
         if random_order:
             for _ in range(8):
@@ -640,14 +889,207 @@ struct Shrinker[F: def(mut ConjectureData) raises](Movable):
                     break
         self.tried[p].add(i)
         self.last_position[p] = i
+        return i
+
+    def use_parallel_steps(self) -> Bool:
+        """Whether to shrink with `parallel_step`: with
+        `Settings(workers=k)`, when the test cases take long enough that
+        starting k processes per step costs less than it saves."""
+        return (
+            not self.pareto
+            and self.runner.settings.worker_count() > 1
+            and self.timed_calls >= 2
+            and self.test_ns >= self.timed_calls * PARALLEL_SHRINK_NS
+        )
+
+    def parallel_step(
+        mut self, p: Int, random_order: Bool
+    ) raises -> Tuple[Int, Int]:
+        """Run pass `p` at up to `Settings.workers` untried positions at
+        once, each in a forked process, and keep what the first of them
+        (in the order `step` takes them) shrank the target to. Returns how
+        many positions were tried and made test calls (-1 if the pass is
+        exhausted) and the most test calls one of them made.
+
+        Positions are first tried here in a dry run (`dry_run`), which
+        stops at the first test case not cached: only the steps that run
+        the test are worth a process. A process logs its test cases as
+        `Settings(fork=True)` does, so that its new target needn't be run
+        again here.
+
+        After QuickerCheck's parallel shrinking, but deterministic: the
+        result doesn't depend on which process finishes first. Only the
+        longest process's test calls count towards the stall limit, and
+        the processes' test cases aren't cached here."""
+        var k = self.runner.settings.worker_count()
+        # positions whose step runs the test; the others are done here
+        var positions = List[Int]()
+        var before = self.target[].id
+        while len(positions) < k:
+            var i = self.next_position(p, random_order)
+            if i < 0:
+                break
+            var shrinks_before = self.shrinks
+            var size_before = self.num_nodes()
+            self.dry_run = True
+            try:
+                self.pass_at(p, i)
+            except e:
+                self.dry_run = False
+                if String(e) != NEEDS_CALL:
+                    raise e^
+                positions.append(i)
+            self.dry_run = False
+            if self.target[].id != before:
+                # a cached test case was simpler: the positions found so
+                # far were for the old target
+                self.pass_shrinks[p] += self.shrinks - shrinks_before
+                self.pass_deletions[p] += size_before - self.num_nodes()
+                return (0, 0)
+        if len(positions) == 0:
+            return (-1, 0)
+        if len(positions) == 1:
+            # not worth a process
+            var calls_before = self.calls()
+            var shrinks_before = self.shrinks
+            var size_before = self.num_nodes()
+            self.pass_at(p, positions[0])
+            self.pass_calls[p] += self.calls() - calls_before
+            self.pass_shrinks[p] += self.shrinks - shrinks_before
+            self.pass_deletions[p] += size_before - self.num_nodes()
+            return (
+                1 if self.calls() != calls_before else 0,
+                self.calls() - calls_before,
+            )
+        self.parallel_rounds += 1
+        # per child: its result, and two logs of test cases
+        var logs = List[Int]()
+        var pids = List[Int]()
+        try:
+            for i in positions:
+                var bases = List[Int]()
+                for _ in range(3):
+                    var base = map_shared(LOG_SIZE)
+                    if base != 0:
+                        bases.append(base)
+                        logs.append(base)
+                if len(bases) < 3:
+                    break
+                var pid = fork_process()
+                if pid == 0:
+                    self._step_in_child(p, i, bases[0], bases[1], bases[2])
+                    exit_child(0)
+                if pid < 0:
+                    break
+                pids.append(pid)
+            for pid in pids:
+                _ = wait_process(pid)
+            return self._collect_steps(p, logs, len(pids))
+        finally:
+            for base in logs:
+                unmap_shared(base, LOG_SIZE)
+
+    def _step_in_child(
+        mut self, p: Int, i: Int, log_base: Int, log_a: Int, log_b: Int
+    ):
+        """In a child of `parallel_step`: run pass `p` at position `i`,
+        and log the calls made, any error, and the new target if any,
+        and which of `log_a` and `log_b` holds the target's test case
+        (if it ran here: the parent then needn't run it again)."""
+        prepare_child(None, quiet=True)
+        self.runner.db = None
+        self.runner.front = None
+        if not self.runner.settings.forks():
+            self.runner.call_log = log_a
+            self.other_log = log_b
+        var before = self.target[].id
         var calls_before = self.calls()
-        var shrinks_before = self.shrinks
-        var size_before = self.num_nodes()
-        self.pass_at(p, i)
-        self.pass_calls[p] += self.calls() - calls_before
-        self.pass_shrinks[p] += self.shrinks - shrinks_before
-        self.pass_deletions[p] += size_before - self.num_nodes()
-        return True
+        var error = String()
+        try:
+            self.pass_at(p, i)
+        except e:
+            if String(e) != STOP_SHRINKING:
+                error = String(e)
+        var log = ForkLog(log_base, LOG_SIZE)
+        log.int(self.calls() - calls_before)
+        log.string(error)
+        var changed = self.target[].id != before
+        log.bool(changed)
+        if changed:
+            ref nodes = self.target[].nodes
+            log.int(len(nodes))
+            for node in nodes:
+                log.value(node.value)
+                log.constraints(node.constraints)
+                log.bool(node.was_forced)
+            log.int(
+                0 if self.kept_log
+                == 0 else (1 if self.kept_log == log_a else 2)
+            )
+        log.commit()
+
+    def _collect_steps(
+        mut self, p: Int, logs: List[Int], n: Int
+    ) raises -> Tuple[Int, Int]:
+        """Read what the first `n` of `parallel_step`'s children did, and
+        take the new target of the first that shrank it (from its log, or
+        by running it again here)."""
+        var most_calls = 0
+        var with_calls = 0
+        var best = Optional[List[ChoiceNode]](None)
+        var best_log = 0
+        var error = String()
+        for c in range(n):
+            var r = LogReader(logs[3 * c])
+            if not r.more():
+                continue  # the child crashed
+            try:
+                var calls = r.int()
+                if calls < 0:
+                    continue
+                self.runner.call_count += calls
+                self.overlapped_calls += calls
+                self.pass_calls[p] += calls
+                most_calls = max(most_calls, calls)
+                if calls > 0:
+                    with_calls += 1
+                var e = r.string()
+                if e.byte_length() > 0 and error.byte_length() == 0:
+                    error = e
+                if not r.bool():
+                    continue
+                var nodes = List[ChoiceNode]()
+                for _ in range(r.length(1)):
+                    var v = r.value()
+                    var con = r.constraints()
+                    nodes.append(ChoiceNode(v^, con^, r.bool()))
+                var kept = r.int()
+                if not best:  # the first in the order sequential steps take
+                    best = nodes^
+                    best_log = logs[3 * c + kept] if 1 <= kept <= 2 else 0
+            except:
+                continue  # a corrupt log
+        self.overlapped_calls -= most_calls
+        if best:
+            var shrinks_before = self.shrinks
+            var size_before = self.num_nodes()
+            var nodes = best.take()
+            var logged = Optional[Result](None)
+            if best_log != 0 and sort_key_less(nodes, self.target[].nodes):
+                try:
+                    logged = self.runner.load_logged(_values(nodes), best_log)
+                except:
+                    pass  # an inconsistent log: run it again here
+            if logged:
+                self.incorporate(logged.value())
+            else:
+                _ = self.consider(nodes^)
+            self.pass_shrinks[p] += self.shrinks - shrinks_before
+            self.pass_deletions[p] += size_before - self.num_nodes()
+        elif error.byte_length() > 0:
+            raise Error(error)
+        self.check_calls()
+        return (with_calls, most_calls)
 
     def greedy_shrink(mut self) raises:
         """Run the passes to a fixed point (port of `fixate_shrink_passes`).
@@ -680,6 +1122,19 @@ struct Shrinker[F: def(mut ConjectureData) raises](Movable):
                     )
                     var prev = self.target[].id
                     var initial_calls = self.calls()
+                    if self.use_parallel_steps():
+                        var tried = self.parallel_step(p, failures >= 10)
+                        if tried[0] < 0:
+                            break
+                        any_ran = True
+                        if prev != self.target[].id:
+                            failures = 0
+                        elif initial_calls != self.calls():
+                            max_calls_per_failing_step = max(
+                                max_calls_per_failing_step, tried[1]
+                            )
+                            failures += tried[0]
+                        continue
                     if not self.step(p, failures >= 10):
                         break
                     any_ran = True
@@ -716,6 +1171,18 @@ struct Shrinker[F: def(mut ConjectureData) raises](Movable):
                 " shrank",
             )
         )
+        if self.parallel_rounds > 0:
+            print(
+                String(
+                    "  ",
+                    self.parallel_rounds,
+                    " steps ran in parallel (Settings.workers), with ",
+                    self.runner.call_count
+                    - self.initial_calls
+                    - (self.calls() - self.initial_calls),
+                    " calls overlapping others",
+                )
+            )
         for p in range(N_PASSES):
             if self.pass_calls[p] == 0:
                 continue
@@ -1123,6 +1590,8 @@ struct Shrinker[F: def(mut ConjectureData) raises](Movable):
             self.lower_common_node_offset()
             return True
         if attempt[].status == Status.OVERRUN:
+            if self.dry_run:
+                raise Error(NEEDS_CALL)
             attempt = self.runner.cached_test_function(
                 _values(initial), extend=-1
             )
@@ -1517,6 +1986,8 @@ struct Shrinker[F: def(mut ConjectureData) raises](Movable):
             if initial[].spans[s].start == i:
                 span_ids.append(s)
         for _ in range(3):
+            if self.dry_run:
+                raise Error(NEEDS_CALL)
             var r = self.runner.cached_test_function(
                 _values(prefix), extend=len(nodes)
             )

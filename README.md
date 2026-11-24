@@ -418,8 +418,9 @@ them, so the parent can rebuild a test case that crashed partway.
 With `workers=k` (after QuickerCheck, a parallel QuickCheck), the
 generate phase runs in `k` forked processes, each with its own seed and
 a share of `max_examples`; the first failure stops the others, and the
-main process shrinks it. It pays off for slow test cases (a millisecond
-or more each).
+main process shrinks it, trying `k` shrink steps (and explain-phase
+variations) at once when test cases take 5 ms or more. It pays off for slow test cases (a millisecond or
+more each).
 
 Failing examples are saved in the example database (`.proptest/examples`,
 one directory per test, keyed by the test's source location) and replayed

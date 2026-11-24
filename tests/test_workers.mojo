@@ -31,6 +31,16 @@ def failure[T: def(Int) raises](test: T, settings: Settings) raises -> String:
     return String()
 
 
+def failure_of[
+    S: Strategy, T: def(S.Value) raises
+](strategy: S, test: T, settings: Settings) raises -> String:
+    try:
+        given(strategy, test, settings)
+    except e:
+        return String(e)
+    return String()
+
+
 def test_a_failure_found_by_a_worker_is_shrunk() raises:
     def prop(x: Int) raises:
         if x >= 1000:
@@ -118,6 +128,54 @@ def test_slow_test_cases_run_in_parallel() raises:
     assert_true(
         parallel * 3 < sequential * 2,
         String("parallel ", parallel, " ns, sequential ", sequential, " ns"),
+    )
+
+
+def test_slow_failures_are_shrunk_in_parallel() raises:
+    # 6 ms per test case: slow enough for parallel shrink steps
+    def prop(xs: List[Int]) raises:
+        sleep_ms(6)
+        var total = 0
+        for x in xs:
+            total += x
+        assert_true(total < 1000, "too big")
+
+    var settings = in_workers(8)
+    settings.seed = UInt64(3)
+    var msg = failure_of(lists(integers(0, 10_000)), prop, settings)
+    assert_true("given([1000])" in msg, msg)
+
+
+def test_slow_crashes_are_shrunk_in_parallel_with_fork() raises:
+    def prop(x: Int) raises:
+        sleep_ms(6)
+        if x >= 1000:
+            crash(11)
+
+    var settings = in_workers(8)
+    settings.fork = True
+    var msg = failure(prop, settings)
+    assert_true("given(1000)" in msg and "SIGSEGV" in msg, msg)
+
+
+def test_slow_failures_are_explained_in_parallel() raises:
+    # explain tries 100 variations of each free argument; with 6 ms test
+    # cases, 8 at a time
+    def prop(a: Int, s: String, b: Int) raises:
+        sleep_ms(6)
+        if a > 10:
+            fail("a too big")
+
+    var msg = String()
+    try:
+        given(integers(), text(), integers(), prop, in_workers(8))
+    except e:
+        msg = String(e)
+    assert_true("        11,\n" in msg, msg)
+    assert_true("'',  # or any other generated value" in msg, msg)
+    assert_true("0,  # or any other generated value" in msg, msg)
+    assert_true(
+        "always failed when commented parts were varied together" in msg, msg
     )
 
 

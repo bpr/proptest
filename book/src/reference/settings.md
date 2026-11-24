@@ -48,7 +48,7 @@ Settings(
 | `fork` | Run each test case in a child process, so that a crash (a segfault, an abort, a sanitizer report) fails the test case and is shrunk instead of ending the run. See [Test code that crashes](../how-to/crashes.md). |
 | `timeout` | Kill a test case that runs longer than this many milliseconds, and fail it with `Timeout`. Implies `fork`. |
 | `dictionary` | Tokens the inputs are likely to need: generation occasionally returns one whole, and `fuzz` inserts them into strings and byte strings. A list of strings converts to a `Dictionary`. See [Use a dictionary](../how-to/fuzzing.md#use-a-dictionary). |
-| `workers` | Run the generate phase in this many `fork()`ed processes at once, each with its own seed and a share of `max_examples`; 0 means one per physical core. Shrinking stays in the main process. See [Run slow tests in parallel](../how-to/parallel.md). |
+| `workers` | Run the generate phase in this many `fork()`ed processes at once, each with its own seed and a share of `max_examples`; 0 means one per physical core. The main process shrinks the failure, trying this many shrink steps, and explain-phase variations, at once (in `fork()`ed processes) when test cases take 5 ms or more. See [Run slow tests in parallel](../how-to/parallel.md). |
 | `check_coverage` | Check `cover` requirements statistically, generating past `max_examples` until they're settled, and fail if one isn't met (QuickCheck's `checkCoverage`). |
 
 ## Environment variables

@@ -222,8 +222,11 @@ struct Settings(Copyable, Writable):
     """Generate test cases in this many processes at once (`fork()`ed
     workers, each with its own seed and a share of `max_examples`); 0
     means one per physical core. The first failure stops the other
-    workers; shrinking runs in this process, as usual. Speeds up tests
-    whose test cases are slow (milliseconds or more each): see
+    workers, and this process shrinks it; once the test cases being
+    shrunk take 5 ms or more each, the shrinker also tries that many
+    steps, and the explain phase that many variations, at once, in forked
+    processes. Speeds up tests whose test cases
+    are slow (milliseconds or more each): see
     `docs/differences-from-hypothesis.md`. Not used with
     `check_coverage`, `reproduce=`, or by the fuzz loop. POSIX only."""
     var dictionary: Dictionary
@@ -282,8 +285,8 @@ struct Settings(Copyable, Writable):
         return self.fork or Bool(self.timeout)
 
     def worker_count(self) -> Int:
-        """How many processes generate test cases (`workers`, with 0 as
-        the number of physical cores)."""
+        """How many processes generate test cases, or try shrink steps,
+        at once (`workers`, with 0 as the number of physical cores)."""
         if self.workers == 0:
             return max(num_physical_cores(), 1)
         return max(self.workers, 1)

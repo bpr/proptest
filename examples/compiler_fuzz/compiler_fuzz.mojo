@@ -46,7 +46,10 @@
 #
 # Each test case takes a second or two, nearly all of it compiling.
 # The compiler under test is $MOJO (default `mojo`); see
-# build_and_compare.sh. COMPILER_FUZZ_NO_SHRINK=1 skips shrinking,
+# build_and_compare.sh. Programs are built and run in one process per
+# physical core at once (PROPTEST_WORKERS=k for k, 1 for one at a time),
+# each in a directory of its own in the work directory.
+# COMPILER_FUZZ_NO_SHRINK=1 skips shrinking,
 # COMPILER_FUZZ_NO_7593_WORKAROUND=1 lets `range` loops overwrite tracked
 # values without reading them first (compilers before 1.3.0.dev2026111605
 # then fail with UNBALANCED), and
@@ -54,11 +57,31 @@
 # programs. The failing program is kept as failing_program.mojo in the
 # work directory.
 
+from std.ffi import external_call
 from std.os import getenv
 from std.subprocess import run
 from std.sys import argv
 
 from proptest import *
+
+# Test cases run in this many worker processes at once (0: one per
+# physical core; each test case also runs two compilers at once), and the
+# failure found is shrunk in as many at once (`Settings.workers`);
+# PROPTEST_WORKERS overrides it
+comptime WORKERS = 0
+
+
+def env_int(name: String, default: Int) -> Int:
+    """The integer in environment variable `name`, or `default`.
+
+    Settings only takes PROPTEST_* variables for settings left at their
+    defaults, so the fuzzers read the ones they change themselves.
+    """
+    try:
+        var v = getenv(name)
+        return Int(v) if v.byte_length() > 0 else default
+    except:
+        return default
 
 
 comptime CONSTANTS: List[String] = [
@@ -3854,6 +3877,15 @@ def draw_program(mut data: ConjectureData) raises -> Tuple[String, String]:
     return (program^, comptime_program^)
 
 
+def process_dir(work_dir: String) raises -> String:
+    """A directory of this process's own in `work_dir`, so that worker
+    processes (`Settings(workers=k)`) don't overwrite each other's files.
+    """
+    var dir = String(work_dir, "/p", external_call["getpid", Int32]())
+    _ = run(String("mkdir -p ", dir))
+    return dir^
+
+
 def main() raises:
     var work_dir = (
         String(argv()[1]) if len(argv()) > 1 else "build/compiler_fuzz_work"
@@ -3868,18 +3900,19 @@ def main() raises:
         mut data: ConjectureData,
     ) raises {imm work_dir, imm script}:
         var programs = draw_program(data)
-        with open(String(work_dir, "/program.mojo"), "w") as f:
+        var dir = process_dir(work_dir)
+        with open(String(dir, "/program.mojo"), "w") as f:
             f.write(programs[0])
-        with open(String(work_dir, "/comptime.mojo"), "w") as f:
+        with open(String(dir, "/comptime.mojo"), "w") as f:
             f.write(programs[1])
-        var verdict = run(String("bash ", script, " ", work_dir, " 2>&1"))
+        var verdict = run(String("bash ", script, " ", dir, " 2>&1"))
         if not verdict.startswith("OK"):
             data.note(programs[0])
             data.note(verdict)
             _ = run(
                 String(
                     "cp ",
-                    work_dir,
+                    dir,
                     "/program.mojo ",
                     work_dir,
                     "/failing_program.mojo",
@@ -3888,7 +3921,7 @@ def main() raises:
             _ = run(
                 String(
                     "cp ",
-                    work_dir,
+                    dir,
                     "/comptime.mojo ",
                     work_dir,
                     "/failing_comptime.mojo",
@@ -3899,8 +3932,16 @@ def main() raises:
             fail(String(verdict.split("\n")[0]))
 
     var settings = Settings(
-        database=None, deadline=None, max_examples=200, print_blob=True
+        database=None,
+        deadline=None,
+        max_examples=env_int("PROPTEST_MAX_EXAMPLES", 200),
+        print_blob=True,
+        workers=env_int("PROPTEST_WORKERS", WORKERS),
     )
+    # no explain phase: it varies each draw of the generator up to 100
+    # times (even `workers` at a time, that's many minutes of builds), and
+    # "or any other generated value" says little about a generated program
+    settings.phases = Phases(explain=False)
     if getenv("COMPILER_FUZZ_NO_SHRINK") != "":
         settings.phases = Phases(shrink=False, explain=False)
     given_data(differential, settings)

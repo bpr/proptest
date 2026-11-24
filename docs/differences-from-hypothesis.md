@@ -760,13 +760,37 @@ the same table at run time from `unicodedata` and caches it on disk.
   have made as many calls again as when they saw it (as a single run
   does after its first failure). Each worker sends back its counts,
   statistics, errors, and failures' choice sequences, and the main
-  process replays and shrinks the failures. Shrinking stays sequential
-  (QuickerCheck's parallel shrinking pays off only when test cases are
-  slow, and its deterministic variant wastes work on speculation). The
+  process replays and shrinks the failures. The
   workers keep separate `DataTree`s, so they can repeat each other's
   test cases, and which failure is found first depends on timing.
   Ignored with `check_coverage`, whose stopping rule needs all the test
   cases seen so far.
+
+  Shrinking also uses the `k` processes once the test cases being shrunk
+  take 5 ms or more each (below that, forking costs more than it saves):
+  `Shrinker.parallel_step` tries one pass at `k` positions at once, each
+  in a `fork()`ed child, and keeps what the first of them (in the order
+  sequential shrinking takes positions) shrank to. Like QuickerCheck's
+  deterministic parallel shrinking, the result doesn't depend on timing;
+  unlike it, the unit of work is a whole step (which may make several
+  test calls, e.g. a binary search over one choice), not one candidate.
+  The parent first tries each position in a dry run that stops at the
+  first test case not cached, so only steps that run the test get a
+  process. A child logs each test case it runs as `Settings(fork=True)`
+  does, so its new target is rebuilt from the log rather than run again.
+  Only the longest child's calls count towards the stall limits, which
+  bound time. On properties shaped like the compiler fuzzers' (20 ms test
+  cases, dozens of choices), 8 processes shrink 1.5 to 2 times faster
+  and reach the same result; a test case with one choice (a string, say)
+  gains nothing.
+
+  The explain phase, under the same condition, runs its variations `k`
+  at a time, each in a `fork()`ed child that reports its outcome (passed,
+  failed the same way, or neither) and the argument's choices. The
+  parent takes the outcomes in order, exactly as the one-at-a-time loop
+  would, so only the extra variations past a deciding one are wasted;
+  the random variations come from the parent's generator, drawn before
+  each batch. With 8 workers it runs about 7 times faster.
 - **Observability output, settings profiles, the pytest plugin, the ghostwriter**: tooling around
   Python's ecosystem. Environment-variable overrides stand in for profiles.
 - **Health checks**: `filter_too_much`, `data_too_large`,

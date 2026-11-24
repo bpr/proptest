@@ -49,8 +49,23 @@ its own seed and its share of `max_examples`. When one finds a failure,
 the others stop after their current test case (or, with
 `report_multiple_bugs`, after looking a little longer for other bugs, as a
 single process does after its first failure). The failures come back to
-the main process, which replays and shrinks them there, as usual.
-Shrinking isn't parallel: each step depends on the one before.
+the main process, which replays and shrinks them there.
+
+Shrinking goes one step at a time, each starting from the simplest
+failing test case so far, but a step can be tried at many places in the
+test case at once. When test cases take 5 ms or more, the shrinker tries
+`k` of them at a time, each in a forked process, and keeps the result of
+the first that made progress, in the order a single process would have
+tried them. So the shrunk failure doesn't depend on timing, and is
+usually the one a single process finds. That's typically 1.5 to 2 times
+faster with 8 workers; a test case with only a few choices, such as one
+string, gains little.
+
+The [explain phase](../reference/settings.md), which tries a hundred
+variations of each argument of the shrunk failure to find the ones that
+don't matter, runs `k` variations at a time too, taking their outcomes
+in order. Its variations are independent, so it gains the most: with 8
+workers, about 7 times faster.
 
 Counts and [statistics](coverage.md) add up across the workers. A health
 check that fails in a worker fails the test.

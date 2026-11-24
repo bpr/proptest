@@ -35,7 +35,10 @@
 #   pixi run build/abi_fuzz build/abi_fuzz_work
 #
 # The compiler under test is $MOJO (default `mojo`); see
-# build_and_compare.sh. ABI_FUZZ_NO_SHRINK=1 skips shrinking, and
+# build_and_compare.sh. Programs are built and run in one process per
+# physical core at once (PROPTEST_WORKERS=k for k, 1 for one at a time),
+# each in a directory of its own in the work directory (the fuzz loop
+# runs one at a time). ABI_FUZZ_NO_SHRINK=1 skips shrinking, and
 # PROPTEST_SEED and PROPTEST_MAX_EXAMPLES set the seed and the number of
 # programs. The failing case is kept in the work directory as failing_*.
 # ABI_FUZZ_NO_EMPTY_WORKAROUND=1 passes empty structs through
@@ -51,11 +54,31 @@
 # and x86-64 eightbyte classes, and how many argument registers the
 # arguments before it took (see `Gen.record_features`).
 
+from std.ffi import external_call
 from std.os import getenv
 from std.subprocess import run
 from std.sys import argv
 
 from proptest import *
+
+# Test cases run in this many worker processes at once (0: one per
+# physical core; each test case also runs two compilers at once), and the
+# failure found is shrunk in as many at once (`Settings.workers`);
+# PROPTEST_WORKERS overrides it
+comptime WORKERS = 0
+
+
+def env_int(name: String, default: Int) -> Int:
+    """The integer in environment variable `name`, or `default`.
+
+    Settings only takes PROPTEST_* variables for settings left at their
+    defaults, so the fuzzers read the ones they change themselves.
+    """
+    try:
+        var v = getenv(name)
+        return Int(v) if v.byte_length() > 0 else default
+    except:
+        return default
 
 
 # Scalars: Mojo type, C type, kind (0 signed, 1 unsigned, 2 Float32,
@@ -1324,6 +1347,15 @@ void set_seen(int64_t);
         return out
 
 
+def process_dir(work_dir: String) raises -> String:
+    """A directory of this process's own in `work_dir`, so that worker
+    processes (`Settings(workers=k)`) don't overwrite each other's files.
+    """
+    var dir = String(work_dir, "/p", external_call["getpid", Int32]())
+    _ = run(String("mkdir -p ", dir))
+    return dir^
+
+
 def write_file(path: String, text: String) raises:
     with open(path, "w") as f:
         f.write(text)
@@ -1345,18 +1377,19 @@ def main() raises:
         var gen = Gen()
         gen.draw_structs(data)
         gen.draw_fns(data)
-        write_file(String(work_dir, "/abi.h"), gen.header())
-        write_file(String(work_dir, "/callee.c"), gen.callee())
-        write_file(String(work_dir, "/ref.c"), gen.reference())
-        write_file(String(work_dir, "/program.mojo"), gen.program())
-        var verdict = run(String("bash ", script, " ", work_dir, " 2>&1"))
+        var dir = process_dir(work_dir)
+        write_file(String(dir, "/abi.h"), gen.header())
+        write_file(String(dir, "/callee.c"), gen.callee())
+        write_file(String(dir, "/ref.c"), gen.reference())
+        write_file(String(dir, "/program.mojo"), gen.program())
+        var verdict = run(String("bash ", script, " ", dir, " 2>&1"))
         if not verdict.startswith("OK"):
             data.note(verdict)
             for name in ["abi.h", "callee.c", "ref.c", "program.mojo"]:
                 _ = run(
                     String(
                         "cp ",
-                        work_dir,
+                        dir,
                         "/",
                         name,
                         " ",
@@ -1370,8 +1403,16 @@ def main() raises:
             fail(String(verdict.split("\n")[0]))
 
     var settings = Settings(
-        database=None, deadline=None, max_examples=200, print_blob=True
+        database=None,
+        deadline=None,
+        max_examples=env_int("PROPTEST_MAX_EXAMPLES", 200),
+        print_blob=True,
+        workers=env_int("PROPTEST_WORKERS", WORKERS),
     )
+    # no explain phase: it varies each draw of the generator up to 100
+    # times (even `workers` at a time, that's many minutes of builds), and
+    # "or any other generated value" says little about a generated program
+    settings.phases = Phases(explain=False)
     if getenv("ABI_FUZZ_NO_SHRINK") != "":
         settings.phases = Phases(shrink=False, explain=False)
     var seconds = getenv("ABI_FUZZ_SECONDS")
