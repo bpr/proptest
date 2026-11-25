@@ -69,6 +69,8 @@
 #
 # The compiler under test is $MOJO (default `mojo`); see
 # build_and_compare.sh. DECL_FUZZ_NO_SHRINK=1 skips shrinking;
+# DECL_FUZZ_REPRODUCE=<blob> replays a failure from the `reproduce=` blob
+# it printed (with the same DECL_FUZZ_MUTANTS or DECL_FUZZ_NEAR);
 # DECL_FUZZ_STATS=1 prints what evaluation reached in each program (for
 # mutants, its kind, whether it got the mutation, and its chances);
 # PROPTEST_SEED, PROPTEST_MAX_EXAMPLES and PROPTEST_WORKERS set the seed,
@@ -2084,6 +2086,10 @@ struct Program(Movable):
             ctx.truncate(n_outer)
             return out^
         if ctx.depth > 0:
+            # (in a loop's body, no moves in the reinitializations: one
+            # could move a variable already passed over, which the next
+            # iteration uses)
+            ctx.no_move += Int(loop)
             for v in range(n_outer):
                 if (
                     live_at_start[v]
@@ -2093,6 +2099,7 @@ struct Program(Movable):
                     and v != self.keep_dead
                 ):
                     out.append(self.gen_reinit(data, ctx, v))
+            ctx.no_move -= Int(loop)
             ctx.truncate(n_outer)
         return out^
 
@@ -2444,10 +2451,16 @@ struct Program(Movable):
     ) raises -> List[Int]:
         """The end of a block with an early return: `p = e` for each `mut`
         argument still moved (a ret_uninit mutant leaves one moved, moving
-        it here if it's live, and marks the `return`), then `return e`."""
+        it here if it's live, and marks the `return`), then `return e`.
+        A mut_uninit mutant's argument, if it's still moved here, stays
+        moved and the `return` is marked: Mojo reports it there (and a
+        block that returns leaves it as it was before the block, perhaps
+        live, so the body's marked return can be valid)."""
         var out = List[Int]()
         var left = -1
-        if self.wants(MU_RET_UNINIT) and not self.in_const_if(ctx):
+        if self.keep_dead >= 0 and not ctx.live[self.keep_dead]:
+            left = self.keep_dead
+        elif self.wants(MU_RET_UNINIT) and not self.in_const_if(ctx):
             var cands = List[Int]()
             for v in range(len(ctx.names)):
                 if ctx.kinds[v] == V_MUT and ctx.types[v] != self.int_ty:
@@ -2507,9 +2520,13 @@ struct Program(Movable):
                 if exit == S_BREAK:
                     bv = v
                     ctx.break_var = v
+        # (no moves in the reinitializations: one could move a variable
+        # already passed over, which the loop or the code after it uses)
+        ctx.no_move += 1
         for v in range(ctx.loop_base):
             if ctx.loop_live[v] and not ctx.live[v] and v != bv:
                 out.append(self.gen_reinit(data, ctx, v))
+        ctx.no_move -= 1
         out.append(self.add_stmt(Stmt(exit, -1, -1, -1, 0, [], [], "")))
         return out^
 
@@ -5120,6 +5137,7 @@ def draw_program(
                 # uncertain)
                 if String(e) == "STEP_LIMIT" or String(e) == "LITERAL":
                     assume(False)
+                data.note(program)  # (a generator bug: show the program)
                 raise e^
             expected += String("c ", i, " ", v, "\n")
             expected += String("b ", i, " ", v, "\n")
@@ -5203,5 +5221,9 @@ def main() raises:
         settings.suppress_health_check = [HealthCheck.filter_too_much]
     if getenv("DECL_FUZZ_NO_SHRINK") != "":
         settings.phases = Phases(shrink=False, explain=False)
+    var blob = getenv("DECL_FUZZ_REPRODUCE")
+    if blob != "":
+        # replay a failure from its `reproduce=` blob
+        settings.reproduce = blob^
     given_data(differential, settings)
     print("no differences")

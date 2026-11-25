@@ -1294,6 +1294,51 @@ rejected, for locals, `mut` arguments and `mut self`. Both 1117 and
 around it: a loop drawn while a field is moved out gets no loop inside
 it. `DECL_FUZZ_NO_PARTIAL_LOOP_WORKAROUND=1` turns this off.
 
+## An all-kinds campaign
+
+With every kind above in place, a longer run on nightly
+1.3.0.dev2026112505, without shrinking: three rounds of 2,000 stage 2
+programs, 2,000 near misses of all kinds and 3,000 mutants of all kinds
+(seeds 100i, 101i and 102i for round i), 2.5 hours in all.
+
+| Run | Programs | Result |
+|---|---|---|
+| Stage 2 | 6,000 | all OK |
+| Near misses | 3,204 | 3,201 OK; 3 `BUILD_CRASH` at -O3 (round 1); round 3 stopped by a generator error |
+| Mutants | 9,000 | 8,992 OK; 8 `ACCEPTED` (round 3) |
+
+A near-miss run stops at its first failure, so rounds 1 and 3 made 562
+and 642 programs.
+
+- **The -O3 crashes** are one program, tried three times. Its
+  backtrace is the one of
+  [#7783](https://github.com/modular/modular/issues/7783), at the same
+  place in `mojo`, and it has a method chain like the one in that issue.
+- **The accepted mutants** were all `mut_uninit`, in three distinct
+  programs, and all valid: a generator bug. The plan's `if` left the
+  `mut` argument moved inside a branch of an outer `if`. That branch then
+  ended with an early return, which reinitialized the argument before
+  the `return`. A block that returns leaves the variables as they were
+  before it, so the argument was live at the body's marked `return`.
+  Now an early return leaves the mutant's argument moved and is
+  marked too, since Mojo reports the error there.
+- **The generator error** ("evaluator: read of a moved variable") was a
+  `loop_exit` near miss. Before its `continue`, the reinitialization of
+  one variable moved another (`S0(p0^, ...)`) that the loop had already
+  passed over. For Mojo, `^` on an `Int` is a copy; for the evaluator,
+  `p0` was moved, and the code after the loop read it. The
+  reinitializations before a `break` or `continue`, and at the end of a
+  loop's body, now make no moves.
+
+`DECL_FUZZ_REPRODUCE=<blob>` replays a failure from the `reproduce=`
+blob it printed. An evaluator error now prints the program.
+
+**Validation.** After both fixes, on the same nightly, all OK:
+2,000 `mut_uninit` mutants (seed 1023, round 3's mutant seed), 2,000
+near misses of all kinds (seed 1013, round 3's near-miss seed), 600
+`loop_exit` near misses (seed 1041), 1,000 mutants of all kinds (seed
+1042) and 600 stage 2 programs (seed 1043).
+
 ## Beyond the paths
 
 Mojo features FM leaves out for now:
