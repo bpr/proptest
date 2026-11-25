@@ -46,7 +46,7 @@
 # The compiler under test is $MOJO (default `mojo`); see
 # build_and_compare.sh. DECL_FUZZ_NO_SHRINK=1 skips shrinking;
 # DECL_FUZZ_STATS=1 prints what evaluation reached in each program (for
-# mutants, which kind each got);
+# mutants, its kind, whether it got the mutation, and its chances);
 # PROPTEST_SEED, PROPTEST_MAX_EXAMPLES and PROPTEST_WORKERS set the seed,
 # the number of programs, and the worker processes (0: one per physical
 # core). The failing program is kept as failing_program.mojo in the work
@@ -349,12 +349,16 @@ def pick(mut data: ConjectureData, n: Int) raises -> Int:
     return data.draw(integers(0, n - 1))
 
 
-def draw_conv(mut data: ConjectureData) raises -> Int:
+def draw_conv(mut data: ConjectureData, mut_often: Bool = False) raises -> Int:
     """Read 1/2, `var` 1/3, `mut` 1/6 of the time.
 
     A call with a `mut` argument goes only at the root of a statement, so
-    `mut` arguments would otherwise rule out most calls."""
+    `mut` arguments would otherwise rule out most calls. With mut_often
+    (for mutants that need `mut` arguments), read 1/3, `var` 1/6, `mut`
+    1/2."""
     var c = data.draw(integers(0, 5))
+    if mut_often:
+        return CONV_READ if c <= 1 else (CONV_VAR if c == 2 else CONV_MUT)
     if c <= 2:
         return CONV_READ
     return CONV_VAR if c <= 4 else CONV_MUT
@@ -497,6 +501,8 @@ struct Ctx(Copyable):
     var depth: Int
     var no_move: Int
     """Inside a ternary branch, where moves would be conditional."""
+    var const_if: Int
+    """Inside a branch of an `if` whose condition is a constant."""
     var discard: Bool
     """The next expression drawn is the root of `_ = e`, which Mojo
     evaluates without copying (`_ = x.f` of a `Copyable` field is fine)."""
@@ -526,6 +532,7 @@ struct Ctx(Copyable):
         self.pool = pool^
         self.depth = 0
         self.no_move = 0
+        self.const_if = 0
         self.discard = False
         self.counter = 0
 
@@ -607,6 +614,8 @@ struct Program(Movable):
     """The kind of mutation to make (MU_*), or -1 for a well-typed program."""
     var mutated: Bool
     """Whether the mutation has been made."""
+    var chances: Int
+    """How many chances to make it there were (DECL_FUZZ_STATS=1)."""
     var loop_mark: Int
     """The depth of the loop body where MU_LOOP_MOVE moved an outer
     variable, until its loop is made (and marked); else -1."""
@@ -643,6 +652,7 @@ struct Program(Movable):
         self.p0_ty = 0
         self.mutant = -1
         self.mutated = False
+        self.chances = 0
         self.loop_mark = -1
         self.marked_stmts = []
         self.mark_struct = -1
@@ -879,6 +889,9 @@ struct Program(Movable):
         return self.draw_type(data, pool)
 
     def draw_declarations(mut self, mut data: ConjectureData) raises:
+        # mut_read and alias mutants need calls with `mut` arguments
+        var mut_often = self.mutant == MU_MUT_READ or self.mutant == MU_ALIAS
+        var mut_self_from = 2 if mut_often else 3  # `mut self` 1/2 or 1/4
         # trait headers: parents, capability, K, make (FJ: classes in
         # order, so the refinement relation is acyclic)
         var n_traits = data.draw(integers(1, 4))
@@ -994,13 +1007,14 @@ struct Program(Movable):
             for _ in range(data.draw(integers(lo, 2))):
                 var m = len(self.methods)
                 var self_conv = (
-                    CONV_MUT if data.draw(integers(0, 3)) == 3 else CONV_READ
+                    CONV_MUT if data.draw(integers(0, 3))
+                    >= mut_self_from else CONV_READ
                 )
                 var params = List[Int]()
                 var convs = List[Int]()
                 for _ in range(data.draw(integers(0, 2))):
                     params.append(self.draw_sig_type(data, pool, self.p0_ty))
-                    convs.append(draw_conv(data))
+                    convs.append(draw_conv(data, mut_often))
                 self.methods.append(
                     MethodDecl(
                         String("m", m),
@@ -1028,13 +1042,14 @@ struct Program(Movable):
             for _ in range(data.draw(integers(0, 2))):
                 var m = len(self.methods)
                 var self_conv = (
-                    CONV_MUT if data.draw(integers(0, 3)) == 3 else CONV_READ
+                    CONV_MUT if data.draw(integers(0, 3))
+                    >= mut_self_from else CONV_READ
                 )
                 var params = List[Int]()
                 var convs = List[Int]()
                 for _ in range(data.draw(integers(0, 2))):
                     params.append(self.draw_sig_type(data, pool, own_ty))
-                    convs.append(draw_conv(data))
+                    convs.append(draw_conv(data, mut_often))
                 self.methods.append(
                     MethodDecl(
                         String("m", m),
@@ -1063,10 +1078,10 @@ struct Program(Movable):
             var convs = List[Int]()
             for i in range(len(bounds)):
                 params.append(self.intern(PARAM, i, -1))
-                convs.append(draw_conv(data))
+                convs.append(draw_conv(data, mut_often))
             for _ in range(data.draw(integers(0, 2))):
                 params.append(self.draw_sig_type(data, pool, own_ty))
-                convs.append(draw_conv(data))
+                convs.append(draw_conv(data, mut_often))
             self.fns.append(
                 FnDecl(
                     String("g", f),
@@ -1091,6 +1106,7 @@ struct Program(Movable):
         shrinker moves the mutation to the first chance."""
         if not self.wants(kind):
             return False
+        self.chances += 1
         return data.draw(integers(0, MU_ODDS - 1)) == 0
 
     def in_branch(self, ctx: Ctx) -> Bool:
@@ -1105,6 +1121,38 @@ struct Program(Movable):
             ctx.no_move > 0
             and getenv("DECL_FUZZ_NO_DEAD_BRANCH_WORKAROUND") == ""
         )
+
+    def in_const_if(self, ctx: Ctx) -> Bool:
+        """Whether ctx is inside a branch of an `if` whose condition is a
+        constant (literals and associated constants), where use_moved and
+        loop_move mutants aren't made: Mojo drops the dead branch before
+        it checks uses of moved values, as for a ternary."""
+        return ctx.const_if > 0
+
+    def is_const(self, e: Int) -> Bool:
+        """Whether e is built from literals and associated constants only
+        (Mojo folds it), conservatively."""
+        var k = self.exprs[e].kind
+        if k == E_LIT or k == E_K:
+            return True
+        if k != E_BIN and k != E_TERN:
+            return False
+        for kid in self.exprs[e].kids:
+            if not self.is_const(kid):
+                return False
+        return True
+
+    def is_place(self, e: Int) -> Bool:
+        """Whether e is a place: a variable, a field of a place, or a
+        ternary of places."""
+        ref x = self.exprs[e]
+        if x.kind == E_VAR:
+            return True
+        if x.kind == E_FIELD:
+            return self.is_place(x.kids[0])
+        if x.kind == E_TERN:
+            return self.is_place(x.kids[2]) and self.is_place(x.kids[3])
+        return False
 
     def mark(mut self, e: Int) -> Int:
         """Marks e as the mutation: the line holding it gets `# MUTANT`."""
@@ -1517,35 +1565,35 @@ struct Program(Movable):
         var live_at_start = ctx.live.copy()
         var out = List[Int]()
         var moved = -1
-        for _ in range(data.draw(integers(0, n_max))):
-            if loop and self.wants(MU_LOOP_MOVE):
+        var to_use = -1  # a variable moved for a use_moved mutant
+        var n = data.draw(integers(0, n_max))
+        for _ in range(n):
+            if (
+                to_use < 0
+                and self.wants(MU_USE_MOVED)
+                and not self.in_const_if(ctx)
+                and data.draw(integers(0, MU_ODDS - 1)) == 0
+            ):
+                # few variables are moved, so move one (it isn't
+                # reinitialized before the block's end); in a loop, a local
+                # one (an outer one would make a loop_move mutant too)
+                var owned = List[Int]()
+                for v in self.owned_vars(ctx, len(ctx.names)):
+                    if not loop or v >= n_outer:
+                        owned.append(v)
+                if len(owned) > 0:
+                    to_use = owned[pick(data, len(owned))]
+                    out.append(self.move_stmt(ctx, to_use))
+            if loop and self.wants(MU_LOOP_MOVE) and not self.in_const_if(ctx):
                 # move an outer variable, and don't reinitialize it: the
                 # next iteration uses it (the whole loop is marked)
-                var outer = List[Int]()
-                for v in range(n_outer):
-                    if (
-                        ctx.kinds[v] == V_OWNED
-                        and ctx.live[v]
-                        and ctx.types[v] != self.int_ty
-                    ):
-                        outer.append(v)
+                var outer = self.loop_movable(ctx, n_outer, out)
                 if len(outer) > 0 and self.chance(data, MU_LOOP_MOVE):
                     moved = outer[pick(data, len(outer))]
-                    ctx.new_statement()
-                    var ty = ctx.types[moved]
-                    var text = String(ctx.names[moved], "^")
-                    var e = self.add(E_MOVE, moved, ty, [], [], text^)
-                    var name = String("v", ctx.counter)
-                    ctx.counter += 1
-                    ctx.push(name.copy(), ty, V_OWNED)
-                    out.append(
-                        self.add_stmt(Stmt(S_VAR, -1, e, -1, 0, [], [], name^))
-                    )
-                    ctx.live[moved] = False
-                    ctx.move_depth[moved] = -2  # not assignable either
+                    out.append(self.move_stmt(ctx, moved))
                     self.mutated = True
                     self.loop_mark = ctx.depth
-            if self.wants(MU_USE_MOVED):
+            if self.wants(MU_USE_MOVED) and not self.in_const_if(ctx):
                 var dead = self.moved_vars(ctx)
                 if len(dead) > 0 and self.chance(data, MU_USE_MOVED):
                     var v = dead[pick(data, len(dead))]
@@ -1554,12 +1602,77 @@ struct Program(Movable):
                         self.add_stmt(Stmt(S_USE, -1, e, -1, 0, [], [], ""))
                     )
             out.append(self.gen_stmt(data, ctx))
+        if loop and self.wants(MU_LOOP_MOVE) and not self.in_const_if(ctx):
+            # no chance was taken: move one last
+            var outer = self.loop_movable(ctx, n_outer, out)
+            if len(outer) > 0:
+                self.chances += 1
+                moved = outer[pick(data, len(outer))]
+                out.append(self.move_stmt(ctx, moved))
+                self.mutated = True
+                self.loop_mark = ctx.depth
+        if to_use >= 0 and self.wants(MU_USE_MOVED):
+            # no chance was taken after the move
+            self.chances += 1
+            var e = self.mark(self.place_expr(ctx, to_use, -1))
+            out.append(self.add_stmt(Stmt(S_USE, -1, e, -1, 0, [], [], "")))
         if ctx.depth > 0:
             for v in range(n_outer):
                 if live_at_start[v] and not ctx.live[v] and v != moved:
                     out.append(self.gen_reinit(data, ctx, v))
             ctx.truncate(n_outer)
         return out^
+
+    def owned_vars(self, ctx: Ctx, n: Int) -> List[Int]:
+        """The live owned variables among the first n, except Ints (`^` on
+        an Int has no effect)."""
+        var out = List[Int]()
+        for v in range(n):
+            if (
+                ctx.kinds[v] == V_OWNED
+                and ctx.live[v]
+                and ctx.types[v] != self.int_ty
+            ):
+                out.append(v)
+        return out^
+
+    def loop_movable(
+        self, ctx: Ctx, n_outer: Int, body: List[Int]
+    ) -> List[Int]:
+        """The outer variables a loop_move mutant can move after the
+        statements `body` of a loop body: not ones these assign (that
+        would reinitialize them on every iteration)."""
+        var out = List[Int]()
+        for v in self.owned_vars(ctx, n_outer):
+            if not self.assigns(body, v):
+                out.append(v)
+        return out^
+
+    def assigns(self, stmts: List[Int], v: Int) -> Bool:
+        """Whether some statement in stmts, or nested in one, assigns the
+        whole variable v."""
+        for i in stmts:
+            ref st = self.stmts[i]
+            if st.kind == S_ASSIGN:
+                ref t = self.exprs[st.target]
+                if t.kind == E_VAR and t.a == v:
+                    return True
+            if self.assigns(st.body, v) or self.assigns(st.orelse, v):
+                return True
+        return False
+
+    def move_stmt(mut self, mut ctx: Ctx, v: Int) -> Int:
+        """`var vN = v^`, leaving v moved and not assignable, so that it
+        stays moved until the end of the block."""
+        ctx.new_statement()
+        var ty = ctx.types[v]
+        var e = self.add(E_MOVE, v, ty, [], [], String(ctx.names[v], "^"))
+        var name = String("v", ctx.counter)
+        ctx.counter += 1
+        ctx.push(name.copy(), ty, V_OWNED)
+        ctx.live[v] = False
+        ctx.move_depth[v] = -2
+        return self.add_stmt(Stmt(S_VAR, -1, e, -1, 0, [], [], name^))
 
     def place_expr(mut self, ctx: Ctx, v: Int, f: Int) -> Int:
         """The place `v` or `v.f<f>`."""
@@ -1651,6 +1764,12 @@ struct Program(Movable):
             kinds += [S_ASSIGN, S_ASSIGN]
         if ctx.depth < MAX_DEPTH:
             kinds += [S_IF, S_FOR]
+            if (
+                self.wants(MU_LOOP_MOVE)
+                and not self.in_const_if(ctx)
+                and len(self.owned_vars(ctx, len(ctx.names))) > 0
+            ):
+                kinds += [S_FOR, S_FOR, S_FOR]  # a loop that can move one
         var kind = kinds[pick(data, len(kinds))]
 
         if kind == S_VAR:
@@ -1660,6 +1779,11 @@ struct Program(Movable):
             if len(receivers) > 0 and data.draw(booleans()):
                 ty = receivers[pick(data, len(receivers))]
             else:
+                ty = self.draw_type(data, ctx.pool)
+            if ty == self.int_ty and (
+                self.wants(MU_LOOP_MOVE) or self.wants(MU_USE_MOVED)
+            ):
+                # (these mutants move a variable, and not an Int)
                 ty = self.draw_type(data, ctx.pool)
             var e = self.gen(data, ctx, ty, BODY_SIZE - 1, P_OWNED, False, True)
             var name = String("v", ctx.counter)
@@ -1712,9 +1836,12 @@ struct Program(Movable):
             var op = pick(data, comptime (len(CMP_OPS)))
             var x = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
             var y = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
+            var const_cond = self.is_const(x) and self.is_const(y)
             ctx.depth += 1
+            ctx.const_if += Int(const_cond)
             var then = self.gen_block(data, ctx, 2)
             var orelse = self.gen_block(data, ctx, 2)
+            ctx.const_if -= Int(const_cond)
             ctx.depth -= 1
             return self.add_stmt(
                 Stmt(S_IF, -1, x, y, op, then^, orelse^, String())
@@ -1833,11 +1960,16 @@ struct Program(Movable):
             for t in ctx.pool.copy():
                 if t != ty:
                     bad += self.mut_places(ctx, t)
-        if len(bad) > 0 and self.chance(data, self.mutant):
+        var places = self.mut_places(ctx, ty)
+        if len(bad) > 0 and (
+            # (places_for let the call go ahead for the mutant)
+            len(places) == 0
+            or self.chance(data, self.mutant)
+        ):
+            self.chances += Int(len(places) == 0)
             var p = bad[pick(data, len(bad))]
             ctx.touched[p // 64] = True
             return self.mark(self.place_expr(ctx, p // 64, p % 64 - 1))
-        var places = self.mut_places(ctx, ty)
         if len(places) == 0:
             raise Error("STUCK")
         var p = places[pick(data, len(places))]
@@ -1866,17 +1998,29 @@ struct Program(Movable):
 
     def places_for(mut self, ctx: Ctx, needed: List[Int]) -> Bool:
         """Whether each type in `needed` has a `mut` place, all with
-        different root variables (greedily)."""
+        different root variables (greedily). For a mut_read or alias
+        mutant, one of them may have only a read place, or one sharing a
+        root variable: take_place makes the mutant there."""
         var used = List[Int]()
+        var spare = self.wants(MU_MUT_READ) or self.wants(MU_ALIAS)
         for ty in needed:
             var found = False
-            for p in self.mut_places(ctx, ty):
+            var places = self.mut_places(ctx, ty)
+            for p in places:
                 if not has(used, p // 64):
                     used.append(p // 64)
                     found = True
                     break
-            if not found:
-                return False
+            if found:
+                continue
+            if spare and (
+                len(places)
+                > 0 if self.wants(MU_ALIAS) else len(self.read_places(ctx, ty))
+                > 0
+            ):
+                spare = False
+                continue
+            return False
         return True
 
     def mut_receivers(self, ctx: Ctx) -> List[Int]:
@@ -1983,6 +2127,7 @@ struct Program(Movable):
             if (
                 len(dead) > 0
                 and not self.in_branch(ctx)
+                and not self.in_const_if(ctx)
                 and self.chance(data, MU_USE_MOVED)
             ):
                 var v = dead[pick(data, len(dead))]
@@ -2305,6 +2450,19 @@ struct Program(Movable):
             var t = self.gen_typed(data, ctx, ty, half, P_OWNED)
             var e = self.gen_typed(data, ctx, ty, half, P_OWNED)
             ctx.no_move -= 1
+            if (
+                self.is_place(t)
+                and self.is_place(e)
+                and self.exprs[t].text != self.exprs[e].text
+                and kind != INT
+                and MARK not in self.exprs[e].text
+                and getenv("DECL_FUZZ_NO_TERN_PLACE_WORKAROUND") == ""
+            ):
+                # a ternary of two places, passed read next to a value
+                # overlapping one of them, is rejected as aliasing a `mut`
+                # argument (modular/modular#7781): copy one
+                var text = String(self.exprs[e].text, ".copy()")
+                e = self.add(E_COPY, 0, ty, [e], [], text^)
             var ops = materialize[CMP_OPS]()
             var text = String(
                 "(",
@@ -3015,6 +3173,7 @@ def draw_program(
             print(
                 "mutant" if p.mutated else "unmutated",
                 names[p.mutant],
+                String("chances=", p.chances),
             )
         if not p.mutated:  # no chance was taken
             assume(False)
@@ -3147,6 +3306,9 @@ def main() raises:
         workers=env_int("PROPTEST_WORKERS", WORKERS),
     )
     settings.phases = Phases(explain=False)
+    if len(kinds) > 0:
+        # a program where the mutation wasn't made is filtered out
+        settings.suppress_health_check = [HealthCheck.filter_too_much]
     if getenv("DECL_FUZZ_NO_SHRINK") != "":
         settings.phases = Phases(shrink=False, explain=False)
     given_data(differential, settings)

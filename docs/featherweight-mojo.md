@@ -669,6 +669,13 @@ didn't have:
 - **An argument `x^` is moved at the call**, after the other arguments
   are evaluated (`ACCEPTED`). So `f(x^, x.copy())` is fine, and
   `use_moved` leaves out variables moved in the current statement.
+- **The dead branch of a constant `if` isn't checked for uses of moved
+  values** (`ACCEPTED`), as for a ternary (see Findings). With a
+  condition of literals and associated constants (`if S0.K1 ==
+  S0.K1:`), Mojo drops the dead branch first. `x < x` and `Res(1).val <
+  0` aren't folded. `use_moved` and `loop_move` mutants aren't made
+  inside either branch of such an `if`. An `implicit_copy` there is
+  still rejected.
 
 Other things that are errors in FM proved to be errors in Mojo too:
 `return x` of a local `Copyable` variable (no implicit move on return),
@@ -701,28 +708,51 @@ program's kind and whether a chance came up. Each program starts with a
 
 Mutants are cheap: the compiler rejects most of them while parsing, so
 600 take about a minute on 16 cores. Rejected programs (no chance
-came up) cost no build. Out of 3000 drawn (seeds 305 to 309), the number
-of programs of each kind that got their mutation, and the number
-rejected:
+came up) cost no build.
 
-| Kind | Made | No chance |
-|---|---|---|
-| `type` | 457 | 55 |
-| `move_read` | 438 | 105 |
-| `assign_read` | 378 | 46 |
-| `cap` | 358 | 116 |
-| `missing` | 282 | 148 |
-| `no_method` | 276 | 144 |
-| `implicit_copy` | 258 | 217 |
-| `bound` | 232 | 222 |
-| `sig` | 188 | 206 |
-| `mut_read` | 57 | 445 |
-| `loop_move` | 48 | 318 |
-| `alias` | 24 | 455 |
-| `use_moved` | 23 | 492 |
+Four kinds need a `mut` call (`alias`, `mut_read`) or a moved non-Int
+variable (`use_moved`, `loop_move`). Few stage-2 bodies have those: at
+first, only 4 to 13% of programs of these kinds got their mutation, and
+nearly all the others had no chance at all. A mutant of these kinds now
+steers the program toward them:
+- **`alias`, `mut_read`:** `mut` parameters and `mut self` are drawn
+  half the time (instead of 1/6 and 1/4). A call with `mut` arguments
+  may go ahead with one `mut` place missing, if a read place of its type
+  (`mut_read`) or one overlapping another argument (`alias`) is there
+  instead; that argument is then the mutation.
+- **`use_moved`:** a block may move a live owned variable itself (`var
+  vN = x^`, and x isn't reinitialized before the block's end). If no
+  chance to use x was taken when the block ends, a use of it goes there.
+- **`loop_move`:** loops are drawn more often where an outer owned
+  variable is live. If no chance was taken in a loop body, a move goes
+  at its end. It never moves a variable the body assigns before the move
+  (the assignment would reinitialize it on every iteration).
+- **`use_moved`, `loop_move`:** a new local variable isn't an `Int`
+  (redrawn once).
 
-The rare kinds need a `mut` call (`alias`, `mut_read`) or a move
-(`use_moved`, `loop_move`) of a non-Int variable. Few bodies have those.
+`DECL_FUZZ_STATS=1` prints how many chances each program had. In 3000
+mutants (seeds 305 to 309), the number of programs of each kind that
+got their mutation, and the number rejected (with the share made before
+tuning):
+
+| Kind | Made | No chance | Made, before |
+|---|---|---|---|
+| `type` | 372 | 7 | 89% |
+| `cap` | 316 | 95 | 76% |
+| `assign_read` | 310 | 25 | 89% |
+| `loop_move` | 279 | 100 | 13% |
+| `no_method` | 253 | 141 | 66% |
+| `move_read` | 248 | 49 | 81% |
+| `bound` | 223 | 164 | 51% |
+| `implicit_copy` | 199 | 124 | 54% |
+| `missing` | 195 | 137 | 66% |
+| `mut_read` | 188 | 143 | 11% |
+| `use_moved` | 188 | 66 | 4% |
+| `sig` | 179 | 244 | 48% |
+| `alias` | 81 | 201 | 5% |
+
+A run restricted to a few kinds rejects many programs, so stage 3 turns
+off proptest's `filter_too_much` health check.
 
 **Validation.** The oracle found two generator bugs on its own. The
 first was a `WRONG_LINE`: an outer loop's `loop_move` marked a loop
@@ -731,6 +761,15 @@ nested in its body instead. The second was a `NO_MARK`: stage 2's
 taking the mark with it. The `ACCEPTED` verdicts above found the five
 rules FM lacked. With all of them fixed, 4200 mutants (seeds 305 to
 311, nightly 1.3.0.dev2026112316) were all rejected on a marked line.
+
+Tuning the rare kinds made them common enough to show two more
+problems. `ACCEPTED` verdicts showed the constant `if` rule above, and
+`loop_move` mutants whose body assigned the variable before moving it.
+A `WRONG_LINE` showed a compiler bug in the well-typed part of a
+program (see Findings). With these fixed, 1200 mutants of the four tuned
+kinds (seeds 601 and 602), 900 `loop_move` mutants (seeds 601 to 603)
+and 2400 of all kinds (seeds 621 to 624) were all rejected on a marked
+line. 200 well-typed programs (seed 221) passed stage 2.
 
 ### Findings
 
@@ -763,6 +802,35 @@ which may be by design. The generator makes neither `use_moved` nor
 `DECL_FUZZ_NO_DEAD_BRANCH_WORKAROUND=1` lets it. With that set,
 `DECL_FUZZ_MUTANTS=implicit_copy` found and shrank the bug in six
 minutes (seed 401).
+
+**A ternary of two places is taken for a `mut` argument.** A
+`loop_move` mutant was rejected for the wrong reason (`WRONG_LINE`).
+The error was on an unmarked line, in a well-typed method body. Reduced
+(first with a line-deletion script, then by hand):
+
+```mojo
+def h(x: B, y: String) -> Int:   # both read
+    return 0
+
+
+def main():
+    var q = B("a", "b")             # B: two String fields
+    var c = q.f0.byte_length()
+    print(h(q, q.f1 if c < 0 else q.f0))
+    # error: aliasing values passed immutably to 'x' argument and
+    # passed mutably to 'y' argument in 'h' call
+```
+
+It needs both branches to be different places, one of them overlapping
+another argument, and a read parameter: the same place twice, an
+rvalue branch (`.copy()`), a `var` parameter or `Int` fields all
+compile. It happens on 1117 and 1123, for a concrete struct, an
+`ImplicitlyCopyable` struct, a type parameter, and with `self` as the
+overlapping argument. Filed as
+[#7781](https://github.com/modular/modular/issues/7781). In stage 2,
+only branches of an `ImplicitlyCopyable` type other than `Int` can both
+be places. The generator now copies the else branch when both are
+(`DECL_FUZZ_NO_TERN_PLACE_WORKAROUND=1` turns that off).
 
 ## Beyond stage 3
 
