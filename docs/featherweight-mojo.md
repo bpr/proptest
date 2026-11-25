@@ -32,7 +32,9 @@ FM comes in four stages, all implemented:
   must accept it and run it correctly.
 
 "Paths" adds mutants and near misses whose variable is initialized on
-some paths only, after an `if`.
+some paths only, after an `if`. "Deferred initialization" does the same
+for variables declared without a value (`var x: T`), and "Early
+returns" for `return` in a branch.
 
 Stage 2 found two compiler bugs in its first rounds, stage 3 two more,
 stage 4 a new form of one of stage 2's, and the path kinds an -O3 crash
@@ -579,8 +581,25 @@ confirms). It happens at -O0 and -O3 and on 1.3.0.dev2026111705 too.
 Filed as [#7759](https://github.com/modular/modular/issues/7759).
 
 The generator works around it: each `for` loop is followed by
-`_use(v)` (a no-op generic function) for every live owned variable.
-`DECL_FUZZ_NO_LOOP_STORE_WORKAROUND=1` turns this off.
+`_use(v)` (a no-op generic function) for every live owned or `mut`
+variable. `DECL_FUZZ_NO_LOOP_STORE_WORKAROUND=1` turns this off.
+
+At first the workaround covered owned variables only. Two rounds later
+(stage 2, seed 821) it gave `UNBALANCED 1 -3` again, through a `mut
+self`: a method stored a field of `self` in a loop, then assigned
+`self` whole after it. The stored values are destroyed twice each, and
+the same happens to a local assigned whole after the loop:
+
+```mojo
+def f(mut s: S):            # S has one field f0: R
+    for i in range(3):
+        s.f0 = R(i)         # each R(i) is destroyed twice
+    s = S(R(7))
+```
+
+That is #7759's bug, in forms the issue doesn't show (a `mut` argument,
+and a reassignment after the loop). Now the workaround reads `mut`
+variables too.
 
 **Self-assignment.** With that workaround off, the next round found a
 `DIFF_O3` instead (-O3 printed 3 and 0, -O0 and the evaluator 4):
@@ -1030,16 +1049,116 @@ crash. Filed as
 has no workaround. The crash is rare, and the program it needs is too
 specific to avoid.
 
+## Deferred initialization
+
+A variable can be declared without a value (`var x: T`) and assigned
+later. Until then it's like a moved variable. Two more kinds test
+this, using the same plans as the path kinds: a plan whose `if`
+declares x just before it (`PRE_DECL`), and assigns it in the then
+branch, the else branch, or both. A `for` loop can also declare x
+before it and assign it in its body. A third of the time the
+assignment is itself an `if` with an assignment in each branch
+(`if c: x = e1 else: x = e2`).
+
+Probes on the nightly:
+- After an `if` that assigns x in only some branches, a use is an
+  error at the use ("use of uninitialized value 'x'"). Assigning x
+  after the `if`, or never using x, is fine. Mojo then destroys x on
+  the paths that assigned it.
+- An assignment in a loop's body leaves x uninitialized after the
+  loop, even with a constant count (`range(3)`). In the body, after
+  the assignment, x is initialized, and the next iteration's
+  assignment destroys the old value.
+- Deferred variables of a type parameter (`var x: T`) and of `Int`
+  behave the same.
+- A field assignment to a variable without a value (`var x: Q;
+  x.f0 = R(1)`) is accepted, and then destroys the fields never set.
+  See "Findings" below. The generator assigns fields of live variables
+  only.
+
+| Kind | Construct | Mojo's error |
+|---|---|---|
+| mutant `uninit` | `var x: T`, assigned in one branch of an `if` (or in a loop's body), then `_use(x)` | use of uninitialized value 'x' |
+| near `deferred` | `var x: T` (marked), assigned in both branches of an `if` and then used; or in one, then perhaps `x = e` and a use; or in a loop's body, used there, and perhaps assigned and used after the loop | |
+
+`DECL_FUZZ_MUTANTS=uninit` and `DECL_FUZZ_NEAR=deferred` ask for them.
+In 200 programs of each (seed 801), 63% of the mutants and 64% of the
+near misses got the construct.
+
+**Validation.** On the nightly, 300 `uninit` mutants and 400
+`deferred` near misses (seed 811) were all OK. With the same build, so
+were 300 mutants and 300 near misses of all kinds (seed 821). Of 200
+stage 2 programs (seed 821), one was `UNBALANCED`, which was #7759
+through a `mut self` that the workaround didn't cover yet (see stage
+2's "Findings").
+
+### Findings
+
+**Field-by-field initialization destroys uninitialized fields.** The
+probes found this before the generator did. `var x: Q; x.f0 = R(1)`
+is accepted when the other fields are never set. When x goes out of
+scope, Mojo destroys every field of Q, including `x.f1`, which was
+never initialized (`R.__deinit__` prints garbage; with `List` fields
+the program segfaults at -O0). If the struct has a custom
+`__deinit__`, it runs on a value no `__init__` built. After `if c: x =
+Q(...)` on some paths, a later `x.f0 = R(3)` makes the assignment in
+the branch destroy the uninitialized x it replaces first. Mojo does
+reject the case where every field is set this way ("used with all
+fields manually initialized but without calling an '__init__'
+method"). Both 1117 and 1123 do this. Not yet reported (draft
+`unfiled-mojo-issue-partial-field-init.md`).
+
+## Early returns
+
+A branch of an `if` can end with `return e`, of the body's result type.
+One `if` in six gets one, in any mode. Before it, the branch
+reinitializes every `mut` argument still moved. To the generator, the
+branch then doesn't fall through: after the `if`, each variable is as
+the other branch left it. The evaluator stops the body at the `return`,
+from inside any loops.
+
+Probes on the nightly:
+- A `mut` argument still moved at an early `return` is an error at
+  that `return` ("'p' is uninitialized at return from this function").
+- A variable moved only on the returning path is live after the `if`,
+  and so is one assigned only on the other path. One assigned only on
+  the returning path is uninitialized after the `if`.
+- A statement after a `return` in the same block only gets a warning
+  ("unreachable code"). The generator never writes one.
+
+An `if` with a constant condition never returns early: if its live
+branch returned, Mojo would drop the code after it, and with it the
+errors of a mutant placed there. The path kinds' plans pick the
+returning branch so that the mutant stays a mutant: when the plan
+moves x in one branch, the other branch may return, and when it
+reinitializes x in one branch, that branch may return.
+
+| Kind | Construct | Mojo's error |
+|---|---|---|
+| mutant `ret_uninit` | an early `return` (marked) with a `mut` argument moved out: moved just before it, or earlier | 'p0' is uninitialized at return from this function |
+| near `early_return` | a plan whose returning branch is the one that leaves x moved: x moved in that branch, or reinitialized in the other; then a use of x after the `if` | |
+
+`DECL_FUZZ_MUTANTS=ret_uninit` and `DECL_FUZZ_NEAR=early_return` ask
+for them. Both make the early returns more frequent (one `if` in two)
+and `mut` arguments more common. In 200 programs of each (seed 831),
+all the mutants and 45% of the near misses got the construct, and 10%
+of stage 2 programs executed an early return.
+
+**Validation.** On the nightly, all OK: 300 `ret_uninit` mutants and
+400 `early_return` near misses (seed 841), 300 stage 2 programs (seed
+842) and 200 more of seed 821 (the round of the `mut self` form of
+#7759, now clean), 400 mutants and 400 near misses of all kinds (seed
+843).
+
 ## Beyond the paths
 
 Mojo features FM leaves out for now:
 - **More ownership:** partial moves of fields, `ref` results and
-  origins, `deinit`/consuming methods, `while` loops with `break` (and
-  the paths they add), early `return`s, and custom `__deinit__`s in
+  origins, `deinit`/consuming methods, and custom `__deinit__`s in
   generated structs.
 - **More paths:** a loop that moves an outer variable in one branch
-  (`loop_move` through an `if`), and variables declared without a
-  value (`var x: T`) and initialized in branches.
+  (`loop_move` through an `if`), and `while` with `break` and
+  `continue`.
 - **More near misses:** disjoint fields through generic functions and
   `mut self`.
 - **Overloading and `@implicit` conversions:** Mojo's resolution rules

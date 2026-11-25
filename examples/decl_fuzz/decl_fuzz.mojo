@@ -38,7 +38,12 @@
 # The path kinds of both (maybe_moved and mut_uninit mutants; maybe_moved,
 # reinit_paths and mut_reinit near misses) leave a variable initialized on
 # some paths only after an `if`: a plan the `if` draws for it moves or
-# reinitializes it in some of its branches (`draw_plan`).
+# reinitializes it in some of its branches (`draw_plan`). The deferred
+# kinds (the uninit mutant, the deferred near miss) declare a variable
+# without a value (`var x: T`) and assign it in some branches of an `if`,
+# or in a loop's body. An `if` may end one of its branches with an early
+# `return` (more often for the ret_uninit mutant and the early_return near
+# miss, which a plan makes as for the path kinds).
 #
 # Every program terminates: each method and function has a rank, and a
 # body calls only methods and functions of lower rank; loops have constant
@@ -146,6 +151,8 @@ comptime S_IF = 3
 comptime S_FOR = 4
 comptime S_USE = 5
 """`_use(v)`: a read with no effect (the workaround in `gen_stmt`)."""
+comptime S_RETURN = 6
+"""An early `return e`, the last statement of a branch of an `if`."""
 
 # generation rules, simplest first (shrinking moves toward rule 0)
 comptime R_ATOM = 0
@@ -166,6 +173,11 @@ comptime PLAN_REINIT = 1
 comptime BR_THEN = 0
 comptime BR_ELSE = 1
 comptime BR_BOTH = 2
+comptime PRE_NONE = 0
+comptime PRE_MOVE = 1
+"""The plan's variable is moved just before the `if`."""
+comptime PRE_DECL = 2
+"""The plan's variable is declared without a value just before the `if`."""
 
 # how an atom uses its variable
 comptime A_PLAIN = 0
@@ -187,7 +199,8 @@ comptime STAT_COPY = 10
 comptime STAT_ASSIGN = 11
 comptime STAT_LOOP = 12
 comptime STAT_RES = 13
-comptime N_STATS = 14
+comptime STAT_RETURN = 14
+comptime N_STATS = 15
 comptime STAT_NAMES: List[String] = [
     "own",
     "required",
@@ -203,6 +216,7 @@ comptime STAT_NAMES: List[String] = [
     "assign",
     "loop",
     "res",
+    "return",
 ]
 
 # Stage 3: ill-typed mutants (DECL_FUZZ_MUTANTS=1). Each program gets one
@@ -240,7 +254,12 @@ some of its branches."""
 comptime MU_MUT_UNINIT = 14
 """A `mut` argument moved out and not reinitialized on some path to the
 return."""
-comptime N_MU = 15
+comptime MU_UNINIT = 15
+"""A use of a variable declared without a value (`var x: T`) and assigned
+in only some branches of an `if`, or in a loop's body."""
+comptime MU_RET_UNINIT = 16
+"""An early `return` with a `mut` argument moved out."""
+comptime N_MU = 17
 comptime MU_NAMES: List[String] = [
     "type",
     "use_moved",
@@ -257,6 +276,8 @@ comptime MU_NAMES: List[String] = [
     "cap",
     "maybe_moved",
     "mut_uninit",
+    "uninit",
+    "ret_uninit",
 ]
 comptime MU_ODDS = 6
 """Each chance to apply the mutation is taken 1 time in MU_ODDS."""
@@ -285,7 +306,14 @@ then after the `if`), then used."""
 comptime NR_MUT_REINIT = 7
 """A `mut` argument moved out and reinitialized on every path to the
 return."""
-comptime N_NR = 8
+comptime NR_DEFERRED = 8
+"""A variable declared without a value (`var x: T`), assigned in both
+branches of an `if` (or in one, then after it; or in a loop's body), then
+used; or assigned in one branch and not used again."""
+comptime NR_EARLY_RETURN = 9
+"""An `if` whose returning branch is the one that leaves a variable moved
+(or unassigned), then a use of it after the `if`."""
+comptime N_NR = 10
 comptime NR_NAMES: List[String] = [
     "disjoint",
     "read_alias",
@@ -295,6 +323,8 @@ comptime NR_NAMES: List[String] = [
     "maybe_moved",
     "reinit_paths",
     "mut_reinit",
+    "deferred",
+    "early_return",
 ]
 comptime MARK_NEAR = "@@N@@"
 """In generated text, marks the line of the near miss."""
@@ -526,7 +556,8 @@ struct Stmt(Copyable):
     var target: Int
     """The place assigned (S_ASSIGN), or -1."""
     var e: Int
-    """The value (S_VAR, S_ASSIGN, S_EXPR) or the left operand (S_IF)."""
+    """The value (S_VAR, S_ASSIGN, S_EXPR) or the left operand (S_IF); -1
+    for `var x: T` (S_VAR with no value)."""
     var e2: Int
     """The right operand of the condition (S_IF), or -1."""
     var a: Int
@@ -534,7 +565,8 @@ struct Stmt(Copyable):
     var body: List[Int]
     var orelse: List[Int]
     var name: String
-    """The variable declared (S_VAR) or the loop variable (S_FOR)."""
+    """The variable declared (S_VAR; with its type, `vN: T`, when it has no
+    value) or the loop variable (S_FOR)."""
 
 
 @fieldwise_init
@@ -575,6 +607,8 @@ struct Ctx(Copyable):
     evaluates without copying (`_ = x.f` of a `Copyable` field is fine)."""
     var counter: Int
     """For fresh local names."""
+    var ret: Int
+    """The body's result type (for early returns), or -1."""
 
     def __init__(
         out self,
@@ -603,6 +637,7 @@ struct Ctx(Copyable):
         self.const_if = 0
         self.discard = False
         self.counter = 0
+        self.ret = -1
 
     def push(mut self, var name: String, ty: Int, kind: Int):
         self.names.append(name^)
@@ -713,6 +748,8 @@ struct Program(Movable):
     var keep_dead: Int
     """The `mut` argument a mut_uninit mutant left moved (blocks don't
     reinitialize it, and the body's return is marked), or -1."""
+    var ret_value: Int
+    """The value of the early `return` being executed."""
     var mark_struct: Int
     """The struct whose header line is marked, or -1..."""
     var mark_fields: Bool
@@ -750,6 +787,7 @@ struct Program(Movable):
         self.loop_mark = -1
         self.marked_stmts = []
         self.keep_dead = -1
+        self.ret_value = -1
         self.mark_struct = -1
         self.mark_fields = False
         self.mark_impl = -1
@@ -990,8 +1028,10 @@ struct Program(Movable):
             self.mutant == MU_MUT_READ
             or self.mutant == MU_ALIAS
             or self.mutant == MU_MUT_UNINIT
+            or self.mutant == MU_RET_UNINIT
             or self.near == NR_DISJOINT
             or self.near == NR_MUT_REINIT
+            or self.near == NR_EARLY_RETURN
         )
         var mut_self_from = 2 if mut_often else 3  # `mut self` 1/2 or 1/4
         # trait headers: parents, capability, K, make (FJ: classes in
@@ -1658,6 +1698,7 @@ struct Program(Movable):
         root: Bool = False,
     ) raises -> Int:
         # entry points (root) drive everything: give them more statements
+        ctx.ret = ret
         var stmts = self.gen_block(data, ctx, 5 if root else 3)
         stmts += self.mut_reinits(data, ctx)
         ctx.new_statement()
@@ -1814,15 +1855,18 @@ struct Program(Movable):
         loop: Bool = False,
         keep_moved: Int = -1,
         reinit_in: Int = -1,
+        ret: Bool = False,
     ) raises -> List[Int]:
         """Statements; in a nested block, variables live at its start are
         live at its end (moved ones are reinitialized), and its locals go
         out of scope. For a branch of an `if` with a plan, keep_moved is a
         variable the block moves (unless a statement does) and leaves
         moved, and reinit_in one moved before it that it reinitializes
-        (unless a statement does)."""
+        (unless a statement does). With ret, the block ends with an early
+        `return` (`returning_end`)."""
         var n_outer = len(ctx.names)
         var live_at_start = ctx.live.copy()
+        var depth_at_start = ctx.move_depth.copy()
         var out = List[Int]()
         var moved = -1
         var to_use = -1  # a variable moved for a use_moved mutant
@@ -1930,6 +1974,15 @@ struct Program(Movable):
             self.chances += 1
             var e = self.mark(self.place_expr(ctx, to_use, -1))
             out.append(self.add_stmt(Stmt(S_USE, -1, e, -1, 0, [], [], "")))
+        if ret:
+            out += self.returning_end(data, ctx)
+            # (the block doesn't fall through: the code after it sees the
+            # variables as they were at its start)
+            for v in range(n_outer):
+                ctx.live[v] = live_at_start[v]
+                ctx.move_depth[v] = depth_at_start[v]
+            ctx.truncate(n_outer)
+            return out^
         if ctx.depth > 0:
             for v in range(n_outer):
                 if (
@@ -2230,6 +2283,67 @@ struct Program(Movable):
         var use = self.place_expr(ctx, v, -1)
         return [st, self.add_stmt(Stmt(S_USE, -1, use, -1, 0, [], [], ""))]
 
+    def returning_end(
+        mut self, mut data: ConjectureData, mut ctx: Ctx
+    ) raises -> List[Int]:
+        """The end of a block with an early return: `p = e` for each `mut`
+        argument still moved (a ret_uninit mutant leaves one moved, moving
+        it here if it's live, and marks the `return`), then `return e`."""
+        var out = List[Int]()
+        var left = -1
+        if self.wants(MU_RET_UNINIT) and not self.in_const_if(ctx):
+            var cands = List[Int]()
+            for v in range(len(ctx.names)):
+                if ctx.kinds[v] == V_MUT and ctx.types[v] != self.int_ty:
+                    cands.append(v)
+            if len(cands) > 0 and self.chance(data, MU_RET_UNINIT):
+                self.mutated = True
+                left = cands[pick(data, len(cands))]
+                if ctx.live[left]:
+                    out.append(self.move_stmt(ctx, left))
+        for v in range(len(ctx.names)):
+            if ctx.kinds[v] == V_MUT and not ctx.live[v] and v != left:
+                out.append(self.gen_reinit(data, ctx, v))
+        ctx.new_statement()
+        var e = self.gen_typed(data, ctx, ctx.ret, BODY_SIZE - 1, P_OWNED, True)
+        if left >= 0:
+            e = self.mark(e)
+        out.append(self.add_stmt(Stmt(S_RETURN, -1, e, -1, 0, [], [], "")))
+        return out^
+
+    def draw_ret_branch(
+        mut self,
+        mut data: ConjectureData,
+        ctx: Ctx,
+        const_cond: Bool,
+        mode: Int,
+        br: Int,
+    ) raises -> Int:
+        """Which branch of the `if` being drawn ends with an early return
+        (BR_THEN or BR_ELSE), or -1. Not in an `if` with a constant
+        condition (Mojo would drop the code after it, and so its errors).
+        With a plan (mode, br), a mutant's continuing branch is one that
+        leaves the variable moved; an early_return near miss's returning
+        branch is."""
+        if ctx.ret < 0 or const_cond:
+            return -1
+        var mutant_plan = mode >= 0 and (
+            self.mutant == MU_MAYBE_MOVED
+            or self.mutant == MU_MUT_UNINIT
+            or self.mutant == MU_UNINIT
+        )
+        if mode >= 0 and self.near == NR_EARLY_RETURN:
+            return br if mode == PLAN_MOVE else 1 - br
+        var often = self.wants(MU_RET_UNINIT) or self.wants_near(
+            NR_EARLY_RETURN
+        )
+        if data.draw(integers(0, 1 if often else 5)) != 0:
+            return -1
+        var r = pick(data, 2)
+        if mutant_plan and br != BR_BOTH:
+            r = 1 - br if mode == PLAN_MOVE else br
+        return r
+
     def plan_step(
         mut self,
         mut data: ConjectureData,
@@ -2244,7 +2358,12 @@ struct Program(Movable):
         if keep_moved >= 0 and ctx.live[keep_moved]:
             out.append(self.move_stmt(ctx, keep_moved))
         if reinit_in >= 0 and not ctx.live[reinit_in]:
-            out.append(self.gen_reinit(data, ctx, reinit_in))
+            if (
+                self.mutant == MU_UNINIT or self.near == NR_DEFERRED
+            ) and data.draw(integers(0, 2)) == 0:
+                out.append(self.nested_reinit(data, ctx, reinit_in))
+            else:
+                out.append(self.gen_reinit(data, ctx, reinit_in))
         return out^
 
     def wants_path(self) -> Bool:
@@ -2256,7 +2375,60 @@ struct Program(Movable):
             or self.wants_near(NR_MAYBE_MOVED)
             or self.wants_near(NR_REINIT_PATHS)
             or self.wants_near(NR_MUT_REINIT)
+            or self.wants_deferred()
+            or self.wants_near(NR_EARLY_RETURN)
         )
+
+    def wants_deferred(self) -> Bool:
+        """Whether a deferred kind (uninit, deferred) is still to be
+        made."""
+        return self.wants(MU_UNINIT) or self.wants_near(NR_DEFERRED)
+
+    def deferred_chance(
+        mut self, mut data: ConjectureData, ctx: Ctx
+    ) raises -> Bool:
+        """Whether to make the deferred kind here (an uninit mutant is
+        made, and so counts as made, only outside constant `if`s)."""
+        if self.wants(MU_UNINIT):
+            if self.in_const_if(ctx) or not self.chance(data, MU_UNINIT):
+                return False
+            self.mutated = True
+            return True
+        return self.near_chance(data, NR_DEFERRED)
+
+    def decl_stmt(
+        mut self, mut data: ConjectureData, mut ctx: Ctx, near: Bool
+    ) raises -> Int:
+        """`var vN: T`, a variable declared without a value: moved, and
+        assignable in this block. With near, marked as the near miss."""
+        var ty = self.draw_type(data, ctx.pool)
+        var name = String("v", ctx.counter)
+        ctx.counter += 1
+        var text = String(
+            MARK_NEAR if near else "", name, ": ", self.cty(ty, ctx)
+        )
+        if near:
+            self.near_made = True
+        ctx.push(name^, ty, V_OWNED)
+        var v = len(ctx.names) - 1
+        ctx.live[v] = False
+        ctx.move_depth[v] = ctx.depth
+        return self.add_stmt(Stmt(S_VAR, -1, -1, -1, 0, [], [], text^))
+
+    def nested_reinit(
+        mut self, mut data: ConjectureData, mut ctx: Ctx, v: Int
+    ) raises -> Int:
+        """`if c: v = e1 else: v = e2`, for the moved variable v."""
+        ctx.new_statement()
+        var op = pick(data, comptime (len(CMP_OPS)))
+        var x = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
+        var y = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
+        ctx.depth += 1
+        var a = self.gen_reinit(data, ctx, v)
+        ctx.live[v] = False
+        var b = self.gen_reinit(data, ctx, v)
+        ctx.depth -= 1
+        return self.add_stmt(Stmt(S_IF, -1, x, y, op, [a], [b], String()))
 
     def setup_movable(self, ctx: Ctx) -> List[Int]:
         """The variables the path kinds may move ahead of an `if` that
@@ -2264,10 +2436,17 @@ struct Program(Movable):
         maybe_moved and reinit_paths, live `mut` ones for mut_uninit and
         mut_reinit, none for other kinds. Not Ints (`^` on an Int has no
         effect)."""
-        var owned = self.wants(MU_MAYBE_MOVED) or self.wants_near(
-            NR_REINIT_PATHS
+        var owned = (
+            self.wants(MU_MAYBE_MOVED)
+            or self.wants_near(NR_REINIT_PATHS)
+            or self.wants_near(NR_EARLY_RETURN)
         )
-        var muts = self.wants(MU_MUT_UNINIT) or self.wants_near(NR_MUT_REINIT)
+        var muts = (
+            self.wants(MU_MUT_UNINIT)
+            or self.wants_near(NR_MUT_REINIT)
+            or self.wants(MU_RET_UNINIT)
+            or self.wants_near(NR_EARLY_RETURN)
+        )
         var out = List[Int]()
         if not owned and not muts:
             return out^
@@ -2283,21 +2462,33 @@ struct Program(Movable):
         mut self, mut data: ConjectureData, ctx: Ctx, x: Int, y: Int
     ) raises -> List[Int]:
         """For a path kind, perhaps a plan for the `if` being drawn, with
-        condition operands x and y: [variable, PLAN_*, BR_*, premove], and
+        condition operands x and y: [variable, PLAN_*, BR_*, PRE_*], and
         the mutant or near miss counts as made; empty if there is none or
-        the chance isn't taken. With premove, a live variable that the
+        the chance isn't taken. With PRE_MOVE, a live variable that the
         condition doesn't use is moved just before the `if`, for its
-        branches to reinitialize. A
+        branches to reinitialize; with PRE_DECL (the deferred kinds), the
+        variable (-1 here) is a new one declared without a value. A
         mutant's `if` isn't in a loop that uses the variable again (the
         next iteration's error could come first), and neither it nor an
         `if` around it has a constant condition (Mojo drops the dead
         branch first)."""
-        var mutant = self.wants(MU_MAYBE_MOVED) or self.wants(MU_MUT_UNINIT)
+        var mutant = (
+            self.wants(MU_MAYBE_MOVED)
+            or self.wants(MU_MUT_UNINIT)
+            or self.wants(MU_UNINIT)
+        )
         if not mutant and not self.wants_path():
             return []
         var const_cond = self.is_const(x) and self.is_const(y)
         if mutant and (const_cond or self.in_const_if(ctx)):
             return []
+        if self.wants_near(NR_EARLY_RETURN) and (ctx.ret < 0 or const_cond):
+            return []
+        if self.wants_deferred():
+            if not self.deferred_chance(data, ctx):
+                return []
+            # (a mutant assigns in one branch: both would be valid)
+            return [-1, PLAN_REINIT, pick(data, 2 if mutant else 3), PRE_DECL]
         var cands = List[Int]()  # v * 4 + PLAN_* + 2 * premove
         for v in range(len(ctx.names)):
             if ctx.types[v] == self.int_ty or v == self.keep_dead:
@@ -2308,7 +2499,7 @@ struct Program(Movable):
             var kind_ok: Bool
             if self.mutant == MU_MAYBE_MOVED or self.near == NR_REINIT_PATHS:
                 kind_ok = k == V_OWNED
-            elif self.near == NR_MAYBE_MOVED:
+            elif self.near == NR_MAYBE_MOVED or self.near == NR_EARLY_RETURN:
                 kind_ok = k == V_OWNED or k == V_MUT
             else:  # mut_uninit, mut_reinit
                 kind_ok = k == V_MUT
@@ -2336,8 +2527,13 @@ struct Program(Movable):
             return []
         var c = cands[pick(data, len(cands))]
         var mode = c % 2
-        # (a mutant reinitializes in one branch: both would be valid)
-        var br = pick(data, 2 if mode == PLAN_REINIT and mutant else 3)
+        # (a mutant reinitializes in one branch: both would be valid; an
+        # early_return near miss acts in the branch that returns, or in
+        # the other)
+        var one = (mode == PLAN_REINIT and mutant) or (
+            self.near == NR_EARLY_RETURN
+        )
+        var br = pick(data, 2 if one else 3)
         return [c // 4, mode, br, (c // 2) % 2]
 
     def finish_plan(
@@ -2355,9 +2551,11 @@ struct Program(Movable):
         plan to reinitialize may be undone: a block's last statements,
         reinitializing others, can move v again): v's state, and what
         follows the `if` (in an S_USE group with them):
-        - maybe_moved mutant: a use of v (marked);
+        - maybe_moved, uninit mutants: a use of v (marked);
         - mut_uninit mutant: nothing, and v stays moved to the return;
         - maybe_moved near miss: perhaps `v = e` and a use;
+        - deferred near miss: as reinit_paths, but perhaps neither when
+          a branch left v unassigned;
         - reinit_paths, mut_reinit: `v = e` unless both branches
           reinitialized v, then a use."""
         ctx.live[v] = all_init
@@ -2374,7 +2572,7 @@ struct Program(Movable):
             return self.add_stmt(
                 Stmt(S_USE, -1, -1, -1, 0, group^, [], String())
             )
-        if self.mutant == MU_MAYBE_MOVED:
+        if self.mutant == MU_MAYBE_MOVED or self.mutant == MU_UNINIT:
             ctx.move_depth[v] = -2
             ctx.new_statement()
             var use = self.mark(self.place_expr(ctx, v, -1))
@@ -2385,6 +2583,8 @@ struct Program(Movable):
                 reinit = data.draw(booleans())
             elif self.near == NR_MUT_REINIT and mode == PLAN_MOVE:
                 reinit = False  # (later, or at the body's end)
+            elif self.near == NR_DEFERRED and reinit:
+                reinit = data.draw(booleans())
             if reinit:
                 group.append(self.gen_reinit(data, ctx, v))
             if ctx.live[v]:
@@ -2545,6 +2745,10 @@ struct Program(Movable):
                 and len(self.owned_vars(ctx, len(ctx.names))) > 0
             ):
                 kinds += [S_FOR, S_FOR, S_FOR]  # a loop that can move one
+            if self.wants_deferred():
+                kinds += [S_FOR]  # a loop that can assign a new variable
+            if self.wants(MU_RET_UNINIT):
+                kinds += [S_IF, S_IF, S_IF]  # an `if` that can return
         var kind = kinds[pick(data, len(kinds))]
 
         if kind == S_VAR:
@@ -2640,15 +2844,19 @@ struct Program(Movable):
                 pv = plan[0]
                 mode = plan[1]
                 br = plan[2]
-                if plan[3] == 1:
+                if plan[3] == PRE_MOVE:
                     pre = self.move_stmt(ctx, pv)
                     ctx.move_depth[pv] = ctx.depth
+                elif plan[3] == PRE_DECL:
+                    pre = self.decl_stmt(data, ctx, self.near >= 0)
+                    pv = len(ctx.names) - 1
                 start_live = ctx.live[pv]
                 start_depth = ctx.move_depth[pv]
-                if self.near >= 0:
+                if self.near >= 0 and plan[3] != PRE_DECL:
                     x = self.mark_near(x)
             var in_then = pv >= 0 and br != BR_ELSE
             var in_else = pv >= 0 and br != BR_THEN
+            var ret_br = self.draw_ret_branch(data, ctx, const_cond, mode, br)
             ctx.depth += 1
             ctx.const_if += Int(const_cond)
             var then = self.gen_block(
@@ -2658,6 +2866,7 @@ struct Program(Movable):
                 False,
                 pv if in_then and mode == PLAN_MOVE else -1,
                 pv if in_then and mode == PLAN_REINIT else -1,
+                ret_br == BR_THEN,
             )
             var then_live = False
             if pv >= 0:  # (as it was before the then branch)
@@ -2671,6 +2880,7 @@ struct Program(Movable):
                 False,
                 pv if in_else and mode == PLAN_MOVE else -1,
                 pv if in_else and mode == PLAN_REINIT else -1,
+                ret_br == BR_ELSE,
             )
             ctx.const_if -= Int(const_cond)
             ctx.depth -= 1
@@ -2679,10 +2889,19 @@ struct Program(Movable):
             )
             if pv < 0:
                 return st
-            var all_init = then_live and ctx.live[pv]
+            # (the state the branches that don't return left)
+            var all_init = (then_live or ret_br == BR_THEN) and (
+                ctx.live[pv] or ret_br == BR_ELSE
+            )
             return self.finish_plan(data, ctx, pre, st, pv, mode, all_init)
 
-        # S_FOR
+        # S_FOR; for a deferred kind, perhaps `var dv: T` before it, which
+        # the body assigns (and the near miss uses there)
+        var pre = -1
+        var dv = -1
+        if self.wants_deferred() and self.deferred_chance(data, ctx):
+            pre = self.decl_stmt(data, ctx, self.near >= 0)
+            dv = len(ctx.names) - 1
         var count = data.draw(integers(0, 3))
         var name = String("i", ctx.counter)
         ctx.counter += 1
@@ -2691,13 +2910,43 @@ struct Program(Movable):
         ctx.depth += 1
         var loop_base = ctx.loop_base
         ctx.loop_base = n
-        var body = self.gen_block(data, ctx, 2, True)
+        var body = self.gen_block(data, ctx, 2, True, -1, dv)
+        if dv >= 0 and self.near >= 0 and ctx.live[dv]:
+            ctx.new_statement()
+            var use = self.place_expr(ctx, dv, -1)
+            body.append(self.add_stmt(Stmt(S_USE, -1, use, -1, 0, [], [], "")))
         ctx.loop_base = loop_base
         ctx.depth -= 1
         ctx.truncate(n)
         var loop = self.add_stmt(
             Stmt(S_FOR, -1, -1, -1, count, body^, [], name^)
         )
+        if dv >= 0:
+            # the loop may run no times: dv is maybe-uninitialized after it
+            ctx.live[dv] = False
+            ctx.move_depth[dv] = ctx.depth
+            var group: List[Int] = [pre, self.loop_uses(loop, ctx, n)]
+            ctx.new_statement()
+            if self.mutant == MU_UNINIT:
+                ctx.move_depth[dv] = -2
+                var use = self.mark(self.place_expr(ctx, dv, -1))
+                group.append(
+                    self.add_stmt(Stmt(S_USE, -1, use, -1, 0, [], [], ""))
+                )
+            elif data.draw(booleans()):
+                group.append(self.gen_reinit(data, ctx, dv))
+                var use = self.place_expr(ctx, dv, -1)
+                group.append(
+                    self.add_stmt(Stmt(S_USE, -1, use, -1, 0, [], [], ""))
+                )
+            return self.add_stmt(
+                Stmt(S_USE, -1, -1, -1, 0, group^, [], String())
+            )
+        return self.loop_uses(loop, ctx, n)
+
+    def loop_uses(mut self, loop: Int, ctx: Ctx, n: Int) -> Int:
+        """The loop statement, perhaps in an S_USE group with reads after
+        it (the workaround below); n variables are in scope."""
         if (
             self.loop_mark == ctx.depth + 1
         ):  # this loop's body, not a nested one
@@ -2706,11 +2955,13 @@ struct Program(Movable):
         if getenv("DECL_FUZZ_NO_LOOP_STORE_WORKAROUND") != "":
             return loop
         # A variable whose last use is a field assignment in a loop is
-        # destroyed on every iteration (modular/modular#7759), so the loop
-        # is followed by a read of each live owned variable. The loop and the reads form one S_USE group.
+        # destroyed on every iteration (modular/modular#7759; also when it
+        # is assigned whole after the loop, and for a `mut` argument or
+        # `mut self`), so the loop is followed by a read of each live owned
+        # or `mut` variable. The loop and the reads form one S_USE group.
         var uses: List[Int] = [loop]
         for v in range(n):
-            if ctx.kinds[v] == V_OWNED and ctx.live[v]:
+            if ctx.kinds[v] != V_READ and ctx.live[v]:
                 var place = self.place_expr(ctx, v, -1)
                 uses.append(
                     self.add_stmt(
@@ -3850,26 +4101,36 @@ struct Program(Movable):
     ) raises -> Int:
         # the body's own locals stay in scope for its result
         for s in self.bodies[b].stmts.copy():
-            self.exec(s, frame, targs)
+            if self.exec(s, frame, targs):
+                return self.ret_value
         return self.eval(self.bodies[b].ret, frame, targs)
 
     def exec_block(
         mut self, stmts: List[Int], mut frame: List[Int], targs: List[Int]
-    ) raises:
+    ) raises -> Bool:
+        """Whether the block returned (the value is in ret_value)."""
         var n = len(frame)
+        var returned = False
         for s in stmts:
-            self.exec(s, frame, targs)
+            if self.exec(s, frame, targs):
+                returned = True
+                break
         while len(frame) > n:
             _ = frame.pop()
+        return returned
 
-    def exec(mut self, s: Int, mut frame: List[Int], targs: List[Int]) raises:
+    def exec(
+        mut self, s: Int, mut frame: List[Int], targs: List[Int]
+    ) raises -> Bool:
+        """Whether s returned (the value is in ret_value)."""
         self.steps += 1
         if self.steps > STEP_LIMIT:
             raise Error("STEP_LIMIT")
         var kind = self.stmts[s].kind
         var e = self.stmts[s].e
         if kind == S_VAR:
-            frame.append(self.eval(e, frame, targs))
+            # (`var x: T` starts moved)
+            frame.append(self.eval(e, frame, targs) if e >= 0 else -1)
         elif kind == S_ASSIGN:
             self.stats[STAT_ASSIGN] += 1
             var v = self.eval(e, frame, targs)
@@ -3877,25 +4138,32 @@ struct Program(Movable):
         elif kind == S_EXPR:
             if self.exprs[e].kind == E_MOVE:  # `_ = x^` keeps x alive
                 self.stats[STAT_MOVE] += 1
-                return
+                return False
             _ = self.eval(e, frame, targs)
         elif kind == S_USE:
             for st in self.stmts[s].body.copy():
-                self.exec(st, frame, targs)
+                if self.exec(st, frame, targs):
+                    return True
+        elif kind == S_RETURN:
+            self.stats[STAT_RETURN] += 1
+            self.ret_value = self.eval(e, frame, targs)
+            return True
         elif kind == S_IF:
             if self.condition(
                 self.stmts[s].a, e, self.stmts[s].e2, frame, targs
             ):
-                self.exec_block(self.stmts[s].body.copy(), frame, targs)
-            else:
-                self.exec_block(self.stmts[s].orelse.copy(), frame, targs)
+                return self.exec_block(self.stmts[s].body.copy(), frame, targs)
+            return self.exec_block(self.stmts[s].orelse.copy(), frame, targs)
         else:
             var body = self.stmts[s].body.copy()
             for i in range(self.stmts[s].a):
                 self.stats[STAT_LOOP] += 1
                 frame.append(self.new_int(i))
-                self.exec_block(body, frame, targs)
+                var returned = self.exec_block(body, frame, targs)
                 _ = frame.pop()
+                if returned:
+                    return True
+        return False
 
     def call_method(
         mut self, m: Int, recv_ty: Int, mut frame: List[Int]
@@ -3952,6 +4220,8 @@ struct Program(Movable):
 
     def stmt_lines(self, st: Int, indent: String) -> String:
         ref s = self.stmts[st]
+        if s.kind == S_VAR and s.e < 0:
+            return String(indent, "var ", s.name, "\n")
         if s.kind == S_VAR:
             return String(
                 indent, "var ", s.name, " = ", self.exprs[s.e].text, "\n"
@@ -3966,6 +4236,8 @@ struct Program(Movable):
             )
         if s.kind == S_EXPR:
             return String(indent, "_ = ", self.exprs[s.e].text, "\n")
+        if s.kind == S_RETURN:
+            return String(indent, "return ", self.exprs[s.e].text, "\n")
         if s.kind == S_USE:
             if s.e >= 0:
                 return String(indent, "_use(", self.exprs[s.e].text, ")\n")
