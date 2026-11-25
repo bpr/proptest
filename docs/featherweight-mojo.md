@@ -15,7 +15,7 @@ refinement, required and default methods, static constructors and
 associated constants; concrete and generic structs conforming to them;
 and generic functions over trait bounds. Every program terminates.
 
-FM comes in three stages, all implemented:
+FM comes in four stages, all implemented:
 - **Stage 1** (the sections from "Syntax" to "Differences from fj-qc")
   is the purely functional core. Every type is `ImplicitlyCopyable`.
 - **Stage 2** ("Stage 2: ownership") adds ownership on top:
@@ -27,9 +27,16 @@ FM comes in three stages, all implemented:
 - **Stage 3** ("Stage 3: ill-typed mutants") turns the generator around:
   each program gets exactly one error, and the compiler must reject it,
   on the line of the error, without crashing.
+- **Stage 4** ("Stage 4: near misses") is stage 3's converse: each
+  program gets one valid construct close to an error, and the compiler
+  must accept it and run it correctly.
 
-Stage 2 found two compiler bugs in its first rounds, and stage 3 one
-more (see each stage's "Findings").
+"Paths" adds mutants and near misses whose variable is initialized on
+some paths only, after an `if`.
+
+Stage 2 found two compiler bugs in its first rounds, stage 3 two more,
+stage 4 a new form of one of stage 2's, and the path kinds an -O3 crash
+(see each section's "Findings").
 
 ## Syntax
 
@@ -210,6 +217,17 @@ either.)
 FM is big-step and call by value. Values are `n` (a 64-bit Int that
 wraps on overflow, as Mojo's does) and `S(v̄)`. ρ maps variables to
 values. θ maps the type parameters in scope to closed types.
+
+One exception to wrapping: Mojo computes an expression built only from
+literals exactly (`IntLiteral`), and truncates it when it becomes an
+`Int`. Truncation commutes with `+`, `-`, `*` and the bitwise operators,
+so wrapping at each step gives the same `Int`. A comparison whose two
+sides are both such expressions compares the exact values, though:
+`(100 * 2) < (100 * 4611686018427387904)` is true. The evaluator compares
+those exactly, in `Int128`. An associated constant is a literal on a
+concrete struct (`S0.K0 * 2^62 > 0` is true) but an `Int` on a type
+parameter (`T.K0 * 2^62 > 0` is false). A program where that or `Int128`
+overflow could change a comparison is rejected.
 
 ```text
   ρ,θ ⊢ e.f_k      ⇓ v_k                 if e ⇓ S(v̄)
@@ -832,17 +850,198 @@ only branches of an `ImplicitlyCopyable` type other than `Int` can both
 be places. The generator now copies the else branch when both are
 (`DECL_FUZZ_NO_TERN_PLACE_WORKAROUND=1` turns that off).
 
-## Beyond stage 3
+## Stage 4: near misses
+
+Stage 2 plays safe: it treats a `mut` argument as using its whole root
+variable, never reads a variable in the call that moves it, and treats
+`_ = x^` as a move. A checker that is too strict in those places goes
+unnoticed, since stage 2 never writes the valid programs it would
+reject. #7781, found by luck in stage 3, is such a false rejection.
+
+A **near miss** is a stage-2 program with one construct that is valid
+but close to an error, made as a mutant is (its kind drawn first, then
+made at a chance, 1/6 each). Unlike a mutant, it is still well typed,
+so the evaluator gives its meaning and `build_and_compare.sh` checks it
+as in stage 2: `BUILD_FAIL` is a false rejection, and the differences
+are miscompiles. The near miss's line is marked `# NEAR`, and the
+program starts with `# FM near miss: <kind>`. `DECL_FUZZ_NEAR=1` (or
+`=disjoint,reinit`) turns stage 4 on.
+
+| Kind | Construct | Next to the error |
+|---|---|---|
+| `disjoint` | `g(v.f0, v.f1)`, a `mut` field and another field (`mut` or read), or `v.f1.m(v.f0)` | `alias`: `g(v, v.f0)` |
+| `read_alias` | `g(x, x)`, `g(x, x.f)`, `x.m(x)`, all read (not Ints, which are passed by value) | `alias` with a `mut` argument |
+| `reinit` | `var y = x^` then, later in the block, `x = e` and a use of x; in a loop, of an outer x in one iteration | `use_moved`, `loop_move` |
+| `move_copy` | `g(x^, x.copy())`, `g(x^, x.f)` (an Int field), `S(x^, x.f.copy())`: x moves at the call, after the other arguments are evaluated | `g(x^, x)`, which borrows x: an aliasing error |
+| `discard_move` | `_ = x^` then a use of x: Mojo keeps x alive | `use_moved` |
+
+Probes settled each construct (and the errors beside them) before the
+generator made any. Two changes to the evaluator follow Mojo:
+- An argument `x^` moves x only when the call is made, so arguments
+  after it may still read x.
+- `_ = x^` leaves x alive.
+
+Neither changes the meaning of a stage 2 program, which never reads x
+afterwards.
+
+Waiting for a chance was enough for `reinit` and `discard_move`, but
+not for the three that need a call. The calls, the variables and their
+types they need seldom meet in a body: at first, 9 to 18% of programs
+got the near miss. For those three, a block may build the statement:
+`_ = g(...)` with the near miss's two arguments fixed and the others
+drawn as usual, none of them using its variable. It picks a function
+that isn't generic, a method with a read receiver, or (for `move_copy`)
+a constructor, and writes `var vN = e` first if no variable of the type
+it needs is there. In 3000 programs (seeds 305 to 309), the number of
+each kind that got its near miss, and the number rejected:
+
+| Kind | Made | No chance |
+|---|---|---|
+| `reinit` | 974 | 268 |
+| `discard_move` | 891 | 226 |
+| `move_copy` | 790 | 380 |
+| `read_alias` | 522 | 730 |
+| `disjoint` | 181 | 930 |
+
+`disjoint` needs a struct with two fields of a callee's parameter
+types, which few programs declare.
+
+**Validation.** The first round, 600 programs of all kinds (seed 743,
+nightly), gave one `DIFF_EXPECTED`. It was an evaluator bug, not a near
+miss: the evaluator wrapped `100 * 4611686018427387904` in a comparison
+of two literal expressions, which Mojo computes exactly (see
+"Evaluation"). Stages 1 and 2 had never hit it. With the evaluator
+fixed, seed 743 and 600 more (seed 744) gave no differences, and nor
+did 300 on 1117 (seed 742). 400 well-typed programs (seeds 223 and 224)
+and 600 mutants (seed 632) passed too.
+
+### Findings
+
+**`v = v if c else w` (#7760 again).** On 1117, a `move_copy` program
+gave a `DIFF_O3`. The near miss had nothing to do with it: the cause was
+`v0 = (v0 if a == a else v0)` on an `ImplicitlyCopyable` struct, the
+self-assignment of #7760 through a ternary, which stage 2's `v = v`
+workaround didn't catch. Reduced:
+- `v = v if c else w` gives garbage at -O3 when `c` is true, as `v = v`
+  does.
+- `v = v if c else w.copy()` and `v = v if c else P(9, 9)` give the
+  other branch's value instead, though `c` is true.
+- `v = w if c else v` with `c` false is wrong too.
+
+`v.copy()` in the branch, or a temporary, gives the right value. Both
+1117 and 1123 do this. Reported in a
+[comment on #7760](https://github.com/modular/modular/issues/7760#issuecomment-7153833750)
+(11-24). The generator now copies a branch that is the assigned variable
+itself (under the same `DECL_FUZZ_NO_SELF_ASSIGN_WORKAROUND`).
+
+## Paths: errors on some paths only
+
+Stage 2 keeps every variable's state the same on all paths: a block
+that moves a variable live at its start reinitializes it at its end, so
+after an `if` each variable is either live or moved, whichever branch
+ran. Mojo's checker is path-sensitive. After an `if`, a variable can be
+initialized on some paths and not others, and a `mut` argument has to
+be initialized on every path to the return. Two mutant kinds and three
+near-miss kinds test this. They are made by a **plan** that an `if`
+draws for one variable, before its branches. In the plan, the branches
+either move the variable (it was live), or reinitialize it (it was
+moved). They do so in the then branch, the else branch, or both, at a
+drawn point in the branch (or wherever a statement of the branch
+already does).
+
+Probes on the nightly settled Mojo's rules first:
+- A use after an `if` that moved x on only some paths is an error at
+  the use ("use of uninitialized value"), as after a move on all paths.
+- `x = e` after such an `if` is fine, and so is never using x again.
+  Mojo then destroys x at the end of the `if` on the paths that didn't
+  move it.
+- A field assignment `x.f = e` after such an `if` is an error at the
+  move ("cannot be consumed, because 'x.f' is used later"). The plans
+  never write one.
+- A `mut` argument (or `mut self`) may be moved out (`var y = p0^`)
+  if it's reinitialized on every path. Otherwise the error is at the
+  `return` ("'p0' is uninitialized at return from this function"),
+  or at the `def` line when there is no `return`.
+- In a loop, a move on some paths of a variable from outside the loop
+  is an error at the move, from the next iteration. Mutant plans are
+  made only on variables declared inside the innermost loop body.
+
+| Kind | Construct | Mojo's error |
+|---|---|---|
+| mutant `maybe_moved` | an `if` moves x in some branches (or reinitializes a moved x in one), then `_use(x)` | use of uninitialized value 'x' |
+| mutant `mut_uninit` | a `mut` argument moved out and not reinitialized: in some branches, or after a move and reinitialized in one branch, or not at all; the `return` is marked | 'p0' is uninitialized at return from this function |
+| near `maybe_moved` | an `if` moves x (owned or `mut`) in some branches, then perhaps `x = e` and a use; otherwise x is left alone, to be reinitialized later or destroyed on the other paths | |
+| near `reinit_paths` | x moved before an `if` that reinitializes it in both branches, or in one and then after the `if`, then a use | |
+| near `mut_reinit` | a `mut` argument moved out, then reinitialized on every path: in the same branch, in both branches, after the `if`, or at the end of the body | |
+
+Mutants and near misses on these kinds use `DECL_FUZZ_MUTANTS` and
+`DECL_FUZZ_NEAR` as before (`DECL_FUZZ_MUTANTS=maybe_moved,mut_uninit`).
+As for the other kinds, a mutant plan isn't made in an `if` with a
+constant condition or inside one. The near misses check destruction on
+every path through the `Res` ledger: a compiler that destroys a
+maybe-moved `Res` on the wrong paths gives `UNBALANCED`.
+
+To give the plans something to reinitialize, these kinds sometimes move
+a variable at the start of a statement (an owned one, or a `mut` one
+for `mut_uninit` and `mut_reinit`). A plan can also move one itself just
+before its `if`, if the condition doesn't use it. A body ends by
+reinitializing each `mut` argument that is still moved. That is a
+`mut_reinit` near miss, or for `mut_uninit` a chance to leave it moved.
+Stage 2 never moves a `mut` argument. In 400 to 1400 programs per kind
+(seeds 305 and 306), the share that got the construct:
+
+| Kind | Made |
+|---|---|
+| near `mut_reinit` | 61% |
+| near `maybe_moved` | 54% |
+| mutant `mut_uninit` | 43% |
+| mutant `maybe_moved` | 40% |
+| near `reinit_paths` | 33% |
+
+**Validation.** On the nightly, after the fix below:
+- 400 path near misses (seed 502) and 300 path mutants (seed 502) were
+  all OK.
+- So were 200 stage 2 programs (seed 225), 300 mutants of all kinds
+  (seed 633), and 200 near misses of the stage 4 kinds (seed 745).
+
+Before the fix, the first round (seed 501) gave 300 OK mutants, and 9
+`BUILD_FAIL`s and 3 `BUILD_CRASH`es among 300 near misses.
+
+The first round showed that a plan can't simply assume its outcome. A
+branch ends by reinitializing the variables it moved, and the value it
+assigns one of them can move another, even the plan's variable after
+the plan reinitialized it (`v2 = v3^`, then `v3 = v2^`). After the `if`,
+the generator now takes the state each branch actually left: the
+variable is live only if both branches left it live.
+
+### Findings
+
+**An -O3 crash.** Three `mut_reinit` programs of the first round, all
+variants of one program, crashed the compiler at -O3 (a segmentation
+fault, with no pass named in the backtrace). The near miss had nothing
+to do with it: it was in a method no entry point called. Reduced, the
+crash needs a method whose `if` condition is known only after inlining
+(a call of a function returning `False`), a dead branch that copies a
+two-level `ImplicitlyCopyable` struct argument into a local, a live
+branch that builds and drops a value with a `__deinit__`, and three
+chained calls of the method. -O0 to -O2 are fine. Both 1117 and 1123
+crash. Filed as
+[#7783](https://github.com/modular/modular/issues/7783). The generator
+has no workaround. The crash is rare, and the program it needs is too
+specific to avoid.
+
+## Beyond the paths
 
 Mojo features FM leaves out for now:
 - **More ownership:** partial moves of fields, `ref` results and
-  origins, `deinit`/consuming methods, "maybe moved" states after
-  branches, `while` loops with `break`, and custom `__deinit__`s in
+  origins, `deinit`/consuming methods, `while` loops with `break` (and
+  the paths they add), early `return`s, and custom `__deinit__`s in
   generated structs.
-- **More mutants:** errors only some paths have (a move in one `if`
-  branch, then a use), uses of a `mut` argument left uninitialized at
-  return, and `mut` borrows of disjoint fields, which are accepted (a
-  "must accept" mutant).
+- **More paths:** a loop that moves an outer variable in one branch
+  (`loop_move` through an `if`), and variables declared without a
+  value (`var x: T`) and initialized in branches.
+- **More near misses:** disjoint fields through generic functions and
+  `mut self`.
 - **Overloading and `@implicit` conversions:** Mojo's resolution rules
   aren't fully specified, so the evaluator would have to restrict itself
   to unambiguous overload sets.

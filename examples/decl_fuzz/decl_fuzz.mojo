@@ -29,6 +29,17 @@
 # compiler to reject the program, with an error on a marked line, and not
 # to crash. DECL_FUZZ_MUTANTS=alias,sig asks for only those kinds.
 #
+# Near misses (DECL_FUZZ_NEAR=1, or =kind,kind) are the converse: valid
+# programs, each with one construct close to an error (NR_*: disjoint `mut`
+# fields, aliased read arguments, a move then a reinitialization, `f(x^,
+# x.copy())`, `_ = x^` then a use of x), marked `# NEAR`. They are checked
+# like well-typed programs, so a BUILD_FAIL is a false rejection.
+#
+# The path kinds of both (maybe_moved and mut_uninit mutants; maybe_moved,
+# reinit_paths and mut_reinit near misses) leave a variable initialized on
+# some paths only after an `if`: a plan the `if` draws for it moves or
+# reinitializes it in some of its branches (`draw_plan`).
+#
 # Every program terminates: each method and function has a rank, and a
 # body calls only methods and functions of lower rank; loops have constant
 # bounds. The generator also evaluates the program itself (`Program.eval`,
@@ -147,6 +158,15 @@ comptime R_METHOD = 6
 comptime R_K = 7
 comptime R_CALL = 8
 
+# what an `if` does to one variable, for the path-dependent mutants and
+# near misses: its branches move it (it was live), or reinitialize it (it
+# was moved), in the then branch, the else branch, or both
+comptime PLAN_MOVE = 0
+comptime PLAN_REINIT = 1
+comptime BR_THEN = 0
+comptime BR_ELSE = 1
+comptime BR_BOTH = 2
+
 # how an atom uses its variable
 comptime A_PLAIN = 0
 comptime A_COPY = 1
@@ -214,7 +234,13 @@ comptime MU_SIG = 11
 """A method whose signature differs from its trait's."""
 comptime MU_CAP = 12
 """A struct declared more copyable than its fields."""
-comptime N_MU = 13
+comptime MU_MAYBE_MOVED = 13
+"""A use, after an `if`, of a variable moved (or reinitialized) in only
+some of its branches."""
+comptime MU_MUT_UNINIT = 14
+"""A `mut` argument moved out and not reinitialized on some path to the
+return."""
+comptime N_MU = 15
 comptime MU_NAMES: List[String] = [
     "type",
     "use_moved",
@@ -229,11 +255,49 @@ comptime MU_NAMES: List[String] = [
     "missing",
     "sig",
     "cap",
+    "maybe_moved",
+    "mut_uninit",
 ]
 comptime MU_ODDS = 6
 """Each chance to apply the mutation is taken 1 time in MU_ODDS."""
 comptime MARK = "@@M@@"
 """In generated text, marks the line of the mutation."""
+
+# Near misses (DECL_FUZZ_NEAR=1): well-typed programs, each with one
+# construct of a kind drawn first that is valid but close to an error; the
+# compiler must accept them and agree with the evaluator. Marked `# NEAR`.
+comptime NR_DISJOINT = 0
+"""`mut` (or read) arguments that are disjoint fields of one variable."""
+comptime NR_READ_ALIAS = 1
+"""Read arguments overlapping each other, or a read receiver."""
+comptime NR_REINIT = 2
+"""A variable moved, then reinitialized (in a loop: in one iteration)."""
+comptime NR_MOVE_COPY = 3
+"""`f(x^, x.copy())`: later arguments use x, which moves at the call."""
+comptime NR_DISCARD_MOVE = 4
+"""`_ = x^`, which keeps x alive, then a use of x."""
+comptime NR_MAYBE_MOVED = 5
+"""A variable moved in some branches of an `if`, then reinitialized, or
+not used again (destroyed on the other paths)."""
+comptime NR_REINIT_PATHS = 6
+"""A moved variable reinitialized in both branches of an `if` (or in one,
+then after the `if`), then used."""
+comptime NR_MUT_REINIT = 7
+"""A `mut` argument moved out and reinitialized on every path to the
+return."""
+comptime N_NR = 8
+comptime NR_NAMES: List[String] = [
+    "disjoint",
+    "read_alias",
+    "reinit",
+    "move_copy",
+    "discard_move",
+    "maybe_moved",
+    "reinit_paths",
+    "mut_reinit",
+]
+comptime MARK_NEAR = "@@N@@"
+"""In generated text, marks the line of the near miss."""
 
 comptime BIN_OPS: List[String] = ["+", "-", "*", "&", "|", "^"]
 comptime CMP_OPS: List[String] = ["<", "==", "!="]
@@ -499,6 +563,9 @@ struct Ctx(Copyable):
     var pool: List[Int]
     """The types this context draws from."""
     var depth: Int
+    var loop_base: Int
+    """The first variable declared in the innermost loop body (0 outside
+    loops): the ones before it are used again by the next iteration."""
     var no_move: Int
     """Inside a ternary branch, where moves would be conditional."""
     var const_if: Int
@@ -531,6 +598,7 @@ struct Ctx(Copyable):
         self.self_print = self_print
         self.pool = pool^
         self.depth = 0
+        self.loop_base = 0
         self.no_move = 0
         self.const_if = 0
         self.discard = False
@@ -566,6 +634,24 @@ def kind_of_conv(conv: Int) -> Int:
     if conv == CONV_MUT:
         return V_MUT
     return V_OWNED if conv == CONV_VAR else V_READ
+
+
+comptime C_FN = 0
+comptime C_METHOD = 1
+comptime C_CTOR = 2
+
+
+@fieldwise_init
+struct Callee(Copyable):
+    """A function, method or constructor a near miss's call can be."""
+
+    var kind: Int
+    """C_FN, C_METHOD (argument 0 is the receiver) or C_CTOR."""
+    var id: Int
+    """The function, the method, or the struct type."""
+    var ret: Int
+    var params: List[Int]
+    var convs: List[Int]
 
 
 @fieldwise_init
@@ -616,11 +702,17 @@ struct Program(Movable):
     """Whether the mutation has been made."""
     var chances: Int
     """How many chances to make it there were (DECL_FUZZ_STATS=1)."""
+    var near: Int
+    """The kind of near miss to make (NR_*), or -1."""
+    var near_made: Bool
     var loop_mark: Int
     """The depth of the loop body where MU_LOOP_MOVE moved an outer
     variable, until its loop is made (and marked); else -1."""
     var marked_stmts: List[Int]
     """Statements whose every line is marked."""
+    var keep_dead: Int
+    """The `mut` argument a mut_uninit mutant left moved (blocks don't
+    reinitialize it, and the body's return is marked), or -1."""
     var mark_struct: Int
     """The struct whose header line is marked, or -1..."""
     var mark_fields: Bool
@@ -653,8 +745,11 @@ struct Program(Movable):
         self.mutant = -1
         self.mutated = False
         self.chances = 0
+        self.near = -1
+        self.near_made = False
         self.loop_mark = -1
         self.marked_stmts = []
+        self.keep_dead = -1
         self.mark_struct = -1
         self.mark_fields = False
         self.mark_impl = -1
@@ -889,8 +984,15 @@ struct Program(Movable):
         return self.draw_type(data, pool)
 
     def draw_declarations(mut self, mut data: ConjectureData) raises:
-        # mut_read and alias mutants need calls with `mut` arguments
-        var mut_often = self.mutant == MU_MUT_READ or self.mutant == MU_ALIAS
+        # mut_read and alias mutants, and disjoint near misses, need calls
+        # with `mut` arguments; mut_uninit and mut_reinit, bodies with them
+        var mut_often = (
+            self.mutant == MU_MUT_READ
+            or self.mutant == MU_ALIAS
+            or self.mutant == MU_MUT_UNINIT
+            or self.near == NR_DISJOINT
+            or self.near == NR_MUT_REINIT
+        )
         var mut_self_from = 2 if mut_often else 3  # `mut self` 1/2 or 1/4
         # trait headers: parents, capability, K, make (FJ: classes in
         # order, so the refinement relation is acyclic)
@@ -1142,6 +1244,49 @@ struct Program(Movable):
                 return False
         return True
 
+    def copy_self_branches(mut self, e: Int, v: Int) -> Int:
+        """The ternary e (perhaps nested) with each branch that is the
+        variable v itself copied; e itself if there is none."""
+        if self.exprs[e].kind != E_TERN:
+            return e
+        var kids = self.exprs[e].kids.copy()
+        var changed = False
+        for b in range(2, 4):
+            var k = kids[b]
+            var nk: Int
+            if (
+                self.exprs[k].kind == E_VAR
+                and self.exprs[k].a == v
+                and MARK not in self.exprs[k].text
+            ):
+                var ty = self.exprs[k].ty
+                var text = String(self.exprs[k].text, ".copy()")
+                nk = self.add(E_COPY, 0, ty, [k], [], text^)
+            else:
+                nk = self.copy_self_branches(k, v)
+            if nk != k:
+                kids[b] = nk
+                changed = True
+        if not changed:
+            return e
+        var ops = materialize[CMP_OPS]()
+        var text = String(
+            "(",
+            self.exprs[kids[2]].text,
+            " if ",
+            self.exprs[kids[0]].text,
+            " ",
+            ops[self.exprs[e].a],
+            " ",
+            self.exprs[kids[1]].text,
+            " else ",
+            self.exprs[kids[3]].text,
+            ")",
+        )
+        return self.add(
+            E_TERN, self.exprs[e].a, self.exprs[e].ty, kids^, [], text^
+        )
+
     def is_place(self, e: Int) -> Bool:
         """Whether e is a place: a variable, a field of a place, or a
         ternary of places."""
@@ -1161,12 +1306,95 @@ struct Program(Movable):
         return e
 
     def mutation_state(self) -> Int:
-        """For backtracking: a mutation in a discarded attempt is undone."""
-        return Int(self.mutated) + 2 * (self.loop_mark + 1)
+        """For backtracking: a mutation (or near miss) in a discarded
+        attempt is undone."""
+        return (
+            Int(self.mutated)
+            + 2 * Int(self.near_made)
+            + 4 * (self.loop_mark + 1)
+            + 64 * (self.keep_dead + 1)
+        )
 
     def restore_mutation(mut self, state: Int):
         self.mutated = state % 2 == 1
-        self.loop_mark = state // 2 - 1
+        self.near_made = (state // 2) % 2 == 1
+        self.loop_mark = (state // 4) % 16 - 1
+        self.keep_dead = state // 64 - 1
+
+    def wants_near(self, kind: Int) -> Bool:
+        """Whether a near miss of this kind is still to be made."""
+        return self.near == kind and not self.near_made
+
+    def near_chance(
+        mut self, mut data: ConjectureData, kind: Int
+    ) raises -> Bool:
+        """Whether to make the near miss here (as `chance`)."""
+        if not self.wants_near(kind):
+            return False
+        self.chances += 1
+        return data.draw(integers(0, MU_ODDS - 1)) == 0
+
+    def mark_near(mut self, e: Int) -> Int:
+        """Marks e as the near miss: its line gets `# NEAR`."""
+        self.exprs[e].text = String(MARK_NEAR, self.exprs[e].text)
+        self.near_made = True
+        return e
+
+    def uses_var(self, e: Int, v: Int) -> Bool:
+        """Whether e mentions variable v."""
+        ref x = self.exprs[e]
+        if (x.kind == E_VAR or x.kind == E_MOVE) and x.a == v:
+            return True
+        for k in x.kids:
+            if self.uses_var(k, v):
+                return True
+        return False
+
+    def borrows_var(self, e: Int, v: Int) -> Bool:
+        """Whether e is a place rooted at v (passed read, it would borrow
+        v rather than be a value)."""
+        ref x = self.exprs[e]
+        if x.kind == E_VAR:
+            return x.a == v
+        if x.kind == E_FIELD:
+            return self.borrows_var(x.kids[0], v)
+        if x.kind == E_TERN:
+            return self.borrows_var(x.kids[2], v) or self.borrows_var(
+                x.kids[3], v
+            )
+        return False
+
+    def disjoint_places(mut self, ctx: Ctx, ty: Int) -> List[Int]:
+        """For NR_DISJOINT: fields of type ty of a variable one of whose
+        fields was passed `mut` in this statement, other than those."""
+        var out = List[Int]()
+        for q in ctx.taken:
+            if q % 64 == 0:
+                continue
+            var v = q // 64
+            var fs = self.fields_of(ctx.types[v])
+            for f in range(len(fs)):
+                var p = v * 64 + f + 1
+                if fs[f] == ty and not has(ctx.taken, p) and not has(out, p):
+                    out.append(p)
+        return out^
+
+    def read_alias_places(mut self, ctx: Ctx, ty: Int) -> List[Int]:
+        """For NR_READ_ALIAS: places of type ty (not Int: Ints are passed
+        by value) overlapping a variable already read in this statement."""
+        var out = List[Int]()
+        if ty == self.int_ty:
+            return out^
+        for v in range(len(ctx.names)):
+            if not ctx.touched[v] or not ctx.live[v] or ctx.excl[v]:
+                continue
+            if ctx.types[v] == ty:
+                out.append(v * 64)
+            var fs = self.fields_of(ctx.types[v])
+            for f in range(len(fs)):
+                if fs[f] == ty:
+                    out.append(v * 64 + f + 1)
+        return out^
 
     def moved_vars(self, ctx: Ctx) -> List[Int]:
         """The dead variables, except Ints and those moved in the current
@@ -1431,12 +1659,18 @@ struct Program(Movable):
     ) raises -> Int:
         # entry points (root) drive everything: give them more statements
         var stmts = self.gen_block(data, ctx, 5 if root else 3)
+        stmts += self.mut_reinits(data, ctx)
         ctx.new_statement()
         var r: Int
         if root:
             r = self.gen(data, ctx, ret, size, P_OWNED, True, True)
         else:
             r = self.gen_typed(data, ctx, ret, size, P_OWNED, True)
+        if self.keep_dead >= 0:
+            # a mut_uninit mutant: Mojo reports the `mut` argument left
+            # uninitialized at the return
+            self.exprs[r].text = String(MARK, self.exprs[r].text)
+            self.keep_dead = -1
         if root:
             # A checksum, as in Csmith: the entry point keeps its result in
             # a variable, then returns it plus every Int reachable from its
@@ -1450,6 +1684,27 @@ struct Program(Movable):
             r = self.checksum(ctx)
         self.bodies.append(Body(stmts^, r, ctx.self_print))
         return len(self.bodies) - 1
+
+    def mut_reinits(
+        mut self, mut data: ConjectureData, mut ctx: Ctx
+    ) raises -> List[Int]:
+        """At the end of a body, `p = e` for each `mut` argument moved out
+        (by the path kinds). A mut_uninit mutant may leave one moved
+        instead, and a mut_reinit near miss may be this
+        reinitialization."""
+        var out = List[Int]()
+        for v in range(len(ctx.names)):
+            if ctx.kinds[v] != V_MUT or ctx.live[v] or v == self.keep_dead:
+                continue
+            if self.chance(data, MU_MUT_UNINIT):
+                self.mutated = True
+                self.keep_dead = v
+                continue
+            var st = self.gen_reinit(data, ctx, v)
+            if self.near_chance(data, NR_MUT_REINIT):
+                _ = self.mark_near(self.stmts[st].target)
+            out.append(st)
+        return out^
 
     def int_paths(mut self, ty: Int, depth: Int) -> List[List[Int]]:
         """Field paths from a value of type ty to its Ints."""
@@ -1557,17 +1812,73 @@ struct Program(Movable):
         mut ctx: Ctx,
         n_max: Int,
         loop: Bool = False,
+        keep_moved: Int = -1,
+        reinit_in: Int = -1,
     ) raises -> List[Int]:
         """Statements; in a nested block, variables live at its start are
         live at its end (moved ones are reinitialized), and its locals go
-        out of scope."""
+        out of scope. For a branch of an `if` with a plan, keep_moved is a
+        variable the block moves (unless a statement does) and leaves
+        moved, and reinit_in one moved before it that it reinitializes
+        (unless a statement does)."""
         var n_outer = len(ctx.names)
         var live_at_start = ctx.live.copy()
         var out = List[Int]()
         var moved = -1
         var to_use = -1  # a variable moved for a use_moved mutant
+        var to_reinit = -1  # a variable moved for a reinit near miss
         var n = data.draw(integers(0, n_max))
-        for _ in range(n):
+        var plan_at = -1  # (before which statement the plan acts)
+        if keep_moved >= 0 or reinit_in >= 0:
+            plan_at = data.draw(integers(0, n))
+        for i in range(n):
+            if i == plan_at:
+                out += self.plan_step(data, ctx, keep_moved, reinit_in)
+            var setup = self.setup_movable(ctx)
+            if len(setup) > 0 and data.draw(integers(0, MU_ODDS - 1)) == 0:
+                # a move for a later `if` (or the body's end) to
+                # reinitialize, assignable in this block
+                var v = setup[pick(data, len(setup))]
+                out.append(self.move_stmt(ctx, v))
+                ctx.move_depth[v] = ctx.depth
+            if to_reinit >= 0 and data.draw(booleans()):
+                out += self.reinit_stmts(data, ctx, to_reinit)
+                to_reinit = -1
+            if to_reinit < 0 and self.wants_near(NR_REINIT):
+                # move a variable (in a loop, perhaps an outer one), and
+                # reinitialize it later in the block
+                var owned = self.owned_vars(ctx, len(ctx.names))
+                if len(owned) > 0 and self.near_chance(data, NR_REINIT):
+                    to_reinit = owned[pick(data, len(owned))]
+                    var st = self.move_stmt(ctx, to_reinit)
+                    var e = self.stmts[st].e
+                    self.exprs[e].text = String(MARK_NEAR, self.exprs[e].text)
+                    out.append(st)
+            if (
+                self.wants_near(NR_DISJOINT)
+                or self.wants_near(NR_READ_ALIAS)
+                or self.wants_near(NR_MOVE_COPY)
+            ):
+                out += self.near_call_stmts(data, ctx)
+            if self.wants_near(NR_DISCARD_MOVE):
+                # `_ = x^`, which leaves x alive, then a use of x
+                var owned = self.owned_vars(ctx, len(ctx.names))
+                if len(owned) > 0 and self.near_chance(data, NR_DISCARD_MOVE):
+                    var v = owned[pick(data, len(owned))]
+                    ctx.new_statement()
+                    var text = String(ctx.names[v], "^")
+                    var e = self.add(E_MOVE, v, ctx.types[v], [], [], text^)
+                    out.append(
+                        self.add_stmt(
+                            Stmt(
+                                S_EXPR, -1, self.mark_near(e), -1, 0, [], [], ""
+                            )
+                        )
+                    )
+                    var use = self.place_expr(ctx, v, -1)
+                    out.append(
+                        self.add_stmt(Stmt(S_USE, -1, use, -1, 0, [], [], ""))
+                    )
             if (
                 to_use < 0
                 and self.wants(MU_USE_MOVED)
@@ -1602,6 +1913,7 @@ struct Program(Movable):
                         self.add_stmt(Stmt(S_USE, -1, e, -1, 0, [], [], ""))
                     )
             out.append(self.gen_stmt(data, ctx))
+        out += self.plan_step(data, ctx, keep_moved, reinit_in)
         if loop and self.wants(MU_LOOP_MOVE) and not self.in_const_if(ctx):
             # no chance was taken: move one last
             var outer = self.loop_movable(ctx, n_outer, out)
@@ -1611,6 +1923,8 @@ struct Program(Movable):
                 out.append(self.move_stmt(ctx, moved))
                 self.mutated = True
                 self.loop_mark = ctx.depth
+        if to_reinit >= 0:
+            out += self.reinit_stmts(data, ctx, to_reinit)
         if to_use >= 0 and self.wants(MU_USE_MOVED):
             # no chance was taken after the move
             self.chances += 1
@@ -1618,10 +1932,469 @@ struct Program(Movable):
             out.append(self.add_stmt(Stmt(S_USE, -1, e, -1, 0, [], [], "")))
         if ctx.depth > 0:
             for v in range(n_outer):
-                if live_at_start[v] and not ctx.live[v] and v != moved:
+                if (
+                    live_at_start[v]
+                    and not ctx.live[v]
+                    and v != moved
+                    and v != keep_moved
+                    and v != self.keep_dead
+                ):
                     out.append(self.gen_reinit(data, ctx, v))
             ctx.truncate(n_outer)
         return out^
+
+    def near_callees(mut self, ctx: Ctx, ctors: Bool) -> List[Callee]:
+        """What a near miss's call can be: functions that aren't generic,
+        methods with a read receiver (argument 0), and with ctors, struct
+        constructors."""
+        var out = List[Callee]()
+        for f in range(len(self.fns)):
+            if len(self.fns[f].bounds) == 0 and self.fns[f].rank < ctx.rank:
+                out.append(
+                    Callee(
+                        C_FN,
+                        f,
+                        self.fns[f].ret,
+                        self.fns[f].params.copy(),
+                        self.fns[f].convs.copy(),
+                    )
+                )
+        for r in ctx.pool.copy():
+            if self.tkind[r] != STRUCT:
+                continue
+            for m in self.methods_on(r, ctx.bounds):
+                if (
+                    self.methods[m].is_static
+                    or self.methods[m].self_conv != CONV_READ
+                    or self.methods[m].rank >= ctx.rank
+                ):
+                    continue
+                var params: List[Int] = [r]
+                params += self.method_params(m, r)
+                var convs: List[Int] = [CONV_READ]
+                convs += self.methods[m].convs.copy()
+                out.append(
+                    Callee(C_METHOD, m, self.method_ret(m, r), params^, convs^)
+                )
+            if ctors:
+                var fs = self.fields_of(r)
+                out.append(
+                    Callee(
+                        C_CTOR,
+                        r,
+                        r,
+                        fs.copy(),
+                        List[Int](length=len(fs), fill=CONV_VAR),
+                    )
+                )
+        return out^
+
+    def call_with(
+        mut self,
+        mut data: ConjectureData,
+        mut ctx: Ctx,
+        c: Callee,
+        pos: List[Int],
+        fixed: List[Int],
+    ) raises -> Int:
+        """A call of c whose arguments at pos are fixed (the rest drawn;
+        the caller keeps them off the fixed arguments' variables)."""
+        var kids = List[Int]()
+        var mut_call = has(c.convs, CONV_MUT)
+        for n in range(len(c.params)):
+            var at = -1
+            for q in range(len(pos)):
+                if pos[q] == n:
+                    at = q
+            if at >= 0:
+                kids.append(fixed[at])
+            elif c.kind == C_METHOD and n == 0:
+                kids.append(self.gen(data, ctx, c.params[0], 1, P_READ))
+            else:
+                kids.append(
+                    self.gen_arg(
+                        data, ctx, c.params[n], c.convs[n], 1, mut_call
+                    )
+                )
+        if c.kind == C_FN:
+            var text = String(
+                self.fns[c.id].name, "(", self.args_text(kids, 0), ")"
+            )
+            return self.add(E_CALL, c.id, c.ret, kids^, [], text^)
+        if c.kind == C_CTOR:
+            var text = String(
+                self.cty(c.id, ctx), "(", self.args_text(kids, 0), ")"
+            )
+            return self.add(E_NEW, 0, c.id, kids^, [], text^)
+        var text = String(
+            self.exprs[kids[0]].text,
+            ".",
+            self.methods[c.id].name,
+            "(",
+            self.args_text(kids, 1),
+            ")",
+        )
+        return self.add(E_METHOD, c.id, c.ret, kids^, [], text^)
+
+    def near_var(
+        mut self,
+        mut data: ConjectureData,
+        mut ctx: Ctx,
+        ty: Int,
+        kinds: List[Int],
+        mut out: List[Int],
+    ) raises -> Int:
+        """A live variable of type ty and one of these kinds, half the time
+        one already there, else a new local (`var vN = e`, added to out)."""
+        var vs = List[Int]()
+        for v in range(len(ctx.names)):
+            if ctx.live[v] and ctx.types[v] == ty and has(kinds, ctx.kinds[v]):
+                vs.append(v)
+        if len(vs) > 0 and data.draw(booleans()):
+            return vs[pick(data, len(vs))]
+        ctx.new_statement()
+        var init = self.gen(data, ctx, ty, BODY_SIZE - 1, P_OWNED, False, True)
+        var name = String("v", ctx.counter)
+        ctx.counter += 1
+        var v = len(ctx.names)
+        ctx.push(name.copy(), ty, V_OWNED)
+        out.append(self.add_stmt(Stmt(S_VAR, -1, init, -1, 0, [], [], name^)))
+        return v
+
+    def near_call_stmts(
+        mut self, mut data: ConjectureData, mut ctx: Ctx
+    ) raises -> List[Int]:
+        """For a disjoint, read_alias or move_copy near miss, perhaps a
+        statement `_ = call` built for it, after `var v = ...` if no
+        variable fits. The calls, variables and types such a near miss
+        needs meet too seldom to wait for them:
+        - disjoint: `g(..., v.f, ..., v.g, ...)`, with a `mut` parameter
+          and another one, `mut` or read, given two fields of v;
+        - read_alias: `g(..., x, ..., x or x.f, ...)` for two read
+          parameters, neither an Int (an Int is passed by value);
+        - move_copy: `g(..., x^, ..., e, ...)` with e a value made from x
+          (`x.copy()`, `x.f.copy()`, or an Int field `x.f`) for a later
+          parameter that isn't `mut`.
+        The other arguments don't use v (or x). None if there is no such
+        call or the chance isn't taken."""
+        var out = List[Int]()
+        var cs = self.near_callees(ctx, self.near == NR_MOVE_COPY)
+        # candidates: callee, i, j, and (type, field a, field b) packed
+        var c_k = List[Int]()
+        var c_ij = List[Int]()
+        var c_t = List[Int]()
+        for k in range(len(cs)):
+            ref ps = cs[k].params
+            ref cv = cs[k].convs
+            for i in range(len(ps)):
+                for j in range(len(ps)):
+                    if i == j:
+                        continue
+                    if self.near == NR_DISJOINT:
+                        if cv[i] != CONV_MUT or cv[j] == CONV_VAR:
+                            continue
+                        for t in ctx.pool.copy():
+                            if self.tkind[t] != STRUCT:
+                                continue
+                            var fs = self.fields_of(t)
+                            for a in range(len(fs)):
+                                for b in range(len(fs)):
+                                    if (
+                                        a != b
+                                        and fs[a] == ps[i]
+                                        and fs[b] == ps[j]
+                                    ):
+                                        c_k.append(k)
+                                        c_ij.append(i * 64 + j)
+                                        c_t.append(t * 4096 + a * 64 + b)
+                    elif self.near == NR_READ_ALIAS:
+                        if (
+                            cv[i] != CONV_READ
+                            or cv[j] != CONV_READ
+                            or ps[i] == self.int_ty
+                            or ps[j] == self.int_ty
+                            or not has(ctx.pool, ps[i])
+                        ):
+                            continue
+                        if ps[j] == ps[i]:
+                            c_k.append(k)
+                            c_ij.append(i * 64 + j)
+                            c_t.append(ps[i] * 4096 + 63)
+                        var fs = self.fields_of(ps[i])
+                        for f in range(len(fs)):
+                            if fs[f] == ps[j]:
+                                c_k.append(k)
+                                c_ij.append(i * 64 + j)
+                                c_t.append(ps[i] * 4096 + f)
+                    else:  # NR_MOVE_COPY
+                        if (
+                            j < i
+                            or cv[i] != CONV_VAR
+                            or cv[j] == CONV_MUT
+                            or ps[i] == self.int_ty
+                            or not has(ctx.pool, ps[i])
+                        ):
+                            continue
+                        var copyable = (
+                            ps[j] == self.int_ty
+                            or self.cap_of(ps[j], ctx.bounds) >= CAP_C
+                        )
+                        if not copyable:
+                            continue
+                        if ps[j] == ps[i]:
+                            c_k.append(k)
+                            c_ij.append(i * 64 + j)
+                            c_t.append(ps[i] * 4096 + 63)
+                        var fs = self.fields_of(ps[i])
+                        for f in range(len(fs)):
+                            if fs[f] == ps[j]:
+                                c_k.append(k)
+                                c_ij.append(i * 64 + j)
+                                c_t.append(ps[i] * 4096 + f)
+        if len(c_k) == 0 or not self.near_chance(data, self.near):
+            return out^
+        var n = pick(data, len(c_k))
+        ref c = cs[c_k[n]]
+        var i = c_ij[n] // 64
+        var j = c_ij[n] % 64
+        var t = c_t[n] // 4096
+        var fa = (c_t[n] // 64) % 64
+        var fb = c_t[n] % 64
+        var saved = ctx.copy()
+        var state = self.mutation_state()
+        var n_out = 0
+        try:
+            var fixed = List[Int]()
+            var v: Int
+            if self.near == NR_DISJOINT:
+                v = self.near_var(data, ctx, t, [V_OWNED, V_MUT], out)
+                n_out = len(out)
+                saved = ctx.copy()  # (the new local stays if the call is stuck)
+                state = self.mutation_state()
+                ctx.new_statement()
+                ctx.taken = [v * 64 + fa + 1, v * 64 + fb + 1]
+                fixed.append(self.place_expr(ctx, v, fa))
+                fixed.append(self.mark_near(self.place_expr(ctx, v, fb)))
+            elif self.near == NR_READ_ALIAS:
+                v = self.near_var(data, ctx, t, [V_OWNED, V_MUT, V_READ], out)
+                n_out = len(out)
+                saved = ctx.copy()  # (the new local stays if the call is stuck)
+                state = self.mutation_state()
+                ctx.new_statement()
+                fixed.append(self.place_expr(ctx, v, -1))
+                var f = -1 if fb == 63 else fb
+                fixed.append(self.mark_near(self.place_expr(ctx, v, f)))
+            else:
+                v = self.near_var(data, ctx, t, [V_OWNED], out)
+                n_out = len(out)
+                saved = ctx.copy()  # (the new local stays if the call is stuck)
+                state = self.mutation_state()
+                ctx.new_statement()
+                var text = String(ctx.names[v], "^")
+                fixed.append(self.add(E_MOVE, v, t, [], [], text^))
+                var f = -1 if fb == 63 else fb
+                var e = self.place_expr(ctx, v, f)
+                if c.params[j] != self.int_ty:
+                    var ctext = String(self.exprs[e].text, ".copy()")
+                    e = self.add(E_COPY, 0, c.params[j], [e], [], ctext^)
+                fixed.append(self.mark_near(e))
+            # nothing else in the call may use v
+            ctx.excl[v] = True
+            ctx.touched[v] = True
+            var call = self.call_with(data, ctx, c, [i, j], fixed)
+            if self.near == NR_MOVE_COPY:
+                ctx.live[v] = False
+                ctx.move_depth[v] = ctx.depth
+            out.append(
+                self.add_stmt(Stmt(S_EXPR, -1, call, -1, 0, [], [], String()))
+            )
+            return out^
+        except err:
+            if String(err) != "STUCK":
+                raise err^
+            # drop the call (a new local stays)
+            ctx = saved^
+            self.restore_mutation(state)
+            while len(out) > n_out:
+                _ = out.pop()
+            return out^
+
+    def reinit_stmts(
+        mut self, mut data: ConjectureData, mut ctx: Ctx, v: Int
+    ) raises -> List[Int]:
+        """For a reinit near miss: `v = e` for the moved variable v, then a
+        use of it."""
+        ctx.new_statement()
+        var st = self.gen_reinit(data, ctx, v)
+        _ = self.mark_near(self.stmts[st].target)
+        var use = self.place_expr(ctx, v, -1)
+        return [st, self.add_stmt(Stmt(S_USE, -1, use, -1, 0, [], [], ""))]
+
+    def plan_step(
+        mut self,
+        mut data: ConjectureData,
+        mut ctx: Ctx,
+        keep_moved: Int,
+        reinit_in: Int,
+    ) raises -> List[Int]:
+        """In a branch with a plan: moves keep_moved if it's live (leaving
+        it unassignable in the block), or reinitializes reinit_in if it's
+        moved."""
+        var out = List[Int]()
+        if keep_moved >= 0 and ctx.live[keep_moved]:
+            out.append(self.move_stmt(ctx, keep_moved))
+        if reinit_in >= 0 and not ctx.live[reinit_in]:
+            out.append(self.gen_reinit(data, ctx, reinit_in))
+        return out^
+
+    def wants_path(self) -> Bool:
+        """Whether a path kind (a mutant or near miss made by an `if`'s
+        plan) is still to be made."""
+        return (
+            self.wants(MU_MAYBE_MOVED)
+            or self.wants(MU_MUT_UNINIT)
+            or self.wants_near(NR_MAYBE_MOVED)
+            or self.wants_near(NR_REINIT_PATHS)
+            or self.wants_near(NR_MUT_REINIT)
+        )
+
+    def setup_movable(self, ctx: Ctx) -> List[Int]:
+        """The variables the path kinds may move ahead of an `if` that
+        reinitializes them (or of the body's end): live owned ones for
+        maybe_moved and reinit_paths, live `mut` ones for mut_uninit and
+        mut_reinit, none for other kinds. Not Ints (`^` on an Int has no
+        effect)."""
+        var owned = self.wants(MU_MAYBE_MOVED) or self.wants_near(
+            NR_REINIT_PATHS
+        )
+        var muts = self.wants(MU_MUT_UNINIT) or self.wants_near(NR_MUT_REINIT)
+        var out = List[Int]()
+        if not owned and not muts:
+            return out^
+        for v in range(len(ctx.names)):
+            if not ctx.live[v] or ctx.types[v] == self.int_ty:
+                continue
+            var k = ctx.kinds[v]
+            if (owned and k == V_OWNED) or (muts and k == V_MUT):
+                out.append(v)
+        return out^
+
+    def draw_plan(
+        mut self, mut data: ConjectureData, ctx: Ctx, x: Int, y: Int
+    ) raises -> List[Int]:
+        """For a path kind, perhaps a plan for the `if` being drawn, with
+        condition operands x and y: [variable, PLAN_*, BR_*, premove], and
+        the mutant or near miss counts as made; empty if there is none or
+        the chance isn't taken. With premove, a live variable that the
+        condition doesn't use is moved just before the `if`, for its
+        branches to reinitialize. A
+        mutant's `if` isn't in a loop that uses the variable again (the
+        next iteration's error could come first), and neither it nor an
+        `if` around it has a constant condition (Mojo drops the dead
+        branch first)."""
+        var mutant = self.wants(MU_MAYBE_MOVED) or self.wants(MU_MUT_UNINIT)
+        if not mutant and not self.wants_path():
+            return []
+        var const_cond = self.is_const(x) and self.is_const(y)
+        if mutant and (const_cond or self.in_const_if(ctx)):
+            return []
+        var cands = List[Int]()  # v * 4 + PLAN_* + 2 * premove
+        for v in range(len(ctx.names)):
+            if ctx.types[v] == self.int_ty or v == self.keep_dead:
+                continue
+            if mutant and v < ctx.loop_base:
+                continue
+            var k = ctx.kinds[v]
+            var kind_ok: Bool
+            if self.mutant == MU_MAYBE_MOVED or self.near == NR_REINIT_PATHS:
+                kind_ok = k == V_OWNED
+            elif self.near == NR_MAYBE_MOVED:
+                kind_ok = k == V_OWNED or k == V_MUT
+            else:  # mut_uninit, mut_reinit
+                kind_ok = k == V_MUT
+            if not kind_ok:
+                continue
+            if ctx.live[v]:
+                if self.near != NR_REINIT_PATHS:
+                    cands.append(v * 4 + PLAN_MOVE)
+                if (
+                    self.near != NR_MAYBE_MOVED
+                    and not self.uses_var(x, v)
+                    and not self.uses_var(y, v)
+                ):
+                    cands.append(v * 4 + PLAN_REINIT + 2)
+            elif ctx.move_depth[v] == ctx.depth:  # (moved in this block)
+                if self.near != NR_MAYBE_MOVED:
+                    cands.append(v * 4 + PLAN_REINIT)
+        if len(cands) == 0:
+            return []
+        if mutant:
+            if not self.chance(data, self.mutant):
+                return []
+            self.mutated = True
+        elif not self.near_chance(data, self.near):
+            return []
+        var c = cands[pick(data, len(cands))]
+        var mode = c % 2
+        # (a mutant reinitializes in one branch: both would be valid)
+        var br = pick(data, 2 if mode == PLAN_REINIT and mutant else 3)
+        return [c // 4, mode, br, (c // 2) % 2]
+
+    def finish_plan(
+        mut self,
+        mut data: ConjectureData,
+        mut ctx: Ctx,
+        pre: Int,
+        st: Int,
+        v: Int,
+        mode: Int,
+        all_init: Bool,
+    ) raises -> Int:
+        """After the `if` st with a plan for v (and the move pre before it,
+        or -1), where all_init says whether both branches left v live (a
+        plan to reinitialize may be undone: a block's last statements,
+        reinitializing others, can move v again): v's state, and what
+        follows the `if` (in an S_USE group with them):
+        - maybe_moved mutant: a use of v (marked);
+        - mut_uninit mutant: nothing, and v stays moved to the return;
+        - maybe_moved near miss: perhaps `v = e` and a use;
+        - reinit_paths, mut_reinit: `v = e` unless both branches
+          reinitialized v, then a use."""
+        ctx.live[v] = all_init
+        ctx.move_depth[v] = -1 if all_init else ctx.depth
+        var group = List[Int]()
+        if pre >= 0:
+            group.append(pre)
+        group.append(st)
+        if self.mutant == MU_MUT_UNINIT:
+            ctx.move_depth[v] = -2
+            self.keep_dead = v
+            if pre < 0:
+                return st
+            return self.add_stmt(
+                Stmt(S_USE, -1, -1, -1, 0, group^, [], String())
+            )
+        if self.mutant == MU_MAYBE_MOVED:
+            ctx.move_depth[v] = -2
+            ctx.new_statement()
+            var use = self.mark(self.place_expr(ctx, v, -1))
+            group.append(self.add_stmt(Stmt(S_USE, -1, use, -1, 0, [], [], "")))
+        else:
+            var reinit = not all_init
+            if self.near == NR_MAYBE_MOVED:
+                reinit = data.draw(booleans())
+            elif self.near == NR_MUT_REINIT and mode == PLAN_MOVE:
+                reinit = False  # (later, or at the body's end)
+            if reinit:
+                group.append(self.gen_reinit(data, ctx, v))
+            if ctx.live[v]:
+                var use = self.place_expr(ctx, v, -1)
+                group.append(
+                    self.add_stmt(Stmt(S_USE, -1, use, -1, 0, [], [], ""))
+                )
+        if len(group) == 1:
+            return st
+        return self.add_stmt(Stmt(S_USE, -1, -1, -1, 0, group^, [], String()))
 
     def owned_vars(self, ctx: Ctx, n: Int) -> List[Int]:
         """The live owned variables among the first n, except Ints (`^` on
@@ -1764,6 +2537,8 @@ struct Program(Movable):
             kinds += [S_ASSIGN, S_ASSIGN]
         if ctx.depth < MAX_DEPTH:
             kinds += [S_IF, S_FOR]
+            if self.wants_path():
+                kinds += [S_IF, S_IF, S_IF]  # an `if` that can get a plan
             if (
                 self.wants(MU_LOOP_MOVE)
                 and not self.in_const_if(ctx)
@@ -1781,9 +2556,17 @@ struct Program(Movable):
             else:
                 ty = self.draw_type(data, ctx.pool)
             if ty == self.int_ty and (
-                self.wants(MU_LOOP_MOVE) or self.wants(MU_USE_MOVED)
+                self.wants(MU_LOOP_MOVE)
+                or self.wants(MU_USE_MOVED)
+                or self.wants_near(NR_REINIT)
+                or self.wants_near(NR_MOVE_COPY)
+                or self.wants_near(NR_DISCARD_MOVE)
+                or self.wants(MU_MAYBE_MOVED)
+                or self.wants_near(NR_MAYBE_MOVED)
+                or self.wants_near(NR_REINIT_PATHS)
             ):
-                # (these mutants move a variable, and not an Int)
+                # (these mutants and near misses move a variable, and not
+                # an Int)
                 ty = self.draw_type(data, ctx.pool)
             var e = self.gen(data, ctx, ty, BODY_SIZE - 1, P_OWNED, False, True)
             var name = String("v", ctx.counter)
@@ -1816,6 +2599,14 @@ struct Program(Movable):
             if f < 0:
                 ctx.live[v] = True
                 ctx.move_depth[v] = -1
+                if (
+                    ty != self.int_ty
+                    and getenv("DECL_FUZZ_NO_SELF_ASSIGN_WORKAROUND") == ""
+                ):
+                    # `v = (v if c else w)` gives garbage, or w's value,
+                    # when it picks v, at -O1+ (as `v = v`,
+                    # modular/modular#7760): `v.copy()` in that branch
+                    e = self.copy_self_branches(e, v)
             if (
                 f < 0
                 and self.exprs[e].kind == E_VAR
@@ -1837,15 +2628,59 @@ struct Program(Movable):
             var x = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
             var y = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
             var const_cond = self.is_const(x) and self.is_const(y)
+            # a plan for one variable (pv), for the path kinds
+            var plan = self.draw_plan(data, ctx, x, y)
+            var pv = -1
+            var mode = -1
+            var br = -1
+            var pre = -1
+            var start_live = False
+            var start_depth = -1
+            if len(plan) > 0:
+                pv = plan[0]
+                mode = plan[1]
+                br = plan[2]
+                if plan[3] == 1:
+                    pre = self.move_stmt(ctx, pv)
+                    ctx.move_depth[pv] = ctx.depth
+                start_live = ctx.live[pv]
+                start_depth = ctx.move_depth[pv]
+                if self.near >= 0:
+                    x = self.mark_near(x)
+            var in_then = pv >= 0 and br != BR_ELSE
+            var in_else = pv >= 0 and br != BR_THEN
             ctx.depth += 1
             ctx.const_if += Int(const_cond)
-            var then = self.gen_block(data, ctx, 2)
-            var orelse = self.gen_block(data, ctx, 2)
+            var then = self.gen_block(
+                data,
+                ctx,
+                2,
+                False,
+                pv if in_then and mode == PLAN_MOVE else -1,
+                pv if in_then and mode == PLAN_REINIT else -1,
+            )
+            var then_live = False
+            if pv >= 0:  # (as it was before the then branch)
+                then_live = ctx.live[pv]
+                ctx.live[pv] = start_live
+                ctx.move_depth[pv] = start_depth
+            var orelse = self.gen_block(
+                data,
+                ctx,
+                2,
+                False,
+                pv if in_else and mode == PLAN_MOVE else -1,
+                pv if in_else and mode == PLAN_REINIT else -1,
+            )
             ctx.const_if -= Int(const_cond)
             ctx.depth -= 1
-            return self.add_stmt(
+            var st = self.add_stmt(
                 Stmt(S_IF, -1, x, y, op, then^, orelse^, String())
             )
+            if pv < 0:
+                return st
+            var all_init = then_live and ctx.live[pv]
+            return self.finish_plan(data, ctx, pre, st, pv, mode, all_init)
 
         # S_FOR
         var count = data.draw(integers(0, 3))
@@ -1854,7 +2689,10 @@ struct Program(Movable):
         var n = len(ctx.names)
         ctx.push(name.copy(), self.int_ty, V_READ)
         ctx.depth += 1
+        var loop_base = ctx.loop_base
+        ctx.loop_base = n
         var body = self.gen_block(data, ctx, 2, True)
+        ctx.loop_base = loop_base
         ctx.depth -= 1
         ctx.truncate(n)
         var loop = self.add_stmt(
@@ -1961,6 +2799,17 @@ struct Program(Movable):
                 if t != ty:
                     bad += self.mut_places(ctx, t)
         var places = self.mut_places(ctx, ty)
+        if self.wants_near(NR_DISJOINT):
+            # another field of a variable a field of which is taken
+            var good = self.disjoint_places(ctx, ty)
+            if len(good) > 0 and (
+                len(places) == 0 or self.near_chance(data, NR_DISJOINT)
+            ):
+                self.chances += Int(len(places) == 0)
+                var p = good[pick(data, len(good))]
+                ctx.touched[p // 64] = True
+                ctx.taken.append(p)
+                return self.mark_near(self.place_expr(ctx, p // 64, p % 64 - 1))
         if len(bad) > 0 and (
             # (places_for let the call go ahead for the mutant)
             len(places) == 0
@@ -2000,9 +2849,14 @@ struct Program(Movable):
         """Whether each type in `needed` has a `mut` place, all with
         different root variables (greedily). For a mut_read or alias
         mutant, one of them may have only a read place, or one sharing a
-        root variable: take_place makes the mutant there."""
+        root variable: take_place makes the mutant there. So may one for
+        a disjoint near miss (another field of a root variable used)."""
         var used = List[Int]()
-        var spare = self.wants(MU_MUT_READ) or self.wants(MU_ALIAS)
+        var spare = (
+            self.wants(MU_MUT_READ)
+            or self.wants(MU_ALIAS)
+            or self.wants_near(NR_DISJOINT)
+        )
         for ty in needed:
             var found = False
             var places = self.mut_places(ctx, ty)
@@ -2015,7 +2869,9 @@ struct Program(Movable):
                 continue
             if spare and (
                 len(places)
-                > 0 if self.wants(MU_ALIAS) else len(self.read_places(ctx, ty))
+                > 0 if not self.wants(MU_MUT_READ) else len(
+                    self.read_places(ctx, ty)
+                )
                 > 0
             ):
                 spare = False
@@ -2071,6 +2927,71 @@ struct Program(Movable):
                 out.append(self.fns[f].ret)
         return out^
 
+    def gen_args(
+        mut self,
+        mut data: ConjectureData,
+        mut ctx: Ctx,
+        params: List[Int],
+        convs: List[Int],
+        size: Int,
+        mut_call: Bool,
+    ) raises -> List[Int]:
+        """A call's arguments, in order. For a move_copy near miss, after
+        an argument `x^` (not an Int), the later ones may use x: Mojo moves
+        it at the call, after evaluating them. Not as a place passed read,
+        which would borrow it (an aliasing error): such an argument gets
+        `.copy()`, or is drawn again without x if its type isn't
+        Copyable."""
+        var kids = List[Int]()
+        var moved = -1
+        var moved_kind = 0
+        for j in range(len(params)):
+            var later = j < len(params) - 1
+            if moved < 0 or not self.wants_near(NR_MOVE_COPY):
+                var k = self.gen_arg(
+                    data, ctx, params[j], convs[j], size, mut_call, later
+                )
+                kids.append(k)
+                if (
+                    moved < 0
+                    and self.wants_near(NR_MOVE_COPY)
+                    and self.exprs[k].kind == E_MOVE
+                    and self.exprs[k].ty != self.int_ty
+                ):
+                    moved = self.exprs[k].a
+                    moved_kind = ctx.kinds[moved]
+                continue
+            # x usable, as a read variable (so neither moved nor `mut`)
+            ctx.live[moved] = True
+            ctx.kinds[moved] = V_READ
+            var saved = ctx.copy()
+            var state = self.mutation_state()
+            var k = self.gen_arg(
+                data, ctx, params[j], convs[j], size, mut_call, later
+            )
+            ctx.live[moved] = False
+            ctx.kinds[moved] = moved_kind
+            if (
+                convs[j] == CONV_READ
+                and params[j] != self.int_ty
+                and self.borrows_var(k, moved)
+            ):
+                if self.cap_of(params[j], ctx.bounds) >= CAP_C:
+                    var text = String(self.exprs[k].text, ".copy()")
+                    k = self.add(E_COPY, 0, params[j], [k], [], text^)
+                else:
+                    ctx = saved^
+                    self.restore_mutation(state)
+                    ctx.live[moved] = False
+                    ctx.kinds[moved] = moved_kind
+                    k = self.gen_arg(
+                        data, ctx, params[j], convs[j], size, mut_call, later
+                    )
+            if self.uses_var(k, moved):
+                k = self.mark_near(k)
+            kids.append(k)
+        return kids^
+
     def gen_arg(
         mut self,
         mut data: ConjectureData,
@@ -2079,10 +3000,48 @@ struct Program(Movable):
         conv: Int,
         size: Int,
         mut_call: Bool = False,
+        later: Bool = False,
     ) raises -> Int:
-        """An argument; mut_call says the call has `mut` arguments."""
+        """An argument; mut_call says the call has `mut` arguments, and
+        later that more arguments follow this one."""
         if conv == CONV_MUT:
             return self.take_place(data, ctx, ty)
+        if conv == CONV_READ and ty != self.int_ty:
+            # near misses: a read argument that is a field disjoint from a
+            # `mut` one, or that overlaps a value read already
+            var good = List[Int]()
+            if mut_call and self.wants_near(NR_DISJOINT):
+                good = self.disjoint_places(ctx, ty)
+            elif self.wants_near(NR_READ_ALIAS):
+                good = self.read_alias_places(ctx, ty)
+            if len(good) > 0 and self.near_chance(data, self.near):
+                var p = good[pick(data, len(good))]
+                ctx.touched[p // 64] = True
+                return self.mark_near(self.place_expr(ctx, p // 64, p % 64 - 1))
+        if (
+            conv == CONV_VAR
+            and later
+            and ty != self.int_ty
+            and ctx.no_move == 0
+            and self.wants_near(NR_MOVE_COPY)
+        ):
+            # `x^`, so that the later arguments may use x (gen_args)
+            var owned = List[Int]()
+            for v in self.owned_vars(ctx, len(ctx.names)):
+                if (
+                    ctx.types[v] == ty
+                    and not ctx.touched[v]
+                    and not ctx.excl[v]
+                ):
+                    owned.append(v)
+            if len(owned) > 0 and self.near_chance(data, NR_MOVE_COPY):
+                var v = owned[pick(data, len(owned))]
+                ctx.live[v] = False
+                ctx.move_depth[v] = ctx.depth
+                ctx.touched[v] = True
+                return self.add(
+                    E_MOVE, v, ty, [], [], String(ctx.names[v], "^")
+                )
         if (
             conv == CONV_READ
             and mut_call
@@ -2399,9 +3358,9 @@ struct Program(Movable):
 
         if rule == R_NEW:  # T-New: the fields are consumed
             var bad = self.bad_type_text(data, ctx, ty)
-            var kids = List[Int]()
-            for ft in self.fields_of(ty):
-                kids.append(self.gen_typed(data, ctx, ft, sub, P_OWNED))
+            var fts = self.fields_of(ty)
+            var vars = List[Int](length=len(fts), fill=CONV_VAR)
+            var kids = self.gen_args(data, ctx, fts, vars, sub, False)
             var text = String(
                 self.cty(ty, ctx) if bad == "" else bad,
                 "(",
@@ -2526,10 +3485,7 @@ struct Program(Movable):
             var params = self.method_params(m, r)
             var convs = self.methods[m].convs.copy()
             var mut_call = self.has_mut(m)
-            for j in range(len(params)):
-                kids.append(
-                    self.gen_arg(data, ctx, params[j], convs[j], half, mut_call)
-                )
+            kids += self.gen_args(data, ctx, params, convs, half, mut_call)
             var text = String(
                 self.exprs[kids[0]].text,
                 ".",
@@ -2577,11 +3533,7 @@ struct Program(Movable):
         var convs = self.fns[f].convs.copy()
         var mut_call = has(convs, CONV_MUT)
         var mutated_before = self.mutated
-        var kids = List[Int]()
-        for j in range(len(params)):
-            kids.append(
-                self.gen_arg(data, ctx, params[j], convs[j], half, mut_call)
-            )
+        var kids = self.gen_args(data, ctx, params, convs, half, mut_call)
         # an argument of another type might change what the type
         # arguments are inferred to be, so they're explicit then
         var forced = bad_i >= 0 or (self.mutated and not mutated_before)
@@ -2720,9 +3672,7 @@ struct Program(Movable):
                 r = x ^ y
             return self.new_int(r)
         if kind == E_TERN:
-            var x = self.vint[self.eval(kids[0], frame, targs)]
-            var y = self.vint[self.eval(kids[1], frame, targs)]
-            if self.compare(a, x, y):
+            if self.condition(a, kids[0], kids[1], frame, targs):
                 return self.eval(kids[2], frame, targs)
             return self.eval(kids[3], frame, targs)
         if kind == E_FIELD:
@@ -2731,8 +3681,11 @@ struct Program(Movable):
         if kind == E_NEW:
             var ty = self.subst(self.exprs[e].ty, targs)
             var vals = List[Int]()
+            var moved = List[Int]()
             for k in kids:
-                vals.append(self.eval(k, frame, targs))
+                vals.append(self.eval_arg(k, frame, targs, moved))
+            for v in moved:
+                frame[v] = -1
             if self.tkind[ty] == RES:
                 self.stats[STAT_RES] += 1
                 return self.new_value(-2, 0, vals^)
@@ -2756,6 +3709,100 @@ struct Program(Movable):
         var convs = self.fns[a].convs.copy()
         return self.call(-1, a, -1, kids, convs, frame, targs, f_targs)
 
+    def eval_arg(
+        mut self,
+        e: Int,
+        mut frame: List[Int],
+        targs: List[Int],
+        mut moved: List[Int],
+    ) raises -> Int:
+        """An argument of a call: `x^` moves x at the call, after the other
+        arguments are evaluated (they may use x), so x goes on `moved`."""
+        if self.exprs[e].kind != E_MOVE:
+            return self.eval(e, frame, targs)
+        self.stats[STAT_MOVE] += 1
+        var a = self.exprs[e].a
+        if frame[a] < 0:
+            raise Error("evaluator: move of a moved variable")
+        moved.append(a)
+        return frame[a]
+
+    def condition(
+        mut self,
+        op: Int,
+        l: Int,
+        r: Int,
+        mut frame: List[Int],
+        targs: List[Int],
+    ) raises -> Bool:
+        """The comparison `l op r`. Mojo computes an expression of literals
+        exactly (IntLiteral) and truncates it only when it becomes an Int,
+        which wrapping at each step matches, except when both sides of a
+        comparison are such expressions: then it compares exact values.
+        Raises LITERAL when the result is uncertain: an exact value beyond
+        Int128, or an associated constant that changes the answer (one on
+        a concrete struct is a literal, one on a type parameter an Int)."""
+        var x = self.vint[self.eval(l, frame, targs)]
+        var y = self.vint[self.eval(r, frame, targs)]
+        var wrapped = self.compare(op, x, y)
+        if not (self.literal_expr(l) and self.literal_expr(r)):
+            return wrapped
+        var uses_k = False
+        var ex = self.exact(l, targs, uses_k)
+        var ey = self.exact(r, targs, uses_k)
+        var exact: Bool
+        if op == 0:
+            exact = ex < ey
+        else:
+            exact = ex == ey if op == 1 else ex != ey
+        if uses_k and exact != wrapped:
+            raise Error("LITERAL")
+        return exact
+
+    def literal_expr(self, e: Int) -> Bool:
+        """Whether e is built from literals, the arithmetic operators and
+        associated constants of structs (not of type parameters)."""
+        ref x = self.exprs[e]
+        if x.kind == E_LIT:
+            return True
+        if x.kind == E_K:
+            return self.tkind[x.tys[0]] != PARAM
+        if x.kind != E_BIN:
+            return False
+        return self.literal_expr(x.kids[0]) and self.literal_expr(x.kids[1])
+
+    def exact(
+        mut self, e: Int, targs: List[Int], mut uses_k: Bool
+    ) raises -> Int128:
+        """The exact value of a literal_expr (LITERAL beyond Int128)."""
+        var kind = self.exprs[e].kind
+        var a = self.exprs[e].a
+        if kind == E_LIT:
+            return Int128(a)
+        if kind == E_K:
+            uses_k = True
+            var ty = self.subst(self.exprs[e].tys[0], targs)
+            return Int128(self.k_value(ty, a))
+        var l = self.exact(self.exprs[e].kids[0], targs, uses_k)
+        var r = self.exact(self.exprs[e].kids[1], targs, uses_k)
+        comptime LIM = Int128(1) << 100
+        if l >= LIM or l <= -LIM or r >= LIM or r <= -LIM:
+            raise Error("LITERAL")
+        if a == 2:  # *
+            comptime HALF = Int128(1) << 63
+            if l >= HALF or l < -HALF or r >= HALF or r < -HALF:
+                raise Error("LITERAL")
+            return l * r
+        if a == 0:
+            return l + r
+        if a == 1:
+            return l - r
+        if a == 3:
+            return l & r
+        if a == 4:
+            return l | r
+        return l ^ r
+
     def compare(self, op: Int, x: Int, y: Int) -> Bool:
         if op == 0:
             return x < y
@@ -2777,12 +3824,15 @@ struct Program(Movable):
         caller's targs), runs the body, then writes the `mut` ones back."""
         var callee = List[Int]()
         var has_mut = False
+        var moved = List[Int]()
         for i in range(len(args)):
             if convs[i] == CONV_MUT:
                 callee.append(self.read_place(args[i], frame))
                 has_mut = True
             else:
-                callee.append(self.eval(args[i], frame, targs))
+                callee.append(self.eval_arg(args[i], frame, targs, moved))
+        for v in moved:
+            frame[v] = -1
         var result: Int
         if f >= 0:
             result = self.run_body(self.fns[f].body, callee, f_targs)
@@ -2825,14 +3875,17 @@ struct Program(Movable):
             var v = self.eval(e, frame, targs)
             self.write_place(self.stmts[s].target, v, frame)
         elif kind == S_EXPR:
+            if self.exprs[e].kind == E_MOVE:  # `_ = x^` keeps x alive
+                self.stats[STAT_MOVE] += 1
+                return
             _ = self.eval(e, frame, targs)
         elif kind == S_USE:
             for st in self.stmts[s].body.copy():
                 self.exec(st, frame, targs)
         elif kind == S_IF:
-            var x = self.vint[self.eval(e, frame, targs)]
-            var y = self.vint[self.eval(self.stmts[s].e2, frame, targs)]
-            if self.compare(self.stmts[s].a, x, y):
+            if self.condition(
+                self.stmts[s].a, e, self.stmts[s].e2, frame, targs
+            ):
                 self.exec_block(self.stmts[s].body.copy(), frame, targs)
             else:
                 self.exec_block(self.stmts[s].orelse.copy(), frame, targs)
@@ -3110,7 +4163,8 @@ struct Program(Movable):
 
 
 def resolve_marks(text: String) -> String:
-    """Moves each line's marks to a `# MUTANT` comment at its end."""
+    """Moves each line's marks to a `# MUTANT` (or `# NEAR`) comment at
+    its end."""
     var out = String()
     var lines = text.split("\n")
     for i in range(len(lines)):
@@ -3119,42 +4173,47 @@ def resolve_marks(text: String) -> String:
             out += "\n"
         if MARK in line:
             out += String(line.replace(MARK, ""), "  # MUTANT")
+        elif MARK_NEAR in line:
+            out += String(line.replace(MARK_NEAR, ""), "  # NEAR")
         else:
             out += line
     return out^
 
 
-def mutant_kinds() raises -> List[Int]:
-    """The mutation kinds DECL_FUZZ_MUTANTS asks for: none if it's unset,
-    every kind for 1 or `all`, else the kinds named (comma-separated)."""
-    var spec = getenv("DECL_FUZZ_MUTANTS")
+def kinds_from_env(var_name: String, names: List[String]) raises -> List[Int]:
+    """The kinds (mutation or near miss) the environment variable asks
+    for: none if it's unset, every kind for 1 or `all`, else the kinds
+    named (comma-separated)."""
+    var spec = getenv(var_name)
     var out = List[Int]()
     if spec == "":
         return out^
     if spec == "1" or spec == "all":
-        for k in range(N_MU):
+        for k in range(len(names)):
             out.append(k)
         return out^
-    var names = materialize[MU_NAMES]()
     for part in spec.split(","):
         var found = False
-        for k in range(N_MU):
+        for k in range(len(names)):
             if names[k] == String(part):
                 out.append(k)
                 found = True
         if not found:
-            raise Error(String("unknown mutation kind: ", part))
+            raise Error(String("unknown kind in ", var_name, ": ", part))
     return out^
 
 
 def draw_program(
-    mut data: ConjectureData, kinds: List[Int]
+    mut data: ConjectureData, kinds: List[Int], near_kinds: List[Int]
 ) raises -> Tuple[String, String, String]:
     """The program, its compile-time twin, and the expected output; with
-    mutation kinds, an ill-typed mutant (and no twin or output)."""
+    mutation kinds, an ill-typed mutant (and no twin or output); with near
+    miss kinds, a program with a near miss."""
     var p = Program()
     if len(kinds) > 0:
         p.mutant = kinds[pick(data, len(kinds))]
+    if len(near_kinds) > 0:
+        p.near = near_kinds[pick(data, len(near_kinds))]
     try:
         p.draw_declarations(data)
         p.draw_bodies(data)
@@ -3176,6 +4235,16 @@ def draw_program(
                 String("chances=", p.chances),
             )
         if not p.mutated:  # no chance was taken
+            assume(False)
+    if p.near >= 0:
+        if getenv("DECL_FUZZ_STATS") != "":
+            var names = materialize[NR_NAMES]()
+            print(
+                "near" if p.near_made else "no_near",
+                names[p.near],
+                String("chances=", p.chances),
+            )
+        if not p.near_made:
             assume(False)
     var arg_lists = List[List[Int]]()
     for _ in range(data.draw(integers(1, 3))):
@@ -3234,7 +4303,9 @@ def draw_program(
             try:
                 v = p.vint[p.run_body(p.entries[i], frame, [])]
             except e:
-                if String(e) == "STEP_LIMIT":
+                # (LITERAL: a comparison of literals whose result is
+                # uncertain)
+                if String(e) == "STEP_LIMIT" or String(e) == "LITERAL":
                     assume(False)
                 raise e^
             expected += String("c ", i, " ", v, "\n")
@@ -3243,6 +4314,11 @@ def draw_program(
         var names = materialize[MU_NAMES]()
         var text = String("# FM mutant: ", names[p.mutant], "\n", program)
         return (resolve_marks(text), String(), String())
+    if p.near >= 0:
+        var names = materialize[NR_NAMES]()
+        var head = String("# FM near miss: ", names[p.near], "\n")
+        program = resolve_marks(head + program)
+        comptime_program = resolve_marks(head + comptime_program)
     if getenv("DECL_FUZZ_STATS") != "":
         var line = String("stats")
         var names = materialize[STAT_NAMES]()
@@ -3263,7 +4339,10 @@ def main() raises:
     var work_dir = (
         String(argv()[1]) if len(argv()) > 1 else "build/decl_fuzz_work"
     )
-    var kinds = mutant_kinds()
+    var kinds = kinds_from_env("DECL_FUZZ_MUTANTS", materialize[MU_NAMES]())
+    var near_kinds = kinds_from_env("DECL_FUZZ_NEAR", materialize[NR_NAMES]())
+    if len(kinds) > 0 and len(near_kinds) > 0:
+        raise Error("DECL_FUZZ_MUTANTS and DECL_FUZZ_NEAR exclude each other")
     var script = String(
         "examples/decl_fuzz/check_rejected.sh" if len(kinds)
         > 0 else "examples/decl_fuzz/build_and_compare.sh"
@@ -3274,8 +4353,8 @@ def main() raises:
 
     def differential(
         mut data: ConjectureData,
-    ) raises {imm work_dir, imm script, imm kinds}:
-        var programs = draw_program(data, kinds)
+    ) raises {imm work_dir, imm script, imm kinds, imm near_kinds}:
+        var programs = draw_program(data, kinds, near_kinds)
         var dir = process_dir(work_dir)
         with open(String(dir, "/program.mojo"), "w") as f:
             f.write(programs[0])
@@ -3306,7 +4385,7 @@ def main() raises:
         workers=env_int("PROPTEST_WORKERS", WORKERS),
     )
     settings.phases = Phases(explain=False)
-    if len(kinds) > 0:
+    if len(kinds) > 0 or len(near_kinds) > 0:
         # a program where the mutation wasn't made is filtered out
         settings.suppress_health_check = [HealthCheck.filter_too_much]
     if getenv("DECL_FUZZ_NO_SHRINK") != "":
