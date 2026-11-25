@@ -76,7 +76,15 @@
 # PROPTEST_SEED, PROPTEST_MAX_EXAMPLES and PROPTEST_WORKERS set the seed,
 # the number of programs, and the worker processes (0: one per physical
 # core). The failing program is kept as failing_program.mojo in the work
-# directory. A second argument replaces build_and_compare.sh or
+# directory. Known crashes (known_crashes.txt) give a KNOWN verdict,
+# which isn't a failure.
+#
+# A campaign (DECL_FUZZ_LOG=<file>) goes on past failures: each program's
+# verdict's first line is appended to the file (GEN_ERROR for an error in
+# the generator), and each case that isn't OK is kept in <file>.bad/ (or
+# <file>.known/), with its verdict; campaign.sh runs rounds of them.
+#
+# A second argument replaces build_and_compare.sh or
 # check_rejected.sh (for example with a script that just echoes OK, to
 # check the generator alone).
 
@@ -5137,8 +5145,8 @@ def draw_program(
                 # uncertain)
                 if String(e) == "STEP_LIMIT" or String(e) == "LITERAL":
                     assume(False)
-                data.note(program)  # (a generator bug: show the program)
-                raise e^
+                # (a generator bug: the program follows the message)
+                raise Error(String(e, "\n", program))
             expected += String("c ", i, " ", v, "\n")
             expected += String("b ", i, " ", v, "\n")
     if p.mutant >= 0:
@@ -5157,6 +5165,25 @@ def draw_program(
             line += String(" ", names[i], "=", p.stats[i])
         print(line)
     return (program^, comptime_program^, expected^)
+
+
+def log_verdict(log: String, first: String) raises:
+    """Appends a verdict's first line to a campaign's log (DECL_FUZZ_LOG;
+    worker processes share it)."""
+    with open(log, "a") as f:
+        f.write(first, "\n")
+
+
+def keep_case(log: String, suffix: String, first: String) raises -> String:
+    """Logs a campaign's verdict that isn't OK, and makes a directory for
+    its case in <log><suffix>/, which it returns."""
+    log_verdict(log, first)
+    var out = run(
+        String(
+            "mkdir -p ", log, suffix, " && mktemp -d ", log, suffix, "/XXXXXX"
+        )
+    )
+    return String(out.strip())
 
 
 def process_dir(work_dir: String) raises -> String:
@@ -5182,10 +5209,24 @@ def main() raises:
         script = String(argv()[2])
     _ = run(String("mkdir -p ", work_dir))
 
+    var log = getenv("DECL_FUZZ_LOG")
+
     def differential(
         mut data: ConjectureData,
-    ) raises {imm work_dir, imm script, imm kinds, imm near_kinds}:
-        var programs = draw_program(data, kinds, near_kinds)
+    ) raises {imm work_dir, imm script, imm kinds, imm near_kinds, imm log}:
+        var programs: Tuple[String, String, String]
+        try:
+            programs = draw_program(data, kinds, near_kinds)
+        except e:
+            var msg = String(e)
+            if log == "" or msg.startswith("proptest."):
+                raise e^
+            # a campaign: log the generator error and go on
+            var first = String(msg.split("\n")[0])
+            var bad = keep_case(log, ".bad", String("GEN_ERROR ", first))
+            with open(String(bad, "/gen_error.txt"), "w") as f:
+                f.write(msg)
+            return
         var dir = process_dir(work_dir)
         with open(String(dir, "/program.mojo"), "w") as f:
             f.write(programs[0])
@@ -5194,7 +5235,23 @@ def main() raises:
         with open(String(dir, "/expected.txt"), "w") as f:
             f.write(programs[2])
         var verdict = run(String("bash ", script, " ", dir, " 2>&1"))
-        if not verdict.startswith("OK"):
+        if log != "":
+            # a campaign: log the verdict, keep the case unless it's OK,
+            # and go on
+            var first = String(verdict.split("\n")[0])
+            if first == "OK":
+                log_verdict(log, first)
+            else:
+                var bad = keep_case(
+                    log,
+                    ".known" if first.startswith("KNOWN") else ".bad",
+                    first,
+                )
+                _ = run(String("cp ", dir, "/*.mojo ", dir, "/*.txt ", bad))
+                with open(String(bad, "/verdict.txt"), "w") as f:
+                    f.write(verdict)
+            return
+        if not verdict.startswith("OK") and not verdict.startswith("KNOWN"):
             data.note(programs[0])
             data.note(verdict)
             for name in ["program.mojo", "comptime.mojo", "expected.txt"]:

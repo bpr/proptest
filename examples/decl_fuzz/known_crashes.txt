@@ -1,0 +1,10 @@
+# Filed compiler crashes that the oracles report as `KNOWN #<issue> ...`
+# instead of BUILD_CRASH, so that a run goes on past them (decl_fuzz
+# doesn't count KNOWN as a failure). One per line:
+#
+#   <issue> <build: O0, O3 or comptime> <grep -E pattern in the build log>
+#
+# A pattern can match a new bug with the same top frames: check what a
+# campaign reports as KNOWN now and then (DECL_FUZZ_NO_KNOWN=1 turns this
+# list off).
+7783 O3 mlir::detail::OperandStorage::OperandStorage

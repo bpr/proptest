@@ -332,6 +332,7 @@ evaluation:
 |---|---|
 | `BUILD_FAIL` | The compiler rejected the program: a generator bug, or a front-end bug rejecting a well-typed program |
 | `BUILD_CRASH`, `BUILD_TIMEOUT` | The compiler crashed or ran too long |
+| `KNOWN #<issue> ...` | It crashed the way a filed bug does (`known_crashes.txt`); not a failure |
 | `RUN_FAIL` | A build crashed or hung |
 | `UNBALANCED` | (Stage 2) A `Res` was destroyed fewer or more times than it was made |
 | `DIFF_O3` | -O0 and -O3 disagree: an optimizer bug |
@@ -738,6 +739,7 @@ the changed signature (`sig`).
 | `OK` | Rejected, with an error on a marked line |
 | `ACCEPTED` | The compiler accepted the mutant: a soundness bug, or a rule FM has that Mojo doesn't |
 | `BUILD_CRASH`, `BUILD_TIMEOUT` | The compiler crashed or ran too long |
+| `KNOWN #<issue> ...` | It crashed the way a filed bug does (`known_crashes.txt`); not a failure |
 | `WRONG_LINE` | Rejected, but with no error on a marked line: a generator bug, or a misplaced error |
 | `NO_MARK` | No line is marked: a generator bug |
 
@@ -1332,6 +1334,35 @@ and 642 programs.
 
 `DECL_FUZZ_REPRODUCE=<blob>` replays a failure from the `reproduce=`
 blob it printed. An evaluator error now prints the program.
+
+**Going on past failures.** The rounds that stopped early did so because
+a run ends at its first failure. (The mutant runs only went on because
+the wrapper script around the oracle printed `OK` for every verdict; for
+the -O3 crash, bash's "Segmentation fault" message got past it on
+stderr.) Three changes make a campaign count in full:
+- `DECL_FUZZ_LOG=<file>` makes a run a campaign. Each program's
+  verdict's first line is appended to the file, and each case that
+  isn't OK is kept in `<file>.bad/` with its program and verdict. An
+  error in the generator is logged as `GEN_ERROR`, with the program, and
+  the run goes on.
+- `known_crashes.txt` lists filed crashes, each as an issue, a build (O0,
+  O3 or comptime) and a pattern in the build log. The oracles report a
+  crash that matches as `KNOWN #<issue> ...`, which isn't a failure, so
+  an ordinary run doesn't stop at it either. A campaign keeps those
+  cases in `<file>.known/`. A pattern could also match a new bug with
+  the same top frames, so the kept cases are worth a look now and then.
+  `DECL_FUZZ_NO_KNOWN=1` turns the list off. For now it holds #7783,
+  matched on its top frame at -O3.
+- The oracles send their own stderr to `oracle_stderr.txt` in the case's
+  directory, so only the verdict is printed.
+
+`examples/decl_fuzz/campaign.sh BINARY OUT [ROUNDS]` runs the rounds
+above. It writes the logs and kept cases to OUT, and prints each run's
+verdict counts. A one-round smoke test on the nightly (60 programs of
+each, seed 2000) was all OK. With fake oracles, campaign runs logged
+and kept every case, a `KNOWN` verdict didn't stop an ordinary run,
+and a generator with the loop fix reverted logged `GEN_ERROR` for the
+near_3 program and kept it.
 
 **Validation.** After both fixes, on the same nightly, all OK:
 2,000 `mut_uninit` mutants (seed 1023, round 3's mutant seed), 2,000

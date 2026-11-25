@@ -8,6 +8,7 @@
 #
 #   OK                        all four agree
 #   BUILD_CRASH <which> ...   the compiler crashed
+#   KNOWN #<issue> ...        it crashed as a filed bug does (known_crashes.txt)
 #   BUILD_TIMEOUT <which>     the compiler ran for over $BUILD_TIMEOUT s
 #   BUILD_FAIL <which>        the compiler rejected the program
 #   RUN_FAIL O0=s O3=s        a build crashed or hung (exit statuses)
@@ -17,13 +18,17 @@
 #   DIFF_EXPECTED             -O0 differs from the generator's evaluation
 #
 # followed by details, kept off the first line so that a failure looks the
-# same on every run and proptest can shrink it.
+# same on every run and proptest can shrink it. The script's own stderr
+# (bash reporting a crashed build, say) goes to DIR/oracle_stderr.txt, so
+# that only the verdict is printed.
 #
 # MOJO selects the compiler, e.g. a nightly in another pixi environment:
 #   MOJO="pixi run --manifest-path ../nightly mojo"
 MOJO="${MOJO:-mojo}"
 BUILD_TIMEOUT="${BUILD_TIMEOUT:-300}"
+source "$(dirname "${BASH_SOURCE[0]}")/known.sh"
 cd "$1" || exit 1
+exec 2> oracle_stderr.txt
 rm -f o0 o3 ct
 
 timeout "$BUILD_TIMEOUT" $MOJO build -O0 -o o0 program.mojo > build_o0.txt 2>&1 &
@@ -42,6 +47,11 @@ report_build() {  # name status log
         if [ "$2" -eq 124 ]; then
             echo "BUILD_TIMEOUT $1"
         elif [ "$2" -gt 128 ] || grep -q -i "LLVM ERROR\|Assertion\|please submit\|Stack dump\|crash" "$3"; then
+            local issue
+            issue=$(known_crash "$1" "$3")
+            if [ -n "$issue" ]; then
+                echo -n "KNOWN #$issue "
+            fi
             echo "BUILD_CRASH $1 status $2"
         else
             echo "BUILD_FAIL $1"
