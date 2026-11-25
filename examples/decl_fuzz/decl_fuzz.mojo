@@ -2634,7 +2634,7 @@ struct Program(Movable):
         if getenv("DECL_FUZZ_NO_PARTIAL_LOOP_WORKAROUND") == "":
             # Mojo rejects the move ("cannot be consumed, because 'x' is
             # used later") when a loop nested in another loop comes before
-            # the reassignment (modular/modular#NNNN): no nested loops here
+            # the reassignment (modular/modular#7787): no nested loops here
             ctx.region_loops = ctx.in_loop
         for _ in range(data.draw(integers(0, 2))):
             out.append(self.gen_stmt(data, ctx))

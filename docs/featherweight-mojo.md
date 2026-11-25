@@ -1289,8 +1289,8 @@ q.f0 = R(5)
 A single loop in between is fine, and so is a loop in an `if` or an
 `if` in a loop; a loop nested in a loop (`for` or `while`) is
 rejected, for locals, `mut` arguments and `mut self`. Both 1117 and
-1123 reject it. Not yet reported (draft
-`unfiled-mojo-issue-partial-move-nested-loop.md`). The generator works
+1123 reject it. Filed as
+[#7787](https://github.com/modular/modular/issues/7787). The generator works
 around it: a loop drawn while a field is moved out gets no loop inside
 it. `DECL_FUZZ_NO_PARTIAL_LOOP_WORKAROUND=1` turns this off.
 
