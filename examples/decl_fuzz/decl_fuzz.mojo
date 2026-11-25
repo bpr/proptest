@@ -43,7 +43,15 @@
 # without a value (`var x: T`) and assign it in some branches of an `if`,
 # or in a loop's body. An `if` may end one of its branches with an early
 # `return` (more often for the ret_uninit mutant and the early_return near
-# miss, which a plan makes as for the path kinds).
+# miss, which a plan makes as for the path kinds). Inside a loop the exit
+# can also be `break` or `continue` (the break_moved mutant and loop_exit
+# near miss move a variable from outside the loop before one), and a third
+# of the loops are `while` loops with a counter. The partial kinds move one
+# field out of a variable (`var v = x.f^`): the near miss reassigns the
+# field before x is used again, the mutant uses x first. Half
+# of the `Movable` and `Copyable` structs are counted: they have their
+# own `__init__`, copy constructor and `__deinit__`, which keep the same
+# ledger as `Res`.
 #
 # Every program terminates: each method and function has a rank, and a
 # body calls only methods and functions of lower rank; loops have constant
@@ -142,6 +150,8 @@ comptime E_K = 8
 comptime E_CALL = 9
 comptime E_COPY = 10
 comptime E_MOVE = 11
+comptime E_FMOVE = 12
+"""`x.f^`, a field moved out (kids: the place)."""
 
 # statement kinds
 comptime S_VAR = 0
@@ -153,6 +163,16 @@ comptime S_USE = 5
 """`_use(v)`: a read with no effect (the workaround in `gen_stmt`)."""
 comptime S_RETURN = 6
 """An early `return e`, the last statement of a branch of an `if`."""
+comptime S_BREAK = 7
+"""`break`, the last statement of a branch of an `if` in a loop."""
+comptime S_CONTINUE = 8
+"""`continue`, likewise."""
+
+# what executing a statement did, for the evaluator
+comptime SIG_NONE = 0
+comptime SIG_RETURN = 1
+comptime SIG_BREAK = 2
+comptime SIG_CONTINUE = 3
 
 # generation rules, simplest first (shrinking moves toward rule 0)
 comptime R_ATOM = 0
@@ -200,7 +220,9 @@ comptime STAT_ASSIGN = 11
 comptime STAT_LOOP = 12
 comptime STAT_RES = 13
 comptime STAT_RETURN = 14
-comptime N_STATS = 15
+comptime STAT_BREAK = 15
+"""`break` and `continue`."""
+comptime N_STATS = 16
 comptime STAT_NAMES: List[String] = [
     "own",
     "required",
@@ -217,6 +239,7 @@ comptime STAT_NAMES: List[String] = [
     "loop",
     "res",
     "return",
+    "break",
 ]
 
 # Stage 3: ill-typed mutants (DECL_FUZZ_MUTANTS=1). Each program gets one
@@ -259,7 +282,13 @@ comptime MU_UNINIT = 15
 in only some branches of an `if`, or in a loop's body."""
 comptime MU_RET_UNINIT = 16
 """An early `return` with a `mut` argument moved out."""
-comptime N_MU = 17
+comptime MU_BREAK_MOVED = 17
+"""A variable from outside a loop moved before a `break`, then used after
+the loop."""
+comptime MU_PARTIAL_USE = 18
+"""A field moved out (`var v = x.f^`), then a use of x or x.f before the
+field is reassigned."""
+comptime N_MU = 19
 comptime MU_NAMES: List[String] = [
     "type",
     "use_moved",
@@ -278,6 +307,8 @@ comptime MU_NAMES: List[String] = [
     "mut_uninit",
     "uninit",
     "ret_uninit",
+    "break_moved",
+    "partial_use",
 ]
 comptime MU_ODDS = 6
 """Each chance to apply the mutation is taken 1 time in MU_ODDS."""
@@ -313,7 +344,14 @@ used; or assigned in one branch and not used again."""
 comptime NR_EARLY_RETURN = 9
 """An `if` whose returning branch is the one that leaves a variable moved
 (or unassigned), then a use of it after the `if`."""
-comptime N_NR = 10
+comptime NR_LOOP_EXIT = 10
+"""A variable from outside a loop moved before a `break` (then assigned
+after the loop and used, or not used again), or moved and reinitialized
+before a `continue`."""
+comptime NR_PARTIAL_MOVE = 11
+"""A field moved out (`var v = x.f^`), perhaps other statements, then the
+field reassigned (perhaps in both branches of an `if`) and x used."""
+comptime N_NR = 12
 comptime NR_NAMES: List[String] = [
     "disjoint",
     "read_alias",
@@ -325,6 +363,8 @@ comptime NR_NAMES: List[String] = [
     "mut_reinit",
     "deferred",
     "early_return",
+    "loop_exit",
+    "partial_move",
 ]
 comptime MARK_NEAR = "@@N@@"
 """In generated text, marks the line of the near miss."""
@@ -400,9 +440,25 @@ struct Res(Copyable):
         _live()[] -= 1
 
 
+def _born():
+    _live()[] += 1
+
+
+def _died():
+    _live()[] -= 1
+
+
 """
 
-comptime COMPILE_TIME_RES = """struct Res(Copyable):
+comptime COMPILE_TIME_RES = """def _born():
+    pass
+
+
+def _died():
+    pass
+
+
+struct Res(Copyable):
     var val: Int
 
     def __init__(out self, val: Int):
@@ -514,6 +570,9 @@ struct StructDecl(Copyable):
     """...as this constant..."""
     var k_sources: List[Int]
     """...plus `Self.T.K<source>` when the source isn't -1."""
+    var counted: Bool
+    """Whether its constructors and `__deinit__` are its own, counting
+    its values in the ledger (only when `Movable` or `Copyable`)."""
 
 
 @fieldwise_init
@@ -554,7 +613,8 @@ struct Expr(Copyable):
 struct Stmt(Copyable):
     var kind: Int
     var target: Int
-    """The place assigned (S_ASSIGN), or -1."""
+    """The place assigned (S_ASSIGN); 1 for a `while` loop (S_FOR); or
+    -1."""
     var e: Int
     """The value (S_VAR, S_ASSIGN, S_EXPR) or the left operand (S_IF); -1
     for `var x: T` (S_VAR with no value)."""
@@ -609,6 +669,22 @@ struct Ctx(Copyable):
     """For fresh local names."""
     var ret: Int
     """The body's result type (for early returns), or -1."""
+    var in_loop: Int
+    """How many loops the context is in."""
+    var loop_live: List[Bool]
+    """Which variables were live at the start of the innermost loop's body
+    (`break` and `continue` reinitialize those moved since)."""
+    var parent_base: Int
+    """The loop_base of the loop around the innermost one (0 if none)."""
+    var break_var: Int
+    """A variable moved before a `break` (break_moved, loop_exit), dead
+    after the loop, or -1."""
+    var no_exit: Int
+    """Inside statements drawn while a field is moved out (no early exit
+    there: it would reassign the variable whole)."""
+    var region_loops: Int
+    """in_loop where those statements start, or -1: a loop there gets no
+    loop inside it (the workaround in `partial_stmts`)."""
 
     def __init__(
         out self,
@@ -638,6 +714,12 @@ struct Ctx(Copyable):
         self.discard = False
         self.counter = 0
         self.ret = -1
+        self.in_loop = 0
+        self.loop_live = []
+        self.parent_base = 0
+        self.break_var = -1
+        self.no_exit = 0
+        self.region_loops = -1
 
     def push(mut self, var name: String, ty: Int, kind: Int):
         self.names.append(name^)
@@ -687,6 +769,8 @@ struct Callee(Copyable):
     var ret: Int
     var params: List[Int]
     var convs: List[Int]
+    var tys: List[Int]
+    """The type arguments of a generic function (C_FN), else empty."""
 
 
 @fieldwise_init
@@ -1123,6 +1207,7 @@ struct Program(Movable):
                     if len(sources) > 0:
                         source = sources[pick(data, len(sources))]
                 k_sources.append(source)
+            var counted = data.draw(booleans())
             self.structs.append(
                 StructDecl(
                     String("B" if generic else "S", s),
@@ -1137,6 +1222,7 @@ struct Program(Movable):
                     k_traits^,
                     k_values^,
                     k_sources^,
+                    counted,
                 )
             )
 
@@ -1855,15 +1941,16 @@ struct Program(Movable):
         loop: Bool = False,
         keep_moved: Int = -1,
         reinit_in: Int = -1,
-        ret: Bool = False,
+        exit: Int = -1,
     ) raises -> List[Int]:
         """Statements; in a nested block, variables live at its start are
         live at its end (moved ones are reinitialized), and its locals go
         out of scope. For a branch of an `if` with a plan, keep_moved is a
         variable the block moves (unless a statement does) and leaves
         moved, and reinit_in one moved before it that it reinitializes
-        (unless a statement does). With ret, the block ends with an early
-        `return` (`returning_end`)."""
+        (unless a statement does). With exit (S_RETURN, S_BREAK or
+        S_CONTINUE), the block ends with that statement (`returning_end`,
+        `loop_exit_end`)."""
         var n_outer = len(ctx.names)
         var live_at_start = ctx.live.copy()
         var depth_at_start = ctx.move_depth.copy()
@@ -1945,9 +2032,19 @@ struct Program(Movable):
                 var outer = self.loop_movable(ctx, n_outer, out)
                 if len(outer) > 0 and self.chance(data, MU_LOOP_MOVE):
                     moved = outer[pick(data, len(outer))]
-                    out.append(self.move_stmt(ctx, moved))
+                    out.append(self.loop_move_stmt(data, ctx, moved))
                     self.mutated = True
                     self.loop_mark = ctx.depth
+            if loop and self.wants_loop_exit(ctx) and ctx.no_exit == 0:
+                out += self.exit_if(data, ctx, -1)
+            if (
+                self.wants(MU_RET_UNINIT)
+                and not self.in_const_if(ctx)
+                and ctx.no_exit == 0
+            ):
+                out += self.exit_if(data, ctx, S_RETURN)
+            if self.wants_partial(ctx):
+                out += self.partial_stmts(data, ctx)
             if self.wants(MU_USE_MOVED) and not self.in_const_if(ctx):
                 var dead = self.moved_vars(ctx)
                 if len(dead) > 0 and self.chance(data, MU_USE_MOVED):
@@ -1964,7 +2061,7 @@ struct Program(Movable):
             if len(outer) > 0:
                 self.chances += 1
                 moved = outer[pick(data, len(outer))]
-                out.append(self.move_stmt(ctx, moved))
+                out.append(self.loop_move_stmt(data, ctx, moved))
                 self.mutated = True
                 self.loop_mark = ctx.depth
         if to_reinit >= 0:
@@ -1974,8 +2071,11 @@ struct Program(Movable):
             self.chances += 1
             var e = self.mark(self.place_expr(ctx, to_use, -1))
             out.append(self.add_stmt(Stmt(S_USE, -1, e, -1, 0, [], [], "")))
-        if ret:
-            out += self.returning_end(data, ctx)
+        if exit >= 0:
+            if exit == S_RETURN:
+                out += self.returning_end(data, ctx)
+            else:
+                out += self.loop_exit_end(data, ctx, exit)
             # (the block doesn't fall through: the code after it sees the
             # variables as they were at its start)
             for v in range(n_outer):
@@ -1996,13 +2096,20 @@ struct Program(Movable):
             ctx.truncate(n_outer)
         return out^
 
-    def near_callees(mut self, ctx: Ctx, ctors: Bool) -> List[Callee]:
+    def near_callees(
+        mut self, ctx: Ctx, ctors: Bool, disjoint: Bool = False
+    ) -> List[Callee]:
         """What a near miss's call can be: functions that aren't generic,
         methods with a read receiver (argument 0), and with ctors, struct
-        constructors."""
+        constructors. With disjoint, also generic functions (instantiated
+        with each choice of conforming types from the pool, up to 64) and
+        methods with a `mut self` receiver."""
         var out = List[Callee]()
         for f in range(len(self.fns)):
-            if len(self.fns[f].bounds) == 0 and self.fns[f].rank < ctx.rank:
+            if self.fns[f].rank >= ctx.rank:
+                continue
+            var bounds = self.fns[f].bounds.copy()
+            if len(bounds) == 0:
                 out.append(
                     Callee(
                         C_FN,
@@ -2010,24 +2117,56 @@ struct Program(Movable):
                         self.fns[f].ret,
                         self.fns[f].params.copy(),
                         self.fns[f].convs.copy(),
+                        [],
+                    )
+                )
+                continue
+            if not disjoint:
+                continue
+            var choices = List[List[Int]]()
+            var total = 1
+            for i in range(len(bounds)):
+                choices.append(self.conforming(ctx, bounds[i]))
+                total *= len(choices[i])
+            for c in range(min(total, 64)):
+                var targs = List[Int]()
+                var r = c
+                for i in range(len(bounds)):
+                    targs.append(choices[i][r % len(choices[i])])
+                    r //= len(choices[i])
+                var params = self.subst_all(self.fns[f].params.copy(), targs)
+                var ret = self.subst(self.fns[f].ret, targs)
+                out.append(
+                    Callee(
+                        C_FN,
+                        f,
+                        ret,
+                        params^,
+                        self.fns[f].convs.copy(),
+                        targs^,
                     )
                 )
         for r in ctx.pool.copy():
             if self.tkind[r] != STRUCT:
                 continue
             for m in self.methods_on(r, ctx.bounds):
+                var conv = self.methods[m].self_conv
                 if (
                     self.methods[m].is_static
-                    or self.methods[m].self_conv != CONV_READ
+                    or not (
+                        conv == CONV_READ or (disjoint and conv == CONV_MUT)
+                    )
                     or self.methods[m].rank >= ctx.rank
                 ):
                     continue
                 var params: List[Int] = [r]
                 params += self.method_params(m, r)
-                var convs: List[Int] = [CONV_READ]
+                var convs: List[Int] = [conv]
                 convs += self.methods[m].convs.copy()
                 out.append(
-                    Callee(C_METHOD, m, self.method_ret(m, r), params^, convs^)
+                    Callee(
+                        C_METHOD, m, self.method_ret(m, r), params^, convs^, []
+                    )
                 )
             if ctors:
                 var fs = self.fields_of(r)
@@ -2038,6 +2177,7 @@ struct Program(Movable):
                         r,
                         fs.copy(),
                         List[Int](length=len(fs), fill=CONV_VAR),
+                        [],
                     )
                 )
         return out^
@@ -2070,10 +2210,16 @@ struct Program(Movable):
                     )
                 )
         if c.kind == C_FN:
-            var text = String(
-                self.fns[c.id].name, "(", self.args_text(kids, 0), ")"
-            )
-            return self.add(E_CALL, c.id, c.ret, kids^, [], text^)
+            var text = self.fns[c.id].name
+            if len(c.tys) > 0:
+                text += "["
+                for i in range(len(c.tys)):
+                    if i > 0:
+                        text += ", "
+                    text += self.cty(c.tys[i], ctx)
+                text += "]"
+            text += String("(", self.args_text(kids, 0), ")")
+            return self.add(E_CALL, c.id, c.ret, kids^, c.tys.copy(), text^)
         if c.kind == C_CTOR:
             var text = String(
                 self.cty(c.id, ctx), "(", self.args_text(kids, 0), ")"
@@ -2122,7 +2268,8 @@ struct Program(Movable):
         variable fits. The calls, variables and types such a near miss
         needs meet too seldom to wait for them:
         - disjoint: `g(..., v.f, ..., v.g, ...)`, with a `mut` parameter
-          and another one, `mut` or read, given two fields of v;
+          and another one, `mut` or read, given two fields of v (g may
+          be generic, or a method with `v.f` its `mut self` receiver);
         - read_alias: `g(..., x, ..., x or x.f, ...)` for two read
           parameters, neither an Int (an Int is passed by value);
         - move_copy: `g(..., x^, ..., e, ...)` with e a value made from x
@@ -2131,7 +2278,9 @@ struct Program(Movable):
         The other arguments don't use v (or x). None if there is no such
         call or the chance isn't taken."""
         var out = List[Int]()
-        var cs = self.near_callees(ctx, self.near == NR_MOVE_COPY)
+        var cs = self.near_callees(
+            ctx, self.near == NR_MOVE_COPY, self.near == NR_DISJOINT
+        )
         # candidates: callee, i, j, and (type, field a, field b) packed
         var c_k = List[Int]()
         var c_ij = List[Int]()
@@ -2146,6 +2295,13 @@ struct Program(Movable):
                     if self.near == NR_DISJOINT:
                         if cv[i] != CONV_MUT or cv[j] == CONV_VAR:
                             continue
+                        if (
+                            cs[k].kind == C_METHOD
+                            and cv[0] == CONV_MUT
+                            and i != 0
+                            and j != 0
+                        ):
+                            continue  # (a `mut self` receiver is one of them)
                         for t in ctx.pool.copy():
                             if self.tkind[t] != STRUCT:
                                 continue
@@ -2311,38 +2467,281 @@ struct Program(Movable):
         out.append(self.add_stmt(Stmt(S_RETURN, -1, e, -1, 0, [], [], "")))
         return out^
 
-    def draw_ret_branch(
+    def loop_exit_end(
+        mut self, mut data: ConjectureData, mut ctx: Ctx, exit: Int
+    ) raises -> List[Int]:
+        """The end of a block in a loop that ends with `break` or
+        `continue`: `v = e` for each variable from outside the loop live at
+        the start of its body and moved since, then the statement. Before a
+        `break`, a break_moved mutant or loop_exit near miss moves one
+        (`ctx.break_var`), left moved; before a `continue`, a loop_exit near
+        miss moves one, reinitialized with the others."""
+        var out = List[Int]()
+        var bv = -1
+        var mutant = (
+            exit == S_BREAK
+            and self.wants(MU_BREAK_MOVED)
+            and not self.in_const_if(ctx)
+        )
+        if mutant or self.wants_near(NR_LOOP_EXIT):
+            # (a mutant's variable isn't used again by an enclosing loop:
+            # its next iteration's error could come first)
+            var lo = ctx.parent_base if mutant else 0
+            var cands = List[Int]()
+            for v in self.owned_vars(ctx, ctx.loop_base):
+                if v >= lo and ctx.loop_live[v]:
+                    cands.append(v)
+            var take = len(cands) > 0 and (
+                self.chance(
+                    data, MU_BREAK_MOVED
+                ) if mutant else self.near_chance(data, NR_LOOP_EXIT)
+            )
+            if take:
+                var v = cands[pick(data, len(cands))]
+                var st = self.move_stmt(ctx, v)
+                if mutant:
+                    self.mutated = True
+                else:
+                    _ = self.mark_near(self.stmts[st].e)
+                out.append(st)
+                if exit == S_BREAK:
+                    bv = v
+                    ctx.break_var = v
+        for v in range(ctx.loop_base):
+            if ctx.loop_live[v] and not ctx.live[v] and v != bv:
+                out.append(self.gen_reinit(data, ctx, v))
+        out.append(self.add_stmt(Stmt(exit, -1, -1, -1, 0, [], [], "")))
+        return out^
+
+    def wants_loop_exit(self, ctx: Ctx) -> Bool:
+        """Whether a break_moved mutant or loop_exit near miss can still be
+        made here."""
+        return (
+            self.wants(MU_BREAK_MOVED) and not self.in_const_if(ctx)
+        ) or self.wants_near(NR_LOOP_EXIT)
+
+    def exit_if(
+        mut self, mut data: ConjectureData, mut ctx: Ctx, kind: Int
+    ) raises -> List[Int]:
+        """A chance for break_moved and loop_exit (kind -1: in a loop's
+        body, `if i == k:` on the loop variable i, ending with `break` or
+        `continue` after a move, `loop_exit_end`), or for ret_uninit (kind
+        S_RETURN: an `if` on a condition that isn't constant, ending with
+        an early return, `returning_end`). Nothing if the chance isn't
+        taken."""
+        var state = self.mutation_state()
+        ctx.new_statement()
+        var exit = kind
+        var x: Int
+        var y: Int
+        if exit < 0:
+            exit = S_BREAK
+            if not self.wants(MU_BREAK_MOVED) and data.draw(booleans()):
+                exit = S_CONTINUE
+            var lv = ctx.loop_base  # (the loop variable)
+            x = self.add(E_VAR, lv, self.int_ty, [], [], ctx.names[lv])
+            var k = data.draw(integers(0, 2))
+            y = self.add(E_LIT, k, self.int_ty, [], [], String(k))
+        else:
+            x = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
+            y = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
+            if self.is_const(x) and self.is_const(y):
+                return []
+        var op = pick(data, comptime (len(CMP_OPS)))
+        var n = len(ctx.names)
+        var live = ctx.live.copy()
+        var depths = ctx.move_depth.copy()
+        ctx.depth += 1
+        var then: List[Int]
+        if exit == S_RETURN:
+            then = self.returning_end(data, ctx)
+        else:
+            then = self.loop_exit_end(data, ctx, exit)
+        ctx.depth -= 1
+        ctx.truncate(n)
+        ctx.live = live^
+        ctx.move_depth = depths^
+        if self.mutation_state() == state:
+            return []
+        return [self.add_stmt(Stmt(S_IF, -1, x, y, op, then^, [], String()))]
+
+    def wants_partial(self, ctx: Ctx) -> Bool:
+        """Whether a partial kind can still be made here (a mutant not in
+        a constant `if`)."""
+        return (
+            self.wants(MU_PARTIAL_USE) and not self.in_const_if(ctx)
+        ) or self.wants_near(NR_PARTIAL_MOVE)
+
+    def partial_stmts(
+        mut self, mut data: ConjectureData, mut ctx: Ctx
+    ) raises -> List[Int]:
+        """A chance for the partial kinds: `var vN = x.f^` for a live owned
+        or `mut` x and a field f that isn't an Int (a mutant's x is
+        declared in the innermost loop body, if any), then:
+        - partial_use: `_use(x)` or `_use(x.f)`, both lines marked;
+        - partial_move: up to two statements that don't use x (and don't
+          exit), `x.f = e` (or an `if` that does it in both branches),
+          and a use of x."""
+        var mutant = self.mutant == MU_PARTIAL_USE
+        var cands = List[Int]()  # v * 64 + f
+        for v in range(len(ctx.names)):
+            var k = ctx.kinds[v]
+            if not ctx.live[v] or (k != V_OWNED and k != V_MUT):
+                continue
+            if mutant and v < ctx.loop_base:
+                continue
+            var fs = self.fields_of(ctx.types[v])
+            for f in range(len(fs)):
+                if fs[f] != self.int_ty:
+                    cands.append(v * 64 + f)
+        if len(cands) == 0:
+            return []
+        if mutant:
+            if not self.chance(data, self.mutant):
+                return []
+            self.mutated = True
+        elif not self.near_chance(data, NR_PARTIAL_MOVE):
+            return []
+        var c = cands[pick(data, len(cands))]
+        var v = c // 64
+        var f = c % 64
+        var fty = self.fields_of(ctx.types[v])[f]
+        ctx.new_statement()
+        var place = self.place_expr(ctx, v, f)
+        var text = String(self.exprs[place].text, "^")
+        var mv = self.add(E_FMOVE, 0, fty, [place], [], text^)
+        if mutant:
+            mv = self.mark(mv)
+        else:
+            mv = self.mark_near(mv)
+        var name = String("v", ctx.counter)
+        ctx.counter += 1
+        ctx.push(name.copy(), fty, V_OWNED)
+        var out: List[Int] = [
+            self.add_stmt(Stmt(S_VAR, -1, mv, -1, 0, [], [], name^))
+        ]
+        ctx.live[v] = False  # (nothing uses or assigns x meanwhile)
+        ctx.move_depth[v] = -2
+        if self.mutant == MU_PARTIAL_USE:
+            ctx.new_statement()
+            var use = self.mark(
+                self.place_expr(ctx, v, f if data.draw(booleans()) else -1)
+            )
+            out.append(self.add_stmt(Stmt(S_USE, -1, use, -1, 0, [], [], "")))
+            return out^
+        ctx.no_exit += 1
+        var region_loops = ctx.region_loops
+        if getenv("DECL_FUZZ_NO_PARTIAL_LOOP_WORKAROUND") == "":
+            # Mojo rejects the move ("cannot be consumed, because 'x' is
+            # used later") when a loop nested in another loop comes before
+            # the reassignment (modular/modular#NNNN): no nested loops here
+            ctx.region_loops = ctx.in_loop
+        for _ in range(data.draw(integers(0, 2))):
+            out.append(self.gen_stmt(data, ctx))
+        ctx.region_loops = region_loops
+        ctx.no_exit -= 1
+        ctx.new_statement()
+        if data.draw(integers(0, 2)) == 0:
+            var op = pick(data, comptime (len(CMP_OPS)))
+            var x = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
+            var y = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
+            var branches = List[Int]()
+            for _ in range(2):
+                ctx.new_statement()
+                var e = self.gen_typed(data, ctx, fty, BODY_SIZE - 2, P_OWNED)
+                var target = self.place_expr(ctx, v, f)
+                branches.append(
+                    self.add_stmt(Stmt(S_ASSIGN, target, e, -1, 0, [], [], ""))
+                )
+            out.append(
+                self.add_stmt(
+                    Stmt(S_IF, -1, x, y, op, [branches[0]], [branches[1]], "")
+                )
+            )
+        else:
+            var e = self.gen_typed(data, ctx, fty, BODY_SIZE - 2, P_OWNED)
+            var target = self.place_expr(ctx, v, f)
+            out.append(
+                self.add_stmt(Stmt(S_ASSIGN, target, e, -1, 0, [], [], ""))
+            )
+        ctx.live[v] = True
+        ctx.move_depth[v] = -1
+        ctx.new_statement()
+        var use = self.place_expr(ctx, v, -1)
+        out.append(self.add_stmt(Stmt(S_USE, -1, use, -1, 0, [], [], "")))
+        return out^
+
+    def loop_move_stmt(
+        mut self, mut data: ConjectureData, mut ctx: Ctx, v: Int
+    ) raises -> Int:
+        """For a loop_move mutant in a loop's body: `var vN = v^`, or
+        `if i == k: var vN = v^` (perhaps then `continue`) on the loop
+        variable i. Either way, v stays moved."""
+        if data.draw(booleans()):
+            return self.move_stmt(ctx, v)
+        ctx.new_statement()
+        var lv = ctx.loop_base  # (the loop variable)
+        var x = self.add(E_VAR, lv, self.int_ty, [], [], ctx.names[lv])
+        var k = data.draw(integers(0, 2))
+        var y = self.add(E_LIT, k, self.int_ty, [], [], String(k))
+        var op = pick(data, comptime (len(CMP_OPS)))
+        var n = len(ctx.names)
+        ctx.depth += 1
+        var then: List[Int] = [self.move_stmt(ctx, v)]
+        if data.draw(booleans()):
+            then.append(
+                self.add_stmt(Stmt(S_CONTINUE, -1, -1, -1, 0, [], [], ""))
+            )
+        ctx.depth -= 1
+        ctx.truncate(n)
+        return self.add_stmt(Stmt(S_IF, -1, x, y, op, then^, [], String()))
+
+    def draw_exit(
         mut self,
         mut data: ConjectureData,
         ctx: Ctx,
         const_cond: Bool,
         mode: Int,
         br: Int,
-    ) raises -> Int:
-        """Which branch of the `if` being drawn ends with an early return
-        (BR_THEN or BR_ELSE), or -1. Not in an `if` with a constant
+    ) raises -> List[Int]:
+        """Which branch of the `if` being drawn (BR_THEN or BR_ELSE) ends
+        with an exit, and which (S_RETURN, or in a loop S_BREAK or
+        S_CONTINUE); empty for none. Not in an `if` with a constant
         condition (Mojo would drop the code after it, and so its errors).
         With a plan (mode, br), a mutant's continuing branch is one that
         leaves the variable moved; an early_return near miss's returning
         branch is."""
-        if ctx.ret < 0 or const_cond:
-            return -1
+        if ctx.ret < 0 or const_cond or ctx.no_exit > 0:
+            return []
         var mutant_plan = mode >= 0 and (
             self.mutant == MU_MAYBE_MOVED
             or self.mutant == MU_MUT_UNINIT
             or self.mutant == MU_UNINIT
         )
         if mode >= 0 and self.near == NR_EARLY_RETURN:
-            return br if mode == PLAN_MOVE else 1 - br
-        var often = self.wants(MU_RET_UNINIT) or self.wants_near(
-            NR_EARLY_RETURN
+            return [br if mode == PLAN_MOVE else 1 - br, S_RETURN]
+        var loop_kind = ctx.in_loop > 0 and (
+            self.wants(MU_BREAK_MOVED) or self.wants_near(NR_LOOP_EXIT)
+        )
+        var often = (
+            self.wants(MU_RET_UNINIT)
+            or self.wants_near(NR_EARLY_RETURN)
+            or loop_kind
         )
         if data.draw(integers(0, 1 if often else 5)) != 0:
-            return -1
+            return []
         var r = pick(data, 2)
         if mutant_plan and br != BR_BOTH:
             r = 1 - br if mode == PLAN_MOVE else br
-        return r
+        var exit = S_RETURN
+        if ctx.in_loop > 0:
+            if self.wants(MU_BREAK_MOVED):
+                exit = S_BREAK
+            elif self.wants_near(NR_LOOP_EXIT):
+                exit = S_BREAK if data.draw(booleans()) else S_CONTINUE
+            elif not self.wants(MU_RET_UNINIT):
+                exit = [S_RETURN, S_BREAK, S_CONTINUE][pick(data, 3)]
+        return [r, exit]
 
     def plan_step(
         mut self,
@@ -2749,6 +3148,20 @@ struct Program(Movable):
                 kinds += [S_FOR]  # a loop that can assign a new variable
             if self.wants(MU_RET_UNINIT):
                 kinds += [S_IF, S_IF, S_IF]  # an `if` that can return
+            if self.wants(MU_BREAK_MOVED) or self.wants_near(NR_LOOP_EXIT):
+                # loops, and in them `if`s that can break
+                if ctx.in_loop > 0:
+                    kinds += [S_IF, S_IF, S_IF]
+                else:
+                    kinds += [S_FOR, S_FOR]
+        if ctx.region_loops >= 0 and ctx.in_loop > ctx.region_loops:
+            # (no loop in a loop where a field is moved out: see
+            # `partial_stmts`)
+            var others = List[Int]()
+            for k in kinds:
+                if k != S_FOR:
+                    others.append(k)
+            kinds = others^
         var kind = kinds[pick(data, len(kinds))]
 
         if kind == S_VAR:
@@ -2768,6 +3181,8 @@ struct Program(Movable):
                 or self.wants(MU_MAYBE_MOVED)
                 or self.wants_near(NR_MAYBE_MOVED)
                 or self.wants_near(NR_REINIT_PATHS)
+                or self.wants(MU_BREAK_MOVED)
+                or self.wants_near(NR_LOOP_EXIT)
             ):
                 # (these mutants and near misses move a variable, and not
                 # an Int)
@@ -2856,7 +3271,9 @@ struct Program(Movable):
                     x = self.mark_near(x)
             var in_then = pv >= 0 and br != BR_ELSE
             var in_else = pv >= 0 and br != BR_THEN
-            var ret_br = self.draw_ret_branch(data, ctx, const_cond, mode, br)
+            var exit = self.draw_exit(data, ctx, const_cond, mode, br)
+            var ret_br = exit[0] if len(exit) > 0 else -1
+            var exit_kind = exit[1] if len(exit) > 0 else -1
             ctx.depth += 1
             ctx.const_if += Int(const_cond)
             var then = self.gen_block(
@@ -2866,7 +3283,7 @@ struct Program(Movable):
                 False,
                 pv if in_then and mode == PLAN_MOVE else -1,
                 pv if in_then and mode == PLAN_REINIT else -1,
-                ret_br == BR_THEN,
+                exit_kind if ret_br == BR_THEN else -1,
             )
             var then_live = False
             if pv >= 0:  # (as it was before the then branch)
@@ -2880,7 +3297,7 @@ struct Program(Movable):
                 False,
                 pv if in_else and mode == PLAN_MOVE else -1,
                 pv if in_else and mode == PLAN_REINIT else -1,
-                ret_br == BR_ELSE,
+                exit_kind if ret_br == BR_ELSE else -1,
             )
             ctx.const_if -= Int(const_cond)
             ctx.depth -= 1
@@ -2902,15 +3319,58 @@ struct Program(Movable):
         if self.wants_deferred() and self.deferred_chance(data, ctx):
             pre = self.decl_stmt(data, ctx, self.near >= 0)
             dv = len(ctx.names) - 1
+        if self.wants_loop_exit(ctx):
+            # break_moved and loop_exit need a variable from outside the
+            # loop to move (for a mutant, not one an enclosing loop uses)
+            var lo = ctx.loop_base if self.mutant == MU_BREAK_MOVED else 0
+            var have = False
+            for v in self.owned_vars(ctx, len(ctx.names)):
+                have = have or v >= lo
+            var ty = self.draw_type(data, ctx.pool)
+            if not have and ty != self.int_ty:
+                ctx.new_statement()
+                var init = self.gen(
+                    data, ctx, ty, BODY_SIZE - 1, P_OWNED, False, True
+                )
+                var vname = String("v", ctx.counter)
+                ctx.counter += 1
+                ctx.push(vname.copy(), ty, V_OWNED)
+                var st = self.add_stmt(
+                    Stmt(S_VAR, -1, init, -1, 0, [], [], vname^)
+                )
+                if pre >= 0:  # (with dv's declaration: one group)
+                    pre = self.add_stmt(
+                        Stmt(S_USE, -1, -1, -1, 0, [pre, st], [], String())
+                    )
+                else:
+                    pre = st
         var count = data.draw(integers(0, 3))
+        # a third of the loops are `while` loops on a counter, a `var`
+        # (but not for the mutants that assign or mut-borrow a read
+        # variable, which the counter would look like)
+        var is_while = data.draw(integers(0, 2)) == 0 and not (
+            self.mutant == MU_ASSIGN_READ or self.mutant == MU_MUT_READ
+        )
         var name = String("i", ctx.counter)
         ctx.counter += 1
         var n = len(ctx.names)
         ctx.push(name.copy(), self.int_ty, V_READ)
         ctx.depth += 1
         var loop_base = ctx.loop_base
+        var parent_base = ctx.parent_base
+        var loop_live = ctx.loop_live.copy()
+        ctx.parent_base = loop_base
         ctx.loop_base = n
+        ctx.loop_live = ctx.live.copy()
+        ctx.in_loop += 1
+        # (a `break` of an enclosing loop's body, drawn before this loop,
+        # belongs to that loop)
+        var outer_bv = ctx.break_var
+        ctx.break_var = -1
         var body = self.gen_block(data, ctx, 2, True, -1, dv)
+        ctx.in_loop -= 1
+        ctx.loop_live = loop_live^
+        ctx.parent_base = parent_base
         if dv >= 0 and self.near >= 0 and ctx.live[dv]:
             ctx.new_statement()
             var use = self.place_expr(ctx, dv, -1)
@@ -2919,15 +3379,38 @@ struct Program(Movable):
         ctx.depth -= 1
         ctx.truncate(n)
         var loop = self.add_stmt(
-            Stmt(S_FOR, -1, -1, -1, count, body^, [], name^)
+            Stmt(S_FOR, 1 if is_while else -1, -1, -1, count, body^, [], name^)
         )
-        if dv >= 0:
-            # the loop may run no times: dv is maybe-uninitialized after it
-            ctx.live[dv] = False
-            ctx.move_depth[dv] = ctx.depth
-            var group: List[Int] = [pre, self.loop_uses(loop, ctx, n)]
+        var bv = ctx.break_var  # (moved before a `break` of this loop)
+        ctx.break_var = outer_bv
+        if bv >= 0:
+            ctx.live[bv] = False
+            ctx.move_depth[bv] = ctx.depth
+        if dv >= 0 or bv >= 0 or pre >= 0:
+            var group = List[Int]()
+            if pre >= 0:
+                group.append(pre)
+            if dv >= 0:
+                # the loop may run no times: dv is maybe-uninitialized
+                ctx.live[dv] = False
+                ctx.move_depth[dv] = ctx.depth
+            group.append(self.loop_uses(loop, ctx, n))
             ctx.new_statement()
-            if self.mutant == MU_UNINIT:
+            if bv >= 0 and self.mutant == MU_BREAK_MOVED:
+                ctx.move_depth[bv] = -2
+                var use = self.mark(self.place_expr(ctx, bv, -1))
+                group.append(
+                    self.add_stmt(Stmt(S_USE, -1, use, -1, 0, [], [], ""))
+                )
+            elif bv >= 0 and data.draw(booleans()):
+                group.append(self.gen_reinit(data, ctx, bv))
+                var use = self.place_expr(ctx, bv, -1)
+                group.append(
+                    self.add_stmt(Stmt(S_USE, -1, use, -1, 0, [], [], ""))
+                )
+            if dv < 0:
+                pass
+            elif self.mutant == MU_UNINIT:
                 ctx.move_depth[dv] = -2
                 var use = self.mark(self.place_expr(ctx, dv, -1))
                 group.append(
@@ -3895,6 +4378,9 @@ struct Program(Movable):
             return self.new_int(a)
         if kind == E_VAR:
             return self.read_place(e, frame)
+        if kind == E_FMOVE:  # (the field is reassigned before any use)
+            self.stats[STAT_MOVE] += 1
+            return self.read_place(kids[0], frame)
         if kind == E_MOVE:
             self.stats[STAT_MOVE] += 1
             var v = frame[a]
@@ -4101,28 +4587,30 @@ struct Program(Movable):
     ) raises -> Int:
         # the body's own locals stay in scope for its result
         for s in self.bodies[b].stmts.copy():
-            if self.exec(s, frame, targs):
+            if self.exec(s, frame, targs) == SIG_RETURN:
                 return self.ret_value
         return self.eval(self.bodies[b].ret, frame, targs)
 
     def exec_block(
         mut self, stmts: List[Int], mut frame: List[Int], targs: List[Int]
-    ) raises -> Bool:
-        """Whether the block returned (the value is in ret_value)."""
+    ) raises -> Int:
+        """What the block did: SIG_NONE, or the SIG_* of the statement that
+        ended it (a return's value is in ret_value)."""
         var n = len(frame)
-        var returned = False
+        var sig = SIG_NONE
         for s in stmts:
-            if self.exec(s, frame, targs):
-                returned = True
+            sig = self.exec(s, frame, targs)
+            if sig != SIG_NONE:
                 break
         while len(frame) > n:
             _ = frame.pop()
-        return returned
+        return sig
 
     def exec(
         mut self, s: Int, mut frame: List[Int], targs: List[Int]
-    ) raises -> Bool:
-        """Whether s returned (the value is in ret_value)."""
+    ) raises -> Int:
+        """What s did: SIG_NONE, SIG_RETURN (the value is in ret_value),
+        SIG_BREAK or SIG_CONTINUE."""
         self.steps += 1
         if self.steps > STEP_LIMIT:
             raise Error("STEP_LIMIT")
@@ -4138,16 +4626,23 @@ struct Program(Movable):
         elif kind == S_EXPR:
             if self.exprs[e].kind == E_MOVE:  # `_ = x^` keeps x alive
                 self.stats[STAT_MOVE] += 1
-                return False
+                return SIG_NONE
             _ = self.eval(e, frame, targs)
         elif kind == S_USE:
             for st in self.stmts[s].body.copy():
-                if self.exec(st, frame, targs):
-                    return True
+                var sig = self.exec(st, frame, targs)
+                if sig != SIG_NONE:
+                    return sig
         elif kind == S_RETURN:
             self.stats[STAT_RETURN] += 1
             self.ret_value = self.eval(e, frame, targs)
-            return True
+            return SIG_RETURN
+        elif kind == S_BREAK:
+            self.stats[STAT_BREAK] += 1
+            return SIG_BREAK
+        elif kind == S_CONTINUE:
+            self.stats[STAT_BREAK] += 1
+            return SIG_CONTINUE
         elif kind == S_IF:
             if self.condition(
                 self.stmts[s].a, e, self.stmts[s].e2, frame, targs
@@ -4156,14 +4651,18 @@ struct Program(Movable):
             return self.exec_block(self.stmts[s].orelse.copy(), frame, targs)
         else:
             var body = self.stmts[s].body.copy()
+            # (a `while` loop's counter is incremented first)
+            var first = 1 if self.stmts[s].target == 1 else 0
             for i in range(self.stmts[s].a):
                 self.stats[STAT_LOOP] += 1
-                frame.append(self.new_int(i))
-                var returned = self.exec_block(body, frame, targs)
+                frame.append(self.new_int(i + first))
+                var sig = self.exec_block(body, frame, targs)
                 _ = frame.pop()
-                if returned:
-                    return True
-        return False
+                if sig == SIG_RETURN:
+                    return SIG_RETURN
+                if sig == SIG_BREAK:
+                    break
+        return SIG_NONE
 
     def call_method(
         mut self, m: Int, recv_ty: Int, mut frame: List[Int]
@@ -4238,6 +4737,10 @@ struct Program(Movable):
             return String(indent, "_ = ", self.exprs[s.e].text, "\n")
         if s.kind == S_RETURN:
             return String(indent, "return ", self.exprs[s.e].text, "\n")
+        if s.kind == S_BREAK:
+            return String(indent, "break\n")
+        if s.kind == S_CONTINUE:
+            return String(indent, "continue\n")
         if s.kind == S_USE:
             if s.e >= 0:
                 return String(indent, "_use(", self.exprs[s.e].text, ")\n")
@@ -4261,6 +4764,13 @@ struct Program(Movable):
             text += self.block_text(s.body, inner)
             text += String(indent, "else:\n")
             text += self.block_text(s.orelse, inner)
+            return text^
+        if s.target == 1:
+            var text = String(indent, "var ", s.name, " = 0\n")
+            text += String(indent, "while ", s.name, " < ", s.a, ":\n")
+            text += String(inner, s.name, " = ", s.name, " + 1\n")
+            for st in s.body:
+                text += self.stmt_text(st, inner)
             return text^
         var text = String(indent, "for ", s.name, " in range(", s.a, "):\n")
         text += self.block_text(s.body, inner)
@@ -4310,6 +4820,26 @@ struct Program(Movable):
         s += String(") -> ", self.ty_str(ret, names, self_print), ":\n")
         return s^
 
+    def counted_text(self, st: Int, names: List[String]) -> String:
+        """A counted struct's field-wise `__init__`, copy constructor (if
+        `Copyable`) and `__deinit__`."""
+        ref fields = self.structs[st].fields
+        var s = String("\n    def __init__(out self")
+        for f in range(len(fields)):
+            s += String(", var f", f, ": ", self.ty_str(fields[f], names, -1))
+        s += "):\n"
+        for f in range(len(fields)):
+            s += String("        self.f", f, " = f", f, "^\n")
+        s += "        _born()\n"
+        if self.structs[st].cap == CAP_C:
+            s += "\n    def __init__(out self, *, copy: Self):\n"
+            for f in range(len(fields)):
+                var dot = "" if fields[f] == self.int_ty else ".copy()"
+                s += String("        self.f", f, " = copy.f", f, dot, "\n")
+            s += "        _born()\n"
+        s += "\n    def __deinit__(deinit self):\n        _died()\n\n"
+        return s^
+
     def declarations_text(mut self) -> String:
         var s = String()
         var self_names: List[String] = ["Self"]
@@ -4347,7 +4877,16 @@ struct Program(Movable):
             var names = ["Self.T"] if generic else List[String]()
             var self_ty = self.self_type(st)
             var marked = st == self.mark_struct
-            s += String("@fieldwise_init\nstruct ", self.structs[st].name)
+            # (not a struct a mutant marks: its own copy constructor would
+            # fail on an unmarked line)
+            var counted = (
+                self.structs[st].counted
+                and self.structs[st].cap <= CAP_C
+                and not marked
+            )
+            if not counted:
+                s += "@fieldwise_init\n"
+            s += String("struct ", self.structs[st].name)
             if generic:
                 s += String("[T: Tr", self.structs[st].bound, "]")
             s += String("(", cap_names[self.structs[st].cap])
@@ -4363,6 +4902,8 @@ struct Program(Movable):
                     MARK if marked and self.mark_fields else "",
                     "\n",
                 )
+            if counted:
+                s += self.counted_text(st, names)
             for i in range(len(self.structs[st].k_traits)):
                 s += String(
                     "    comptime K",

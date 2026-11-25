@@ -34,7 +34,9 @@ FM comes in four stages, all implemented:
 "Paths" adds mutants and near misses whose variable is initialized on
 some paths only, after an `if`. "Deferred initialization" does the same
 for variables declared without a value (`var x: T`), and "Early
-returns" for `return` in a branch.
+returns" for `return` in a branch, and "Loops: `while`, `break` and
+`continue`" for the other exits. "Partial moves and counted structs"
+moves fields out and gives structs their own `__deinit__`.
 
 Stage 2 found two compiler bugs in its first rounds, stage 3 two more,
 stage 4 a new form of one of stage 2's, and the path kinds an -O3 crash
@@ -598,8 +600,9 @@ def f(mut s: S):            # S has one field f0: R
 ```
 
 That is #7759's bug, in forms the issue doesn't show (a `mut` argument,
-and a reassignment after the loop). Now the workaround reads `mut`
-variables too.
+and a reassignment after the loop), posted as a
+[comment](https://github.com/modular/modular/issues/7759#issuecomment-7170310106)
+on it. Now the workaround reads `mut` variables too.
 
 **Self-assignment.** With that workaround off, the next round found a
 `DIFF_O3` instead (-O3 printed 3 and 0, -O0 and the evaluator 4):
@@ -923,7 +926,13 @@ each kind that got its near miss, and the number rejected:
 | `disjoint` | 181 | 930 |
 
 `disjoint` needs a struct with two fields of a callee's parameter
-types, which few programs declare.
+types, which few programs declare. Later, its callees grew to include
+generic functions (instantiated with each choice of conforming types
+from the pool, up to 64, with the type arguments written out) and
+methods with a `mut self` receiver, which is then one of the two
+fields (`v.f0.m(v.f1)`). That barely changed how often it's made (18%
+of 1135 programs, seed 902) but varied the calls: of 60 near misses
+(seed 901), 9 called a generic function and 33 a `mut self` method.
 
 **Validation.** The first round, 600 programs of all kinds (seed 743,
 nightly), gave one `DIFF_EXPECTED`. It was an evaluator bug, not a near
@@ -1105,8 +1114,8 @@ Q(...)` on some paths, a later `x.f0 = R(3)` makes the assignment in
 the branch destroy the uninitialized x it replaces first. Mojo does
 reject the case where every field is set this way ("used with all
 fields manually initialized but without calling an '__init__'
-method"). Both 1117 and 1123 do this. Not yet reported (draft
-`unfiled-mojo-issue-partial-field-init.md`).
+method"). Both 1117 and 1123 do this. Filed as
+[#7785](https://github.com/modular/modular/issues/7785).
 
 ## Early returns
 
@@ -1140,9 +1149,11 @@ reinitializes x in one branch, that branch may return.
 
 `DECL_FUZZ_MUTANTS=ret_uninit` and `DECL_FUZZ_NEAR=early_return` ask
 for them. Both make the early returns more frequent (one `if` in two)
-and `mut` arguments more common. In 200 programs of each (seed 831),
-all the mutants and 45% of the near misses got the construct, and 10%
-of stage 2 programs executed an early return.
+and `mut` arguments more common. `ret_uninit` also gets a chance at
+every statement: an `if` (on a condition that isn't constant) whose
+branch moves a `mut` argument and returns. In 200 programs of each
+(seeds 831 and 851), 70% of the mutants and 45% of the near misses got
+the construct, and 10% of stage 2 programs executed an early return.
 
 **Validation.** On the nightly, all OK: 300 `ret_uninit` mutants and
 400 `early_return` near misses (seed 841), 300 stage 2 programs (seed
@@ -1150,17 +1161,144 @@ of stage 2 programs executed an early return.
 #7759, now clean), 400 mutants and 400 near misses of all kinds (seed
 843).
 
+## Loops: `while`, `break` and `continue`
+
+A third of the loops are now `while` loops on a counter, a `var`
+incremented first, so that a `continue` can't loop forever:
+
+```mojo
+var i2 = 0
+while i2 < 3:
+    i2 = i2 + 1
+    ...
+```
+
+Inside a loop, the exit that ends a branch of an `if` can also be
+`break` or `continue`. Before either, the branch reinitializes every
+variable from outside the loop that was live at the start of the body
+and has been moved since. The evaluator runs both, and a `while`
+loop's counter starts at 1 in the body.
+
+Probes on the nightly:
+- A variable moved before a `break` is maybe-moved after the loop: a
+  use there is an error at the use, and `x = e` or no use is fine.
+- A variable moved before a `continue` (and not reinitialized) is an
+  error at the first use the next iteration reaches, which may be the
+  move itself. The same holds for a move in a branch of an `if` in the
+  loop.
+- Reinitializing before the `continue` or `break` is fine, and so is
+  a `break` from an inner loop followed by `x = e` in the outer one.
+
+| Kind | Construct | Mojo's error |
+|---|---|---|
+| mutant `break_moved` | x, from outside the loop (and not used by an enclosing loop), moved before a `break`; `_use(x)` after the loop | use of uninitialized value 'x' |
+| mutant `loop_move` (extended) | the loop's move of an outer x can now be `if i == k: var v = x^`, perhaps followed by `continue` | as before, the whole loop is marked |
+| near `loop_exit` | x moved (marked) before a `break`, then perhaps `x = e` and a use after the loop; or x moved and reinitialized before a `continue` | |
+
+The mutants that assign or mut-borrow a read variable make no `while`
+loops: the counter is a `var`, and would look like a read variable to
+them. `break_moved` and `loop_exit` get a chance at every statement of
+a loop's body (an `if` on the loop variable whose branch moves x and
+exits), and a non-`Int` variable before the loop if it has none. In 200
+programs of each (seed 851), 55% of the `break_moved` mutants, 64% of
+the `loop_move` mutants and 64% of the `loop_exit` near misses got the
+construct.
+
+**Validation.** The first round (seed 861, nightly) gave 300 OK
+`loop_move` mutants, 200 OK `ret_uninit` mutants, 300 OK stage 2
+programs and 400 OK mutants of all kinds, but 57 `WRONG_LINE`s among
+300 `break_moved` mutants and 14 build failures among 400 `loop_exit`
+near misses. Both were one generator bug: the variable moved before a
+`break` was recorded in the context, and a loop nested in the same
+body, drawn after the `break`, took it as its own, so the outer loop
+treated it as live after it. Each loop now keeps the outer loop's
+record aside while it draws its body. After the fix, 300 `break_moved`
+mutants and 400 `loop_exit` near misses (seed 881) were all OK, and so
+were 400 near misses of all kinds (seed 882).
+
+## Partial moves and counted structs
+
+A field can be moved out of a variable (`var v = x.f^`). Probes on the
+nightly settled the rules:
+- The field has to be reassigned (`x.f = e`) on every path before x is
+  used whole, before the field is read, and before x's lifetime ends or
+  x is assigned whole. Otherwise the error is at the use ("use of
+  uninitialized value 'x.f0'"), or at the move ("field 'x.f0' destroyed
+  out of the middle of a value, preventing the overall value from being
+  destroyed"), or at the `if` whose branches disagree.
+- Reading another field in between is fine, and so is reassigning the
+  field in both branches of an `if`, in a loop, or for a `mut` argument.
+- `^` moves an `ImplicitlyCopyable` field too. A struct with its own
+  `__deinit__` allows a partial move if the field is reassigned.
+- A `deinit self` method replaces the destructor: the struct's
+  `__deinit__` doesn't run, its remaining fields are destroyed.
+
+| Kind | Construct | Mojo's error |
+|---|---|---|
+| mutant `partial_use` | `var v = x.f^` (marked), then `_use(x)` or `_use(x.f)` (marked) | use of uninitialized value 'x.f' |
+| near `partial_move` | `var v = x.f^` (marked), up to two statements that don't use x, `x.f = e` (a third of the time in both branches of an `if`), then a use of x | |
+
+x is a live owned or `mut` variable, and the field isn't an `Int`. The
+statements in between don't exit: a `return`, `break` or `continue`
+would reassign x whole, which is an error with a field moved out. A
+mutant's x is declared in the innermost loop body. Each kind gets a
+chance at every statement. In 200 programs of each (seed 871), 50% of
+the mutants and 41% of the near misses got the construct.
+
+A third kind, a mutant that never reassigns the field, didn't work.
+Mojo reports "destroyed out of the middle of a value" where x would
+otherwise have been destroyed, which is often at x's last use before
+the move, on another line: 294 of 300 such mutants were `WRONG_LINE`.
+And when the field moved is x's only one with a destructor, the rest
+of x needs no destruction, so the program is valid: the other 6 were
+`ACCEPTED`.
+
+Half of the `Movable` and `Copyable` structs are now **counted**: they
+have their own field-wise `__init__`, a copy constructor if they are
+`Copyable`, and a `__deinit__`. These call `_born()` and `_died()`,
+which keep the same ledger as `Res`, so a struct value destroyed twice
+or never gives `UNBALANCED` as a `Res` would. (In the comptime twin
+they do nothing.) A struct that a mutant marks isn't counted: its copy
+constructor would fail on an unmarked line.
+
+**Validation.** On the nightly, with the workaround below and counted
+structs, all OK: 400 `partial_move` near misses (seed 881), 200
+`partial_use` mutants (seed 914), 400 `disjoint` near misses (seed
+911), 400 stage 2 programs (seed 912), 400 mutants and 400 near misses
+of all kinds (seed 913). With the workaround off, 200 `partial_move`
+near misses (seed 881) were OK too: counted structs change what a seed
+draws, and the nested loop the bug needs is rare (18 in the 400 of the
+first round).
+
+### Findings
+
+**A nested loop after a partial move.** The first round of 400
+`partial_move` near misses (seed 881) gave 18 build failures, all
+"value 'self.f1' cannot be consumed, because 'self' is used later" at
+the move, though the field was reassigned before any use. Reduced:
+
+```mojo
+var q = Q(R(1), R(2))
+var v = q.f0^
+for i in range(2):
+    for j in range(1):
+        pass
+q.f0 = R(5)
+```
+
+A single loop in between is fine, and so is a loop in an `if` or an
+`if` in a loop; a loop nested in a loop (`for` or `while`) is
+rejected, for locals, `mut` arguments and `mut self`. Both 1117 and
+1123 reject it. Not yet reported (draft
+`unfiled-mojo-issue-partial-move-nested-loop.md`). The generator works
+around it: a loop drawn while a field is moved out gets no loop inside
+it. `DECL_FUZZ_NO_PARTIAL_LOOP_WORKAROUND=1` turns this off.
+
 ## Beyond the paths
 
 Mojo features FM leaves out for now:
-- **More ownership:** partial moves of fields, `ref` results and
-  origins, `deinit`/consuming methods, and custom `__deinit__`s in
-  generated structs.
-- **More paths:** a loop that moves an outer variable in one branch
-  (`loop_move` through an `if`), and `while` with `break` and
-  `continue`.
-- **More near misses:** disjoint fields through generic functions and
-  `mut self`.
+- **More ownership:** `ref` results and origins, and `deinit`
+  (consuming) methods.
 - **Overloading and `@implicit` conversions:** Mojo's resolution rules
   aren't fully specified, so the evaluator would have to restrict itself
   to unambiguous overload sets.
