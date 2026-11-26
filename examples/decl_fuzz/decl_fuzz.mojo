@@ -51,7 +51,10 @@
 # field before x is used again, the mutant uses x first. Half
 # of the `Movable` and `Copyable` structs are counted: they have their
 # own `__init__`, copy constructor and `__deinit__`, which keep the same
-# ledger as `Res`.
+# ledger as `Res`. Some methods take `deinit self` (called on `x^`, a
+# copy or a new value); a counted struct's call `_died()` before each
+# return, since `__deinit__` doesn't run. The deinit near misses move a
+# field out of self, or self itself, at the end of one and leave it moved.
 #
 # Every program terminates: each method and function has a rank, and a
 # body calls only methods and functions of lower rank; loops have constant
@@ -130,7 +133,9 @@ comptime CAP_NAMES: List[String] = [
 comptime CONV_READ = 0
 comptime CONV_MUT = 1
 comptime CONV_VAR = 2
-comptime CONV_PREFIX: List[String] = ["", "mut ", "var "]
+comptime CONV_DEINIT = 3
+"""`deinit self`: a consuming method (only for `self`)."""
+comptime CONV_PREFIX: List[String] = ["", "mut ", "var ", "deinit "]
 
 # kinds of variables in Γ
 comptime V_READ = 0
@@ -232,7 +237,9 @@ comptime STAT_RES = 13
 comptime STAT_RETURN = 14
 comptime STAT_BREAK = 15
 """`break` and `continue`."""
-comptime N_STATS = 16
+comptime STAT_DEINIT = 16
+"""Calls of `deinit self` methods."""
+comptime N_STATS = 17
 comptime STAT_NAMES: List[String] = [
     "own",
     "required",
@@ -250,6 +257,7 @@ comptime STAT_NAMES: List[String] = [
     "res",
     "return",
     "break",
+    "deinit",
 ]
 
 # Stage 3: ill-typed mutants (DECL_FUZZ_MUTANTS=1). Each program gets one
@@ -361,7 +369,13 @@ before a `continue`."""
 comptime NR_PARTIAL_MOVE = 11
 """A field moved out (`var v = x.f^`), perhaps other statements, then the
 field reassigned (perhaps in both branches of an `if`) and x used."""
-comptime N_NR = 12
+comptime NR_DEINIT_DROP = 12
+"""At the end of a `deinit self` method, a field moved out of self and not
+reassigned (an error in any other method)."""
+comptime NR_DEINIT_MOVE = 13
+"""At the end of a `deinit self` method, self moved out whole (`var v =
+self^`) and not reassigned (an error for a `mut` argument)."""
+comptime N_NR = 14
 comptime NR_NAMES: List[String] = [
     "disjoint",
     "read_alias",
@@ -375,6 +389,8 @@ comptime NR_NAMES: List[String] = [
     "early_return",
     "loop_exit",
     "partial_move",
+    "deinit_drop",
+    "deinit_move",
 ]
 comptime MARK_NEAR = "@@N@@"
 """In generated text, marks the line of the near miss."""
@@ -604,6 +620,9 @@ struct Body(Copyable):
     var ret: Int
     var self_print: Int
     """The type written `Self` in this body and its signature, or -1."""
+    var died: Bool
+    """Whether its final return calls `_died()` first (a counted struct's
+    `deinit self` method, with self not moved out whole)."""
 
 
 @fieldwise_init
@@ -631,7 +650,8 @@ struct Stmt(Copyable):
     var e2: Int
     """The right operand of the condition (S_IF), or -1."""
     var a: Int
-    """The comparison (S_IF) or the trip count (S_FOR)."""
+    """The comparison (S_IF), the trip count (S_FOR), or 1 for a `return`
+    that calls `_died()` first (S_RETURN)."""
     var body: List[Int]
     var orelse: List[Int]
     var name: String
@@ -758,7 +778,11 @@ struct Ctx(Copyable):
 
 
 def kind_of_conv(conv: Int) -> Int:
-    if conv == CONV_MUT:
+    # (in a `deinit self` method, self can be assigned, mut-borrowed and
+    # moved, like a `mut` argument; unlike one, it needn't be live at the
+    # return, but the generator keeps it live except for the deinit near
+    # misses)
+    if conv == CONV_MUT or conv == CONV_DEINIT:
         return V_MUT
     return V_OWNED if conv == CONV_VAR else V_READ
 
@@ -839,6 +863,12 @@ struct Program(Movable):
     variable, until its loop is made (and marked); else -1."""
     var marked_stmts: List[Int]
     """Statements whose every line is marked."""
+    var deinit_body: Bool
+    """Whether the body being generated is a `deinit self` method's (self
+    is variable 0)..."""
+    var died: Bool
+    """...and a counted struct's: its returns call `_died()`, since the
+    struct's `__deinit__` doesn't run."""
     var keep_dead: Int
     """The `mut` argument a mut_uninit mutant left moved (blocks don't
     reinitialize it, and the body's return is marked), or -1."""
@@ -880,6 +910,8 @@ struct Program(Movable):
         self.near_made = False
         self.loop_mark = -1
         self.marked_stmts = []
+        self.deinit_body = False
+        self.died = False
         self.keep_dead = -1
         self.ret_value = -1
         self.mark_struct = -1
@@ -1128,6 +1160,11 @@ struct Program(Movable):
             or self.near == NR_EARLY_RETURN
         )
         var mut_self_from = 2 if mut_often else 3  # `mut self` 1/2 or 1/4
+        # `deinit self` for 1/6 of the other methods (1/2 for the deinit
+        # near misses)
+        var deinit_odds = 3 if (
+            self.near == NR_DEINIT_DROP or self.near == NR_DEINIT_MOVE
+        ) else 1
         # trait headers: parents, capability, K, make (FJ: classes in
         # order, so the refinement relation is acyclic)
         var n_traits = data.draw(integers(1, 4))
@@ -1248,6 +1285,11 @@ struct Program(Movable):
                     CONV_MUT if data.draw(integers(0, 3))
                     >= mut_self_from else CONV_READ
                 )
+                if (
+                    self_conv == CONV_READ
+                    and data.draw(integers(0, 5)) < deinit_odds
+                ):
+                    self_conv = CONV_DEINIT
                 var params = List[Int]()
                 var convs = List[Int]()
                 for _ in range(data.draw(integers(0, 2))):
@@ -1264,7 +1306,9 @@ struct Program(Movable):
                         convs^,
                         self.draw_sig_type(data, pool, self.p0_ty),
                         data.draw(integers(0, MAX_RANK)),
-                        data.draw(booleans()),
+                        # (no default body for a `deinit self` method: a
+                        # counted struct's has to call `_died()`)
+                        data.draw(booleans()) and self_conv != CONV_DEINIT,
                         -1,
                     )
                 )
@@ -1283,6 +1327,11 @@ struct Program(Movable):
                     CONV_MUT if data.draw(integers(0, 3))
                     >= mut_self_from else CONV_READ
                 )
+                if (
+                    self_conv == CONV_READ
+                    and data.draw(integers(0, 5)) < deinit_odds
+                ):
+                    self_conv = CONV_DEINIT
                 var params = List[Int]()
                 var convs = List[Int]()
                 for _ in range(data.draw(integers(0, 2))):
@@ -1797,6 +1846,8 @@ struct Program(Movable):
         ctx.ret = ret
         var stmts = self.gen_block(data, ctx, 5 if root else 3)
         stmts += self.mut_reinits(data, ctx)
+        if self.deinit_body and ctx.live[0]:
+            stmts += self.deinit_end(data, ctx)
         ctx.new_statement()
         var r: Int
         if root:
@@ -1819,8 +1870,13 @@ struct Program(Movable):
             )
             ctx.push(name^, self.int_ty, V_OWNED)
             r = self.checksum(ctx)
-        self.bodies.append(Body(stmts^, r, ctx.self_print))
+        self.bodies.append(Body(stmts^, r, ctx.self_print, self.died))
         return len(self.bodies) - 1
+
+    def is_deinit_self(self, v: Int) -> Bool:
+        """Whether v is self in a `deinit self` method's body: left moved,
+        it isn't an error (no mut_uninit, ret_uninit mutants)."""
+        return self.deinit_body and v == 0
 
     def mut_reinits(
         mut self, mut data: ConjectureData, mut ctx: Ctx
@@ -1833,7 +1889,7 @@ struct Program(Movable):
         for v in range(len(ctx.names)):
             if ctx.kinds[v] != V_MUT or ctx.live[v] or v == self.keep_dead:
                 continue
-            if self.chance(data, MU_MUT_UNINIT):
+            if not self.is_deinit_self(v) and self.chance(data, MU_MUT_UNINIT):
                 self.mutated = True
                 self.keep_dead = v
                 continue
@@ -1891,6 +1947,60 @@ struct Program(Movable):
                     sum = self.add(E_BIN, 0, self.int_ty, [sum, e], [], text^)
         return sum
 
+    def start_body(mut self, s: Int, m: Int):
+        """Before generating struct s's body of method m: whether it's a
+        `deinit self` method's, and whether its returns call `_died()`."""
+        self.deinit_body = self.methods[m].self_conv == CONV_DEINIT
+        self.died = self.deinit_body and self.is_counted(s)
+
+    def is_counted(self, st: Int) -> Bool:
+        """Whether struct st is printed counted: drawn so, `Movable` or
+        `Copyable`, and not a struct a mutant marks (its own copy
+        constructor would fail on an unmarked line)."""
+        return (
+            self.structs[st].counted
+            and self.structs[st].cap <= CAP_C
+            and st != self.mark_struct
+        )
+
+    def deinit_end(
+        mut self, mut data: ConjectureData, mut ctx: Ctx
+    ) raises -> List[Int]:
+        """At the end of a `deinit self` method's body (self live), perhaps
+        a near miss: deinit_drop moves a field out of self (`var v =
+        self.f^`, the rest of self is destroyed), deinit_move self itself
+        (`var v = self^`; v is destroyed with the struct's `__deinit__`, so
+        the return doesn't call `_died()`). self isn't used again."""
+        var out = List[Int]()
+        if self.wants_near(NR_DEINIT_DROP):
+            var fields = self.fields_of(ctx.types[0])
+            var cands = List[Int]()
+            for f in range(len(fields)):
+                if fields[f] != self.int_ty:  # (`^` on an Int copies it)
+                    cands.append(f)
+            if len(cands) > 0 and self.near_chance(data, NR_DEINIT_DROP):
+                var f = cands[pick(data, len(cands))]
+                ctx.new_statement()
+                var place = self.place_expr(ctx, 0, f)
+                var text = String(self.exprs[place].text, "^")
+                var mv = self.mark_near(
+                    self.add(E_FMOVE, 0, fields[f], [place], [], text^)
+                )
+                var name = String("v", ctx.counter)
+                ctx.counter += 1
+                ctx.push(name.copy(), fields[f], V_OWNED)
+                out.append(
+                    self.add_stmt(Stmt(S_VAR, -1, mv, -1, 0, [], [], name^))
+                )
+                ctx.live[0] = False
+                ctx.move_depth[0] = -2
+        elif self.near_chance(data, NR_DEINIT_MOVE):
+            var st = self.move_stmt(ctx, 0)
+            _ = self.mark_near(self.stmts[st].e)
+            out.append(st)
+            self.died = False
+        return out^
+
     def draw_bodies(mut self, mut data: ConjectureData) raises:
         # trait defaults
         for m in range(len(self.methods)):
@@ -1909,6 +2019,7 @@ struct Program(Movable):
                         continue
                     var ctx = self.struct_ctx(data, s, m)
                     var ret = self.body_ret(s, m)
+                    self.start_body(s, m)
                     var b = self.gen_body(data, ctx^, ret)
                     self.structs[s].impl_methods.append(m)
                     self.structs[s].impl_bodies.append(b)
@@ -1917,7 +2028,10 @@ struct Program(Movable):
             for m in self.structs[s].own.copy():
                 var ctx = self.struct_ctx(data, s, m)
                 var ret = self.methods[m].ret
+                self.start_body(s, m)
                 self.methods[m].body = self.gen_body(data, ctx^, ret)
+        self.deinit_body = False
+        self.died = False
         # functions
         for f in range(len(self.fns)):
             var bounds = self.fns[f].bounds.copy()
@@ -2471,7 +2585,11 @@ struct Program(Movable):
         elif self.wants(MU_RET_UNINIT) and not self.in_const_if(ctx):
             var cands = List[Int]()
             for v in range(len(ctx.names)):
-                if ctx.kinds[v] == V_MUT and ctx.types[v] != self.int_ty:
+                if (
+                    ctx.kinds[v] == V_MUT
+                    and ctx.types[v] != self.int_ty
+                    and not self.is_deinit_self(v)
+                ):
                     cands.append(v)
             if len(cands) > 0 and self.chance(data, MU_RET_UNINIT):
                 self.mutated = True
@@ -2485,7 +2603,10 @@ struct Program(Movable):
         var e = self.gen_typed(data, ctx, ctx.ret, BODY_SIZE - 1, P_OWNED, True)
         if left >= 0:
             e = self.mark(e)
-        out.append(self.add_stmt(Stmt(S_RETURN, -1, e, -1, 0, [], [], "")))
+        # (op 1: `_died()` first)
+        out.append(
+            self.add_stmt(Stmt(S_RETURN, -1, e, -1, Int(self.died), [], [], ""))
+        )
         return out^
 
     def loop_exit_end(
@@ -2917,7 +3038,7 @@ struct Program(Movable):
         for v in range(len(ctx.names)):
             if ctx.types[v] == self.int_ty or v == self.keep_dead:
                 continue
-            if mutant and v < ctx.loop_base:
+            if mutant and (v < ctx.loop_base or self.is_deinit_self(v)):
                 continue
             var k = ctx.kinds[v]
             var kind_ok: Bool
@@ -4239,6 +4360,9 @@ struct Program(Movable):
             var kids = List[Int]()
             if self.methods[m].self_conv == CONV_MUT:
                 kids.append(self.take_place(data, ctx, r, True))
+            elif self.methods[m].self_conv == CONV_DEINIT:
+                # an owned receiver: `x^`, a copy, or a new value
+                kids.append(self.gen(data, ctx, r, sub, P_OWNED))
             else:
                 kids.append(self.gen(data, ctx, r, sub, P_READ))
             var params = self.method_params(m, r)
@@ -4455,6 +4579,9 @@ struct Program(Movable):
         if kind == E_METHOD:
             var recv_ty = self.subst(self.exprs[kids[0]].ty, targs)
             var convs: List[Int] = [self.methods[a].self_conv]
+            if convs[0] == CONV_DEINIT:
+                self.stats[STAT_DEINIT] += 1
+                convs[0] = CONV_VAR  # (the receiver is passed owned)
             convs += self.methods[a].convs.copy()
             return self.call(a, -1, recv_ty, kids, convs, frame, targs, [])
         if kind == E_STATIC:
@@ -4761,7 +4888,8 @@ struct Program(Movable):
         if s.kind == S_EXPR:
             return String(indent, "_ = ", self.exprs[s.e].text, "\n")
         if s.kind == S_RETURN:
-            return String(indent, "return ", self.exprs[s.e].text, "\n")
+            var died = String(indent, "_died()\n") if s.a == 1 else String()
+            return String(died, indent, "return ", self.exprs[s.e].text, "\n")
         if s.kind == S_BREAK:
             return String(indent, "break\n")
         if s.kind == S_CONTINUE:
@@ -4806,6 +4934,8 @@ struct Program(Movable):
         var s = String()
         for st in body.stmts:
             s += self.stmt_text(st, indent)
+        if body.died:
+            s += String(indent, "_died()\n")
         s += String(indent, "return ", self.exprs[body.ret].text, "\n")
         return s^
 
@@ -4902,13 +5032,7 @@ struct Program(Movable):
             var names = ["Self.T"] if generic else List[String]()
             var self_ty = self.self_type(st)
             var marked = st == self.mark_struct
-            # (not a struct a mutant marks: its own copy constructor would
-            # fail on an unmarked line)
-            var counted = (
-                self.structs[st].counted
-                and self.structs[st].cap <= CAP_C
-                and not marked
-            )
+            var counted = self.is_counted(st)
             if not counted:
                 s += "@fieldwise_init\n"
             s += String("struct ", self.structs[st].name)

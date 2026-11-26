@@ -1370,11 +1370,76 @@ near misses of all kinds (seed 1013, round 3's near-miss seed), 600
 `loop_exit` near misses (seed 1041), 1,000 mutants of all kinds (seed
 1042) and 600 stage 2 programs (seed 1043).
 
+## Consuming methods (`deinit self`)
+
+A method can take `deinit self`: it consumes its receiver, and the
+struct's `__deinit__` doesn't run for it. Probes on the nightly:
+- The receiver must be owned: `x^.m()`, `x.copy().m()` or `S(...).m()`;
+  `x.m()` copies x implicitly if the type is `ImplicitlyCopyable`, and is
+  an error ("cannot be implicitly copied") otherwise. On a `read`
+  argument, `p^.m()` is "cannot transfer out of immutable reference".
+- After `x^.m()`, a use of x is "use of uninitialized value 'x'", and
+  `x = e` makes it live again. A `mut` argument consumed this way must be
+  reassigned before the return. In one call, `h(x.f, x^.m())` and
+  `h(x^.m(), x.f)` are both errors, as they are with `x^`.
+- In the body, self is like an owned variable: its fields can be
+  assigned, mut-borrowed and moved out, and `mut self` methods called.
+  A field moved out needn't be reassigned: the remaining fields are
+  destroyed at the end. Even `var v = self^` is fine; v is then a value
+  like any other, destroyed with the struct's `__deinit__`.
+- `deinit self` works in a trait requirement, and a generic function can
+  call it (`x^.m()` with `x: T`). In a generic struct, the fields of type
+  `T` need `Deinitable` (every FM trait refines it).
+
+FM declares 1/6 of the methods that would take `self` with `deinit
+self` instead, both a struct's own methods and trait requirements (with
+no default body). A call's receiver is drawn as an owned value, so it is
+`x^`, a copy, a new value, or an implicit copy, and the evaluator moves
+x for `x^`. In the body, self has the kind of a `mut` argument, so the
+generator assigns, borrows and moves it as it would one, and
+reinitializes it before each return (not needed, but valid). The
+mut_uninit and ret_uninit mutants leave self alone there, since a moved
+self isn't an error.
+
+A counted struct's `deinit self` method calls `_died()` before each
+return, because its `__deinit__` won't. If Mojo ran both, or neither,
+the ledger would be off and `main` would print `UNBALANCED`.
+
+Two near misses do what only a `deinit self` method may, at the end of
+its body:
+
+| Kind | Construct | Why it's valid |
+|---|---|---|
+| near `deinit_drop` | `var v = self.f^` (marked), never reassigned; the return doesn't use self | the rest of self is destroyed field by field |
+| near `deinit_move` | `var v = self^` (marked), never reassigned; no `_died()` | v is destroyed with `__deinit__` |
+
+Their mutant counterparts in any other method are the ones of the
+partial-moves and paths sections: `partial_drop` (dropped, since Mojo's
+line for it is unpredictable) and `mut_uninit`. For these two near
+misses, half of the methods take `deinit self`.
+
+In 300 stage 2 programs (seed 3001), 41 evaluated a `deinit self`
+call, 990 in all.
+
+**Validation.** The first round gave `UNBALANCED` in 3 of 300 stage 2
+programs and 20 of 200 near misses, with more deaths than births. That
+was the generator: it decided whether a struct was counted from the
+drawn flag alone, while the printer also requires `Movable` or
+`Copyable`, so `ImplicitlyCopyable` structs' `deinit self` methods
+called `_died()`. After the fix (`is_counted`, used by both), on
+nightly 1.3.0.dev2026112505, all OK:
+- 300 stage 2 programs, 200 deinit near misses and 300 mutants of all
+  kinds (seeds 3002-3004);
+- 1,000 stage 2 programs, 1,000 near misses of all kinds, 400 deinit
+  near misses and 1,000 mutants of all kinds (seeds 3021-3024).
+
+No compiler bugs so far: Mojo destroyed every consumed value exactly
+once, at -O0, at -O3 and at compile time.
+
 ## Beyond the paths
 
 Mojo features FM leaves out for now:
-- **More ownership:** `ref` results and origins, and `deinit`
-  (consuming) methods.
+- **More ownership:** `ref` results and origins.
 - **Overloading and `@implicit` conversions:** Mojo's resolution rules
   aren't fully specified, so the evaluator would have to restrict itself
   to unambiguous overload sets.
