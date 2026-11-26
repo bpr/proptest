@@ -66,9 +66,16 @@
 # parameter (`struct V[n: Int]`), used with one or two values (`V[3]`,
 # each occurrence spelled as some expression equal to it, `V[(1 + 2)]`,
 # which Mojo folds) and read as `V[3].n` or `Self.n`, also in constants
-# (`comptime K0 = Self.n + (5)`). The value mutant writes another value
-# where one is expected; the value_expr near miss writes Self as
-# `V[Self.n + 0]` or another equal expression.
+# (`comptime K0 = Self.n + (5)`). A third of the functions have a value
+# parameter too, `def gN[n: Int](p0: V[n], ...)`, which Mojo infers from
+# the first argument; their signatures and bodies, and the methods of V,
+# also use `V[n + 1]` and `V[n - 1]` (spelled `1 + n`, `(n + 2) + (-1)`,
+# ...), so a call `g(x)` with x: V[n - 1] in another function has
+# `V[(n - 1) + 1]` for `V[n]`. The value mutant writes another value
+# where one is expected (in a type, or explicitly in a call,
+# `g0[4](V[3](...))`); the value_expr near miss writes Self as
+# `V[Self.n + 0]`, or any `V[n]` as `V[n * 1]` or another equal
+# expression.
 #
 # Every program terminates: each method and function has a rank, and a
 # body calls only methods and functions of lower rank; loops have constant
@@ -135,6 +142,9 @@ comptime RES = 3
 comptime VAL = 4
 """A comptime Int, the argument of a struct with a value parameter
 (`struct V[n: Int]`): tid is the value. Not a type of values."""
+comptime OFF = 5
+"""A value parameter plus a constant, `n + c` (as the argument of a
+struct with a value parameter): tid is c (never 0), targ the PARAM n."""
 
 # capabilities, weakest first
 comptime CAP_M = 0
@@ -267,7 +277,10 @@ comptime STAT_REF = 17
 accessor."""
 comptime STAT_VALUE = 18
 """Value parameters read (`Self.n`, `V[k].n`, `Self.n` in a constant)."""
-comptime N_STATS = 19
+comptime STAT_VALUE_CALL = 19
+"""Calls of functions with a value parameter (`def gN[n: Int](p0:
+V[n])`)."""
+comptime N_STATS = 20
 comptime STAT_NAMES: List[String] = [
     "own",
     "required",
@@ -288,6 +301,7 @@ comptime STAT_NAMES: List[String] = [
     "deinit",
     "ref",
     "value",
+    "value_call",
 ]
 
 # Stage 3: ill-typed mutants (DECL_FUZZ_MUTANTS=1). Each program gets one
@@ -347,7 +361,8 @@ e`), which is immutable."""
 comptime MU_VALUE = 22
 """A value of a struct with a value parameter, with another value
 (`V[4](...)` or `V[Self.n + 1](...)`), where `V[3]` or `Self` is
-expected."""
+expected, or a call of a function with a value parameter with another
+value given explicitly (`g0[4](V[3](...))`)."""
 comptime N_MU = 23
 comptime MU_NAMES: List[String] = [
     "type",
@@ -426,7 +441,9 @@ comptime NR_REF_REINIT = 14
 of rN: the binding is to the place, not to the value."""
 comptime NR_VALUE_EXPR = 15
 """In a struct with a value parameter, a value of Self written with an
-equal expression (`V[Self.n + 0](...)`, `V[0 + Self.n]`, ...)."""
+equal expression (`V[Self.n + 0](...)`, `V[0 + Self.n]`, ...); and
+anywhere, a type with a value parameter as its argument written so
+(`V[n * 1]`, in a signature too)."""
 comptime N_NR = 16
 comptime NR_NAMES: List[String] = [
     "disjoint",
@@ -1035,11 +1052,25 @@ struct Program(Movable):
         self.targ.append(arg)
         return len(self.tkind) - 1
 
+    def offset(mut self, arg: Int, c: Int) -> Int:
+        """The value argument arg plus c: `k + c` folded, `n + c`."""
+        var kind = self.tkind[arg]
+        if kind == VAL:
+            return self.intern(VAL, self.tid[arg] + c, -1)
+        if kind == OFF:
+            return self.offset(self.targ[arg], self.tid[arg] + c)
+        if c == 0:
+            return arg
+        return self.intern(OFF, c, arg)
+
     def subst(mut self, ty: Int, args: List[Int]) -> Int:
         """Replaces PARAM i by args[i]."""
         var kind = self.tkind[ty]
         if kind == PARAM:
             return args[self.tid[ty]]
+        if kind == OFF:
+            var n = self.subst(self.targ[ty], args)
+            return self.offset(n, self.tid[ty])
         if kind == STRUCT and self.targ[ty] >= 0:
             var arg = self.subst(self.targ[ty], args)
             return self.intern(STRUCT, self.tid[ty], arg)
@@ -1055,8 +1086,8 @@ struct Program(Movable):
         if ty == self_print:
             return "Self"
         var kind = self.tkind[ty]
-        if kind == VAL:  # (spelled by resolve_values)
-            return String("@@=", self.tid[ty], "@@")
+        if kind == VAL or kind == OFF:
+            return self.val_str(ty, names)
         if kind == INT:
             return "Int"
         if kind == RES:
@@ -1064,11 +1095,28 @@ struct Program(Movable):
         if kind == PARAM:
             return names[self.tid[ty]]
         var s = self.structs[self.tid[ty]].name
+        if self.targ[ty] >= 0 and self.structs[self.tid[ty]].valued:
+            return String(s, "[", self.val_str(self.targ[ty], names), "]")
         if self.targ[ty] >= 0:
             return String(
                 s, "[", self.ty_str(self.targ[ty], names, self_print), "]"
             )
         return s
+
+    def val_str(self, arg: Int, names: List[String]) -> String:
+        """A value argument, spelled by resolve_values: `@@=k@@` for k,
+        `@@=n;c@@` for `n + c`. A bare n is spelled `n`, except for the
+        value_expr near miss (`@@=n;0@@`)."""
+        var kind = self.tkind[arg]
+        if kind == VAL:
+            return String("@@=", self.tid[arg], "@@")
+        if kind == OFF:
+            return String(
+                "@@=", names[self.tid[self.targ[arg]]], ";", self.tid[arg], "@@"
+            )
+        if self.near == NR_VALUE_EXPR:
+            return String("@@=", names[self.tid[arg]], ";0@@")
+        return names[self.tid[arg]]
 
     def cty(self, ty: Int, ctx: Ctx) -> String:
         return self.ty_str(ty, ctx.param_names, ctx.self_print)
@@ -1126,7 +1174,8 @@ struct Program(Movable):
         for s in range(n_structs):
             pool += self.concrete_types(s)
         for p in range(len(bounds)):
-            pool.append(self.intern(PARAM, p, -1))
+            if bounds[p] >= 0:  # (-1: a value parameter)
+                pool.append(self.intern(PARAM, p, -1))
         var start = 0
         for _ in range(2):
             var end = len(pool)
@@ -1158,6 +1207,55 @@ struct Program(Movable):
 
     def is_valued(self, ty: Int) -> Bool:
         return self.tkind[ty] == STRUCT and self.structs[self.tid[ty]].valued
+
+    def value_family(mut self, s: Int, p: Int) -> List[Int]:
+        """V[n], V[n + 1] and V[n - 1], for struct s (V) with the value
+        parameter n (PARAM p) in scope."""
+        var n = self.intern(PARAM, p, -1)
+        var out = List[Int]()
+        for c in [0, 1, -1]:
+            out.append(self.intern(STRUCT, s, self.offset(n, c)))
+        return out^
+
+    def fn_pool(mut self, f: Int) -> List[Int]:
+        """The types function f's signature and body draw from."""
+        var bounds = self.fns[f].bounds.copy()
+        var pool = self.type_pool(bounds, len(self.structs))
+        for i in range(len(bounds)):
+            if bounds[i] < 0:
+                pool += self.value_family(self.tid[self.fns[f].params[i]], i)
+        return pool^
+
+    def fn_names(self, f: Int) -> List[String]:
+        """The names of function f's parameters: `T` and `U` for types, `n`
+        for a value."""
+        var out = List[String]()
+        var bounds = self.fns[f].bounds.copy()
+        var types = 0
+        for i in range(len(bounds)):
+            if bounds[i] < 0:
+                out.append("n")
+            else:
+                out.append("T" if types == 0 else "U")
+                types += 1
+        return out^
+
+    def value_args(self, ctx: Ctx, s: Int) -> List[Int]:
+        """The arguments of struct s (with a value parameter) in the pool:
+        a free value parameter of a call is drawn from them."""
+        var out = List[Int]()
+        for t in ctx.pool:
+            if self.tkind[t] == STRUCT and self.tid[t] == s:
+                if not has(out, self.targ[t]):
+                    out.append(self.targ[t])
+        return out^
+
+    def targ_choices(self, ctx: Ctx, f: Int, i: Int) -> List[Int]:
+        """What parameter i of function f can be, where nothing fixes it."""
+        var b = self.fns[f].bounds[i]
+        if b < 0:
+            return self.value_args(ctx, self.tid[self.fns[f].params[i]])
+        return self.conforming(ctx, b)
 
     def methods_on(self, ty: Int, bounds: List[Int]) -> List[Int]:
         """Non-static methods callable on a value of type ty."""
@@ -1200,10 +1298,20 @@ struct Program(Movable):
             return True
         return has(self.methods[m].convs, CONV_MUT)
 
-    def unify(self, pat: Int, ty: Int, mut assign: List[Int]) -> Bool:
+    def unify(mut self, pat: Int, ty: Int, mut assign: List[Int]) -> Bool:
         var kind = self.tkind[pat]
         if kind == VAL:
             return ty == pat
+        if kind == OFF:
+            # n + c = ty, so n = ty - c (Mojo doesn't infer through the
+            # arithmetic, but the generator solves for the arguments it
+            # picks, and a value parameter's first argument is V[n])
+            var tk = self.tkind[ty]
+            if tk != VAL and tk != PARAM and tk != OFF:
+                return False
+            var n = self.targ[pat]
+            var solved = self.offset(ty, -self.tid[pat])
+            return self.unify(n, solved, assign)
         if kind == PARAM:
             var i = self.tid[pat]
             if assign[i] < 0:
@@ -1341,8 +1449,13 @@ struct Program(Movable):
             )
             var values = List[Int]()
             if valued:
-                for _ in range(data.draw(integers(1, 2))):
+                for i in range(data.draw(integers(1, 3))):
                     var k = data.draw(integers(-2, 5))
+                    if i > 0 and data.draw(booleans()):
+                        # a neighbor, so that `V[n + 1]` results are wanted
+                        k = values[len(values) - 1] + (
+                            1 if data.draw(booleans()) else -1
+                        )
                     if not has(values, k):
                         values.append(k)
             var bound = pick(data, n_traits) if generic else -1
@@ -1460,7 +1573,7 @@ struct Program(Movable):
             var pool = self.type_pool(bounds, n_structs)
             var own_ty = self.self_type(s)
             if self.structs[s].valued:
-                pool.append(own_ty)
+                pool += self.value_family(s, 0)
             for _ in range(data.draw(integers(0, 2))):
                 var m = len(self.methods)
                 var self_conv = (
@@ -1494,17 +1607,44 @@ struct Program(Movable):
                 )
                 self.structs[s].own.append(m)
 
-        # free and generic functions; parameter i < #bounds has type PARAM i
+        # free and generic functions; parameter i < #bounds has type PARAM
+        # i, or V[PARAM i] for a value parameter (bound -1), so that Mojo
+        # infers each one from the arguments
+        var valued_structs = List[Int]()
+        for s in range(n_structs):
+            if self.structs[s].valued:
+                valued_structs.append(s)
         for f in range(data.draw(integers(0, 3))):
             var bounds = List[Int]()
             for _ in range(data.draw(integers(0, 2))):
                 bounds.append(pick(data, n_traits))
+            # a value parameter for half of them (3/4 for the value kinds)
+            var vi = -1
+            var vs = -1
+            if len(valued_structs) > 0 and data.draw(integers(0, 3)) < (
+                3 if value_kind else 2
+            ):
+                vs = valued_structs[pick(data, len(valued_structs))]
+                if len(bounds) == 2:
+                    vi = pick(data, 2)
+                    bounds[vi] = -1
+                else:
+                    vi = pick(data, len(bounds) + 1)
+                    bounds.insert(vi, -1)
             var pool = self.type_pool(bounds, n_structs)
-            var own_ty = self.p0_ty if len(bounds) > 0 else -1
+            var own_ty = -1
+            if vi >= 0:
+                pool += self.value_family(vs, vi)
+                own_ty = self.intern(STRUCT, vs, self.intern(PARAM, vi, -1))
+            elif len(bounds) > 0:
+                own_ty = self.p0_ty
             var params = List[Int]()
             var convs = List[Int]()
             for i in range(len(bounds)):
-                params.append(self.intern(PARAM, i, -1))
+                if i == vi:
+                    params.append(own_ty)
+                else:
+                    params.append(self.intern(PARAM, i, -1))
                 convs.append(draw_conv(data, mut_often))
             for _ in range(data.draw(integers(0, 2))):
                 params.append(self.draw_sig_type(data, pool, own_ty))
@@ -1782,14 +1922,11 @@ struct Program(Movable):
             and self.wants(MU_VALUE)
             and self.chance(data, MU_VALUE)
         ):
-            # `V[k + d](...)` or `V[Self.n + d](...)`
+            # `V[k + d](...)`, `V[Self.n + d](...)` or `V[n + d](...)`
             var d = data.draw(integers(1, 3))
-            var arg = self.targ[ty]
-            var vtext: String
-            if self.tkind[arg] == VAL:
-                vtext = String("@@=", self.tid[arg] + d, "@@")
-            else:
-                vtext = String("Self.n + ", d)
+            var vtext = self.val_str(
+                self.offset(self.targ[ty], d), ctx.param_names
+            )
             var fts = self.fields_of(ty)
             var vars = List[Int](length=len(fts), fill=CONV_VAR)
             var kids = self.gen_args(data, ctx, fts, vars, size - 1, False)
@@ -1991,7 +2128,7 @@ struct Program(Movable):
         var pool = self.type_pool(bounds, len(self.structs))
         var valued = self.structs[s].valued
         if valued:
-            pool.append(self_ty)
+            pool += self.value_family(s, 0)
         var ctx = Ctx(
             bounds^,
             ["Self.T"] if generic else (
@@ -2226,8 +2363,8 @@ struct Program(Movable):
         for f in range(len(self.fns)):
             var bounds = self.fns[f].bounds.copy()
             var rank = self.fns[f].rank
-            var pool = self.type_pool(bounds, len(self.structs))
-            var ctx = Ctx(bounds^, ["T", "U"], rank, -1, pool^)
+            var pool = self.fn_pool(f)
+            var ctx = Ctx(bounds^, self.fn_names(f), rank, -1, pool^)
             self.push_params(ctx, self.fns[f].params, self.fns[f].convs, "p")
             var ret = self.fns[f].ret
             self.fns[f].body = self.gen_body(data, ctx^, ret)
@@ -2468,7 +2605,7 @@ struct Program(Movable):
             var choices = List[List[Int]]()
             var total = 1
             for i in range(len(bounds)):
-                choices.append(self.conforming(ctx, bounds[i]))
+                choices.append(self.targ_choices(ctx, f, i))
                 total *= len(choices[i])
             for c in range(min(total, 64)):
                 var targs = List[Int]()
@@ -4776,8 +4913,12 @@ struct Program(Movable):
         if rule == R_VALN:  # a value parameter
             var t = c.valn[pick(data, len(c.valn))]
             var text = String(self.cty(t, ctx), ".n")
-            if t == ctx.self_ty and data.draw(booleans()):
-                text = "Self.n"
+            var ak = self.tkind[self.targ[t]]
+            if (ak == PARAM or ak == OFF) and data.draw(booleans()):
+                # `Self.n`, `n`, `(n + 1)`
+                text = String(
+                    "(", self.val_str(self.targ[t], ctx.param_names), ")"
+                )
             return self.add(E_VALN, 0, ty, [], [t], text^)
 
         if rule == R_K:  # an associated constant: τ.K<t>
@@ -4794,7 +4935,7 @@ struct Program(Movable):
             targs = self.call_assignment(f, ty, ctx)
             for i in range(n_tp):
                 if targs[i] < 0:
-                    var ok = self.conforming(ctx, self.fns[f].bounds[i])
+                    var ok = self.targ_choices(ctx, f, i)
                     targs[i] = ok[pick(data, len(ok))]
         # MU_BOUND: a type argument that doesn't conform, (i, type)
         var bad_i = -1
@@ -4802,6 +4943,8 @@ struct Program(Movable):
         if n_tp > 0 and self.wants(MU_BOUND):
             var cands = List[Int]()
             for i in range(n_tp):
+                if self.fns[f].bounds[i] < 0:
+                    continue
                 for t in ctx.pool:
                     if not self.conforms(t, self.fns[f].bounds[i], ctx.bounds):
                         cands.append(i * 1024 + t)
@@ -4809,6 +4952,16 @@ struct Program(Movable):
                 var x = cands[pick(data, len(cands))]
                 bad_i = x // 1024
                 bad_t = x % 1024
+                self.mutated = True
+        # MU_VALUE: another value given explicitly for a value parameter
+        if self.wants(MU_VALUE):
+            var vs = List[Int]()
+            for i in range(n_tp):
+                if self.fns[f].bounds[i] < 0:
+                    vs.append(i)
+            if len(vs) > 0 and self.chance(data, MU_VALUE):
+                bad_i = vs[pick(data, len(vs))]
+                bad_t = self.offset(targs[bad_i], data.draw(integers(1, 3)))
                 self.mutated = True
         var params = self.fns[f].params.copy()
         if n_tp > 0:
@@ -4826,11 +4979,19 @@ struct Program(Movable):
             for i in range(n_tp):
                 if i > 0:
                     text += ", "
-                text += self.cty(bad_t if i == bad_i else targs[i], ctx)
+                text += self.targ_str(
+                    f, i, bad_t if i == bad_i else targs[i], ctx
+                )
             text += "]"
         text += String("(", self.args_text(kids, 0), ")")
         var e = self.add(E_CALL, f, ty, kids^, targs^, text^)
         return self.mark(e) if bad_i >= 0 else e
+
+    def targ_str(self, f: Int, i: Int, t: Int, ctx: Ctx) -> String:
+        """Type argument i of a call of function f: a type, or a value."""
+        if self.fns[f].bounds[i] < 0:
+            return self.val_str(t, ctx.param_names)
+        return self.cty(t, ctx)
 
     def bad_type_text(
         mut self, mut data: ConjectureData, ctx: Ctx, ty: Int
@@ -4861,7 +5022,7 @@ struct Program(Movable):
                 out.append(r)
         return out^
 
-    def call_assignment(self, f: Int, ty: Int, ctx: Ctx) -> List[Int]:
+    def call_assignment(mut self, f: Int, ty: Int, ctx: Ctx) -> List[Int]:
         """Type arguments making generic function f return ty (-1 where
         free), or [] if there are none."""
         var n_tp = len(self.fns[f].bounds)
@@ -4875,9 +5036,9 @@ struct Program(Movable):
         for i in range(n_tp):
             var b = self.fns[f].bounds[i]
             if assign[i] >= 0:
-                if not self.conforms(assign[i], b, ctx.bounds):
+                if b >= 0 and not self.conforms(assign[i], b, ctx.bounds):
                     return []
-            elif len(self.conforming(ctx, b)) == 0:
+            elif len(self.targ_choices(ctx, f, i)) == 0:
                 return []
         return assign^
 
@@ -5000,6 +5161,8 @@ struct Program(Movable):
         # E_CALL
         if len(self.fns[a].bounds) > 0:
             self.stats[STAT_GENERIC] += 1
+        if has(self.fns[a].bounds, -1):
+            self.stats[STAT_VALUE_CALL] += 1
         var f_targs = self.subst_all(self.exprs[e].tys.copy(), targs)
         var convs = self.fns[a].convs.copy()
         return self.call(-1, a, -1, kids, convs, frame, targs, f_targs)
@@ -5535,9 +5698,9 @@ struct Program(Movable):
                 )
                 s += self.body_text(b, "        ")
             s += "\n\n"
-        var fn_names: List[String] = ["T", "U"]
         var prefixes = materialize[CONV_PREFIX]()
         for f in range(len(self.fns)):
+            var fn_names = self.fn_names(f)
             ref fd = self.fns[f]
             s += String("def ", fd.name)
             if len(fd.bounds) > 0:
@@ -5545,7 +5708,10 @@ struct Program(Movable):
                 for i in range(len(fd.bounds)):
                     if i > 0:
                         s += ", "
-                    s += String(fn_names[i], ": Tr", fd.bounds[i])
+                    if fd.bounds[i] < 0:
+                        s += String(fn_names[i], ": Int")
+                    else:
+                        s += String(fn_names[i], ": Tr", fd.bounds[i])
                 s += "]"
             s += "("
             for i in range(len(fd.params)):
@@ -5568,9 +5734,18 @@ struct Program(Movable):
         return s^
 
 
-def resolve_values(mut data: ConjectureData, text: String) raises -> String:
+def lit(x: Int) -> String:
+    return String(x) if x >= 0 else String("(", x, ")")
+
+
+def resolve_values(
+    mut data: ConjectureData, text: String, near: Bool, mut made: Bool
+) raises -> String:
     """Spells each value argument `@@=<k>@@` as an expression equal to k
-    (Mojo folds it), drawn per occurrence: `V[3]`, `V[(1 + 2)]`, ..."""
+    (Mojo folds it), drawn per occurrence: `V[3]`, `V[(1 + 2)]`, ...; and
+    `@@=n;c@@` as one equal to `n + c`: `V[n + 1]`, `V[1 + n]`, .... With
+    near (the value_expr near miss), `@@=n;0@@` may be spelled `n * 1`,
+    ... (marked, and made says so); else it's `n`."""
     var out = String()
     var rest = text
     while True:
@@ -5579,8 +5754,17 @@ def resolve_values(mut data: ConjectureData, text: String) raises -> String:
             break
         var i = found.value()
         var j = rest.find("@@", i + 3).value()
-        var k = Int(rest[byte = i + 3 : j])
+        var inner = String(rest[byte = i + 3 : j])
         out += rest[byte=:i]
+        var semi = inner.find(";")
+        if semi:
+            var name = String(inner[byte = : semi.value()])
+            var c = Int(inner[byte = semi.value() + 1 :])
+            out += spell_sym(data, name, c, near, made)
+            var tail = String(rest[byte = j + 2 :])
+            rest = tail^
+            continue
+        var k = Int(inner)
         var form = data.draw(integers(0, 3))
         if form == 0:
             out += String(k) if k >= 0 else String("(", k, ")")
@@ -5596,6 +5780,37 @@ def resolve_values(mut data: ConjectureData, text: String) raises -> String:
         rest = tail^
     out += rest
     return out^
+
+
+def spell_sym(
+    mut data: ConjectureData, name: String, c: Int, near: Bool, mut made: Bool
+) raises -> String:
+    """An expression equal to `name + c`, for resolve_values."""
+    if c == 0:
+        if not near or data.draw(integers(0, 2)) > 0:
+            return name
+        made = True
+        var forms: List[String] = [
+            "{} + 0",
+            "0 + {}",
+            "{} * 1",
+            "1 * {}",
+            "{} - 0",
+            "({} + 2) - 2",
+            "2 + {} - 2",
+        ]
+        return String(
+            MARK_NEAR, forms[pick(data, len(forms))].replace("{}", name)
+        )
+    var form = data.draw(integers(0, 3))
+    if form == 0:
+        return String(name, " + ", c) if c > 0 else String(name, " - ", -c)
+    if form == 1:
+        return String(lit(c), " + ", name)
+    if form == 2:
+        var a = data.draw(integers(1, 3))
+        return String("(", name, " + ", a, ") + ", lit(c - a))
+    return String(name, " - ", lit(-c))
 
 
 def resolve_marks(text: String) -> String:
@@ -5672,6 +5887,10 @@ def draw_program(
             )
         if not p.mutated:  # no chance was taken
             assume(False)
+    # (spelling the value arguments may make a value_expr near miss)
+    var decls = resolve_values(
+        data, p.declarations_text(), p.near == NR_VALUE_EXPR, p.near_made
+    )
     if p.near >= 0:
         if getenv("DECL_FUZZ_STATS") != "":
             var names = materialize[NR_NAMES]()
@@ -5692,7 +5911,6 @@ def draw_program(
                 args.append(data.draw(integers(-20, 20)))
         arg_lists.append(args^)
 
-    var decls = resolve_values(data, p.declarations_text())
     var program = String(PRELUDE_HEAD, RUN_TIME_RES, decls, "def main():\n")
     program += "    _ledger_init()\n"
     var comptime_program = String(

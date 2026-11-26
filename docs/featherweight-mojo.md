@@ -1611,6 +1611,57 @@ The wrapped product, 0x7FFFFFFFFFFFFFFD, has the low 32 bits of -3. With
 parameters only brought the overflowing product into a condition that
 folds.
 
+### On functions, and arithmetic
+
+Functions take value parameters too, next to type parameters, and
+types can do arithmetic on them. Probes on the nightly:
+- `def h[n: Int](p0: V[n], p1: V[n]) -> Int` infers n from its
+  arguments: `h(V[3](1), V[(1 + 2)](2))` is fine, and `h(V[3](1),
+  V[4](2))` is "cannot be converted from 'V[Int(4)]' to 'V[Int(3)]'". So
+  is an explicit `h[4](V[3](1), ...)`.
+- `def g[T: Tr0, n: Int](p0: T, p1: V[n]) -> V[n]` mixes the two kinds.
+- A result can be `V[n + 1]`: `succ(succ(V[1](0)))` is a `V[3]`, and a
+  method `-> V[Self.n + 1]` chains (`V[3](7).up().up()` is a `V[5]`).
+  `V[1 + n + 1]` and `V[(n + 1) + 1]` are the same type.
+- A parameter `p0: V[n + 0]` (or `V[n * 1]`) still lets Mojo infer n, but
+  `p0: V[n + 1]` doesn't: "it depends on an unresolved parameter 'n'".
+
+In FM a third of the functions (two thirds for the value kinds) have a
+value parameter `n` over one struct V with one, at position 0 or 1 of
+their parameters; its first argument has type `V[n]`, from which Mojo
+infers it. Their signatures and bodies draw from `V[n]`, `V[n + 1]` and
+`V[n - 1]` as well as the usual types, and so do V's own methods and
+bodies, with `Self.n`. A new type kind OFF is `n + c`: substituting a
+value k for n gives `V[k + c]`, and substituting another parameter m
+(the caller's) gives `V[m + c]`, folded (`(m - 1) + 1` is m). To call a
+function for a wanted result `V[n + 1]` in a context where that's
+`V[k]`, unification solves n = k - 1; where it's `V[m]`, n = m - 1, so
+the argument is a `V[m - 1]` and Mojo must see that the result `V[(m -
+1) + 1]` is `V[m]`. Where nothing fixes n, it's drawn from the
+arguments of V in the context's pool. A second value of a struct is
+often a neighbor of the first, so that results `V[k + 1]` are wanted.
+
+`n + c` is printed `n + c`, `c + n`, `(n + a) + (c - a)` or `n - (-c)`,
+drawn per occurrence, and Int positions can read `n`, `(n + 1)` or
+`V[n + 1].n`. A call prints its parameters explicitly half the time
+(`g0[(1 + 2), S1](...)`).
+
+| Kind | Construct | Mojo's error, or why it's valid |
+|---|---|---|
+| `value` | also `V[n + d](...)` where `V[n]` is expected, and a call with another value explicitly, `g0[4](V[3](...))` or `g0[n + 1](p0)` | cannot be converted |
+| near `value_expr` | also, anywhere `V[n]` or `V[Self.n]` is written (signatures too, including the parameter n is inferred from): `V[n * 1]`, `V[2 + n - 2]`, ... | canonicalized to n |
+
+A function gets a value parameter only when some struct has one, so in
+1,000 stage 2 programs (seed 7211) 61 called one while running, 1,643
+times in all; for the value kinds, struct and function odds are higher.
+In 400 value mutants (seed 7223), 68 were an explicit call.
+
+**Validation.** On nightly 1.3.0.dev2026112505 everything was OK: 2,200
+stage 2 programs, 1,000 value_expr near misses and 1,000 value mutants
+(seeds 7201-7203, 7211-7213, 7221-7223), and 1,000 near misses and 1,000
+mutants of all kinds (seeds 7214, 7215). No new compiler bug: Mojo
+folded every `(m - 1) + 1`, and inferred every n.
+
 ## Beyond the paths
 
 Mojo features FM leaves out for now:
@@ -1622,8 +1673,8 @@ Mojo features FM leaves out for now:
   to unambiguous overload sets.
 - **More of the type system:** retroactive conformance with
   `__extension` (e.g. `Int` to a trait), conditional conformance
-  (`where` clauses), associated types, generic methods, value
-  parameters on functions and methods (`def f[n: Int]`, inferred from
-  `V[n]` arguments) and next to type parameters, and keyword and default
-  arguments.
+  (`where` clauses), associated types, generic methods (and value
+  parameters on methods), parameters inferred from a field of an argument
+  or not inferable at all (`p0: V[n + 1]` needs an explicit n), and
+  keyword and default arguments.
 - **`Variant` and `isa`:** the counterpart of FJ's downcasts.
