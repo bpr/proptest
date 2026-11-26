@@ -1710,6 +1710,181 @@ bound-or-sig mutants (seeds 7301-7304, 7311, 7312, 7316), and 1,000 near
 misses and 1,000 mutants of all kinds (seeds 7314, 7315). No new
 compiler bug.
 
+## Conditional conformance
+
+A generic struct can conform to a trait only for some type arguments:
+`struct B[T: Tr0](Tr0, Tr1 where conforms_to(T, Tr2))`. Probes on the
+nightly:
+- `B[A]` conforms to Tr1 when A conforms to Tr2, also through a
+  refinement, and in a generic context when T's bound refines Tr2 (Mojo
+  proves it from the bound). Tr1's defaults then apply to `B[A]`.
+- `B[C]` with C not conforming to Tr2 doesn't: passing it for a `T: Tr1`
+  is "argument type 'B[C]' does not conform to trait 'Tr1'", and so is
+  `B[T]` with T's bound not implying Tr2.
+- The methods only Tr1 needs may be gated by the same condition, `def
+  m1(self) -> Int where conforms_to(Self.T, Tr2)`, or not (then their
+  bodies can't use it). Calling a gated method on `B[C]` is "violated
+  constraint", or in a generic context "lacking evidence to prove
+  correctness". A stricter condition on the method than on the
+  conformance is "'B[T]' does not implement all requirements for 'Tr1'".
+- Tr1's parents need implementations too, gated as well; a constant
+  (`comptime K1 = 9`) needs no condition. A missing implementation or
+  constant is reported at the struct even if nothing uses it.
+- In the struct's header the condition names `T`; `Self.T` is "'Self'
+  type is not available in this context".
+- A function can have conditions too, `def w[T: Tr0, U: Tr0](x: T, y: U)
+  -> Int where conforms_to(T, Tr1) and conforms_to(U, Tr2)`, joined with
+  `and` (a comma is a syntax error), and its body can use them. A call
+  that fails one is "violated constraint".
+
+In FM a third of the generic structs (all of them for the where kinds,
+which also make more structs generic and give them fewer unconditional
+traits) get one conditional conformance, to a trait not already implied
+by their unconditional ones, with a condition the bound usually doesn't
+imply. They implement the methods of that trait and its parents that
+their other conformances don't need, gated (half the time, always for
+the where kinds) by the same condition. A quarter of the type
+parameters of functions (half for the where kinds) get a `where
+conforms_to(T, TrN)` with a trait the bound doesn't imply.
+
+A body with a `where` (a gated implementation's, or a function's) uses
+its condition: while it's drawn, `Program.facts` holds "PARAM p conforms
+to TrN", which `conforms` consults besides the bound, so T values get
+the condition trait's methods, static methods and constants, and
+`B2[T]` types whose bound only the condition gives. That also keeps the
+where mutant honest: inside a gated method, a gated call on `self`
+isn't a violation (a first version counted it as one, and Mojo rightly
+accepted those 7 "mutants"). A gated implementation whose signature has
+Self as a type argument (`-> B2[Self]`, with Self substituted by
+`B[Self.T]`) needs the condition to be well formed, so it always prints
+its `where`.
+
+`conforms(B[X], t)` is true if an unconditional conformance gives t, or
+if the conditional one does and `conforms(X, Y)`; for X a type parameter
+that's whether its bound refines Y, as Mojo proves it. Everything that
+draws a type or a method goes through `conforms` and `methods_on`, so a
+gated method is only called on receivers whose condition holds, and a
+function's type arguments are drawn from the types that meet both its
+bound and its `where`.
+
+| Kind | Construct | Mojo's error, or why it's valid |
+|---|---|---|
+| `where` | a gated method called on `B[X]` with X failing the condition; `B[X]` (explicitly) as the type argument of a function or generic method whose bound only the conditional conformance would give; a type argument meeting a function's bound but not its `where`. Never in a ternary's branch or a constant `if` (Mojo drops a dead branch before checking constraints: 2 of 400 were accepted there) | violated constraint, lacking evidence, or does not conform |
+| `where_impl` | a gated implementation of a required method, with a condition on a trait refining the conformance's (and not implied by the bound) | does not implement all requirements |
+| near `where` | a gated method called on `B[X]` with X meeting the condition (half the time, a condition the bound implies) | the condition holds |
+
+**Found: Mojo gives T a refined type under a `where` that it doesn't
+identify with T** (filed as
+[#7811](https://github.com/modular/modular/issues/7811)).
+The first stage 2 and near miss rounds failed to build with "cannot
+implicitly convert 'T(Tr3)' value to 'T(Tr3)'". Reduced, in `def f[T:
+Tr0](p: T) -> Int where conforms_to(T, Tr1)`:
+- `B[T](p)`, an implicit copy into a struct's constructor, is "cannot
+  implicitly convert 'T(Tr1)' value to 'T(Tr1)'" (`B(p)`, `B[T](p.copy())`
+  and `take(p)` are fine);
+- `p if True else b.f0` is "ambiguous merge: left value has type 'T(Tr1)'
+  and right value has type 'T'";
+- `T.make1(1) if True else T.make1(2)`, with make1 a static method of
+  Tr1, is "'Tr0' value has no attribute 'make1'", as if the second
+  branch were checked without the `where`; so is an Int ternary `1 if
+  True else T.make1(2).m()`.
+
+The same happens in gated methods. The first is on 1117 too; the
+ternaries compile on 1117, so they're a regression in 2026112505
+(still there in 2026112605). The
+workaround (`where_workaround`; DECL_FUZZ_NO_WHERE_WORKAROUND=1
+disables it) draws no ternaries in bodies with a `where`, and passes
+variables and fields whose types mention a type parameter with
+`.copy()` there, to constructors and to every non-`mut` argument (the
+generated programs also hit it through ref accessors in calls with
+explicit type arguments, `g1[Self.T](self.f0_ref())`).
+
+Two more generator bugs showed up as accepted mutants: an
+implicit_copy mutant that the workaround's `.copy()` undid (it now
+leaves marked expressions alone), and one that wasn't a mutant at all,
+an implicit copy of a T whose bound is only `Copyable` but whose `where`
+trait is `ImplicitlyCopyable` (`cap_of` now consults the facts too).
+
+In 1,000 stage 2 programs (seed 7442), 15 called a gated method or a
+function with a `where` while running, 2,220 times in all; the where
+kinds make most of these constructs. With the final generator, on
+nightly 1.3.0.dev2026112505, everything was OK: 1,000 stage 2 programs,
+400 where near misses, 400 where, 267 where_impl and 300
+implicit_copy-or-where mutants, and 1,000 near misses and 1,000 mutants
+of all kinds (seeds 7436, 7441-7446). Without the workaround, 34 of 100
+where near misses failed to build (seed 7437).
+
+## Associated types
+
+A trait can require a type, `comptime E0: Tr1`, and use it in its
+signatures as `Self.E0`. Probes on the nightly:
+- A struct binds it with `comptime E0 = A` (or `Self.T`, or `Self`); its
+  implementations can write either `A` or `Self.E0`, and `S.E0(3)` and
+  `var z: S.E0` work outside it.
+- Generic code uses `T.E0` as a type (`def g[T: Tr0](x: T) -> T.E0`,
+  `y: T.E0`), with Tr1's methods, static methods and constants
+  (`T.E0.make1(3)`, `T.E0.K1`), at compile time too.
+- A binding that doesn't conform to the bound (`comptime E0 = Int`, or a
+  struct without Tr1), or a missing one, is "'S' does not implement all
+  requirements for 'Tr0'". `T.E0` where T is wanted is "cannot implicitly
+  convert 'T.E0' value to 'T'"; a C passed for `y: T.E0` with T = S is
+  "cannot be converted from 'C' to 'S.E0'".
+
+In FM a third of the traits (two thirds for the assoc kinds) declare
+`comptime E<t>: TrU`, with any trait as the bound. A new type kind ASSOC
+is `X.E<t>`, and `assoc(t, X)` normalizes it: for a struct X, it's X's
+binding (substituted for a generic struct's argument), so `B[A].E0` and
+`A` are the same type id; for a type parameter (or HOLE) it stays
+symbolic. Substitution goes through `assoc`, so a trait method's
+`Self.E0` becomes the binding for a receiver, and `T.E0` in a generic
+function becomes the binding of the type argument. An ASSOC type
+conforms to its bound's refinements, has the bound's capability, and has
+no fields, so it's used like a type parameter: through the bound's
+methods, makes and constants, never `X.E0(...)`. The pool of a context
+holds `T.E<x>` for each type parameter T and each trait x its bound
+implies that has one; signatures, fields of generic structs
+(`Self.T.E0`) and bodies draw from it.
+
+After the struct headers, each struct binds the associated types of
+every trait it conforms to (conditionally too), to a type of its pool
+that conforms to the bound, Self included. A struct with no such type
+gives up the conformances that need it, repeated until nothing changes
+(giving one up can leave another struct without candidates), and its
+constants for those traits. A call of a function with result `T.E0`
+can't infer T from the result type: unification records the pair, and
+`call_assignment` takes the first T allowed whose E0 is the type wanted
+(Mojo then infers T from the arguments).
+
+| Kind | Construct | Mojo's error, or why it's valid |
+|---|---|---|
+| `assoc` | a struct binding E<t> to a concrete type that doesn't conform to the bound | does not implement all requirements |
+| `missing` | also a binding left out | does not implement all requirements |
+| near `assoc` | one struct writes one of its bindings as `Self.E<t>` in its signatures, fields and bodies | it's the same type |
+
+Three generator bugs showed up on the way:
+- Dropping a conformance in the binding pass could leave a field type
+  drawn earlier ill formed (`B0[S2]` with S2 no longer conforming to
+  B0's bound): 5 BUILD_FAILs and 2 evaluator errors. Such programs are
+  now discarded.
+- A missing mutant that left out a binding named by an implementation's
+  signature (`-> Self.E0`) made Mojo stop at "'V1[n]' value has no
+  attribute 'E0'" on that line, before reporting the struct: it now
+  leaves out only bindings no signature names.
+- A near miss whose alias was never printed wasn't one; such programs are
+  discarded.
+
+In 1,000 stage 2 programs (seed 7511), 565 declare an associated type
+and 310 write one (`T.E0`, `Self.T.E0`, `Self.E0`), but only 14 call a
+method, a make or a constant through one while running, 568 times in
+all.
+
+**Validation.** On nightly 1.3.0.dev2026112605 everything was OK, over
+the last three versions of the generator (each fixing one of the bugs
+above): 1,900 stage 2 programs, 700 assoc near misses, 400 assoc, 900
+missing, 600 assoc-or-missing and 300 missing-or-type mutants, and
+1,000 near misses and 1,000 mutants of all kinds (seeds 7511-7516,
+7521-7523, 7531, 7532). No new compiler bug.
+
 ## Beyond the paths
 
 Mojo features FM leaves out for now:
@@ -1720,8 +1895,9 @@ Mojo features FM leaves out for now:
   aren't fully specified, so the evaluator would have to restrict itself
   to unambiguous overload sets.
 - **More of the type system:** retroactive conformance with
-  `__extension` (e.g. `Int` to a trait), conditional conformance
-  (`where` clauses), associated types, value parameters on methods,
+  `__extension` (e.g. `Int` to a trait), `where` on value parameters
+  (`where n > 0`), associated types of associated types (`T.E0.E1`) and
+  constraints on them (`where T.E0 == A`), value parameters on methods,
   methods with two parameters of their own, parameters not inferable at
   all (`p0: V[n + 1]` needs an explicit n), and keyword and default
   arguments.
