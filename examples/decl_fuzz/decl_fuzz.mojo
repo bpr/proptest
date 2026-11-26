@@ -77,6 +77,13 @@
 # `V[Self.n + 0]`, or any `V[n]` as `V[n * 1]` or another equal
 # expression.
 #
+# A quarter of the methods, in traits and in structs, are generic, `def
+# m[U: TrN](self, p0: U, ...)`: U is inferred from the first argument,
+# or written (`x.m[S1](...)`), and a struct's implementation repeats the
+# bound. The bound mutant writes a U that doesn't conform; the sig mutant
+# may give an implementation another bound; the rename near miss calls
+# an implementation's parameter W.
+#
 # Every program terminates: each method and function has a rank, and a
 # body calls only methods and functions of lower rank; loops have constant
 # bounds. The generator also evaluates the program itself (`Program.eval`,
@@ -145,6 +152,9 @@ comptime VAL = 4
 comptime OFF = 5
 """A value parameter plus a constant, `n + c` (as the argument of a
 struct with a value parameter): tid is c (never 0), targ the PARAM n."""
+comptime HOLE = 6
+"""A generic method's own type parameter `U` not chosen yet, in its
+signature instantiated for a receiver: a pattern for `match_hole`."""
 
 # capabilities, weakest first
 comptime CAP_M = 0
@@ -280,7 +290,9 @@ comptime STAT_VALUE = 18
 comptime STAT_VALUE_CALL = 19
 """Calls of functions with a value parameter (`def gN[n: Int](p0:
 V[n])`)."""
-comptime N_STATS = 20
+comptime STAT_GENERIC_METHOD = 20
+"""Calls of generic methods (`def m[U: Tr0](self, p0: U)`)."""
+comptime N_STATS = 21
 comptime STAT_NAMES: List[String] = [
     "own",
     "required",
@@ -302,6 +314,7 @@ comptime STAT_NAMES: List[String] = [
     "ref",
     "value",
     "value_call",
+    "generic_method",
 ]
 
 # Stage 3: ill-typed mutants (DECL_FUZZ_MUTANTS=1). Each program gets one
@@ -444,7 +457,10 @@ comptime NR_VALUE_EXPR = 15
 equal expression (`V[Self.n + 0](...)`, `V[0 + Self.n]`, ...); and
 anywhere, a type with a value parameter as its argument written so
 (`V[n * 1]`, in a signature too)."""
-comptime N_NR = 16
+comptime NR_RENAME = 16
+"""A struct's implementation of a generic trait method names its type
+parameter `W` where the trait says `U`."""
+comptime N_NR = 17
 comptime NR_NAMES: List[String] = [
     "disjoint",
     "read_alias",
@@ -462,6 +478,7 @@ comptime NR_NAMES: List[String] = [
     "deinit_move",
     "ref_reinit",
     "value_expr",
+    "rename",
 ]
 comptime MARK_NEAR = "@@N@@"
 """In generated text, marks the line of the near miss."""
@@ -644,6 +661,9 @@ struct MethodDecl(Copyable):
     var has_default: Bool
     var body: Int
     """Default body (trait methods) or the body (own methods), or -1."""
+    var mbound: Int
+    """For a generic method, the bound of its own type parameter `U`
+    (PARAM 1; its first parameter has type U), else -1."""
 
 
 @fieldwise_init
@@ -701,6 +721,9 @@ struct Body(Copyable):
     var died: Bool
     """Whether its final return calls `_died()` first (a counted struct's
     `deinit self` method, with self not moved out whole)."""
+    var names: List[String]
+    """The names of the parameters in scope (a generic method's `U` may be
+    renamed)."""
 
 
 @fieldwise_init
@@ -1269,23 +1292,68 @@ struct Program(Movable):
                         out.append(m)
         return out^
 
-    def method_args(self, m: Int, recv: Int) -> List[Int]:
-        """What to substitute into m's signature for receiver type recv."""
+    def method_args(mut self, m: Int, recv: Int, u: Int = -1) -> List[Int]:
+        """What to substitute into m's signature for receiver type recv;
+        for a generic method, with u for its `U` (-1: a HOLE)."""
+        var out = List[Int]()
         if self.methods[m].trait_id >= 0:
-            return [recv]
-        ref sd = self.structs[self.methods[m].struct_id]
-        if sd.generic or sd.valued:
-            return [self.targ[recv]]
-        return []
+            out.append(recv)
+        else:
+            ref sd = self.structs[self.methods[m].struct_id]
+            if sd.generic or sd.valued:
+                out.append(self.targ[recv])
+        if self.methods[m].mbound >= 0:
+            if len(out) == 0:
+                out.append(self.int_ty)  # (PARAM 0 isn't used)
+            out.append(u if u >= 0 else self.intern(HOLE, 0, -1))
+        return out^
 
-    def method_ret(mut self, m: Int, recv: Int) -> Int:
-        var args = self.method_args(m, recv)
+    def method_ret(mut self, m: Int, recv: Int, u: Int = -1) -> Int:
+        var args = self.method_args(m, recv, u)
         if len(args) == 0:
             return self.methods[m].ret
         return self.subst(self.methods[m].ret, args)
 
-    def method_params(mut self, m: Int, recv: Int) -> List[Int]:
-        var args = self.method_args(m, recv)
+    def is_generic_method(self, m: Int) -> Bool:
+        return self.methods[m].mbound >= 0
+
+    def match_hole(self, pat: Int, ty: Int, mut assign: List[Int]) -> Bool:
+        """Whether pat, with HOLE for a generic method's `U`, is ty for
+        some U (assign[0]); everything else in pat is fixed."""
+        if self.tkind[pat] == HOLE:
+            if assign[0] < 0:
+                assign[0] = ty
+                return True
+            return assign[0] == ty
+        if pat == ty:
+            return True
+        if (
+            self.tkind[pat] == STRUCT
+            and self.tkind[ty] == STRUCT
+            and self.tid[pat] == self.tid[ty]
+            and self.targ[pat] >= 0
+            and self.targ[ty] >= 0
+        ):
+            return self.match_hole(self.targ[pat], self.targ[ty], assign)
+        return False
+
+    def method_fit(mut self, m: Int, r: Int, ty: Int, ctx: Ctx) -> Int:
+        """Whether m on a receiver of type r can return ty: -2 if not; else
+        the `U` that makes it (-1 for any conforming one, or if m isn't
+        generic)."""
+        var ret = self.method_ret(m, r)
+        var b = self.methods[m].mbound
+        if b < 0:
+            return -1 if ret == ty else -2
+        var assign: List[Int] = [-1]
+        if not self.match_hole(ret, ty, assign):
+            return -2
+        if assign[0] >= 0:
+            return assign[0] if self.conforms(assign[0], b, ctx.bounds) else -2
+        return -1 if len(self.conforming(ctx, b)) > 0 else -2
+
+    def method_params(mut self, m: Int, recv: Int, u: Int = -1) -> List[Int]:
+        var args = self.method_args(m, recv, u)
         var params = self.methods[m].params.copy()
         if len(args) == 0:
             return params^
@@ -1373,6 +1441,58 @@ struct Program(Movable):
             return own
         return self.draw_type(data, pool)
 
+    def mentions(self, ty: Int, p: Int) -> Bool:
+        """Whether type ty mentions PARAM p."""
+        var kind = self.tkind[ty]
+        if kind == PARAM:
+            return self.tid[ty] == p
+        if kind == STRUCT and self.targ[ty] >= 0:
+            return self.mentions(self.targ[ty], p)
+        return False
+
+    def draw_signature(
+        mut self,
+        mut data: ConjectureData,
+        bounds: List[Int],
+        extra: List[Int],
+        own: Int,
+        mut_often: Bool,
+        mut params: List[Int],
+        mut convs: List[Int],
+        mut mbound: Int,
+    ) raises -> Int:
+        """A method's parameters (into params and convs) and result type,
+        in a context with these bounds and extra types. A quarter of them
+        (half for the rename near miss) are generic, `[U: TrN]` (into
+        mbound): U is PARAM 1, the type of the first parameter (which Mojo
+        infers it from), and often of others and the result. Parameters
+        whose types mention U aren't `mut`, which calls would need places
+        of each U for."""
+        if data.draw(integers(0, 3)) < (2 if self.near == NR_RENAME else 1):
+            mbound = pick(data, len(self.traits))
+        var bs = bounds.copy()
+        var sig_own = own
+        if mbound >= 0:
+            if len(bs) == 0:
+                bs.append(-1)  # (PARAM 0 is a value or unused)
+            bs.append(mbound)
+        var pool = self.type_pool(bs, len(self.structs))
+        pool += extra.copy()
+        if mbound >= 0:
+            var u = self.intern(PARAM, 1, -1)
+            params.append(u)
+            convs.append(CONV_VAR if data.draw(booleans()) else CONV_READ)
+            if data.draw(booleans()):
+                sig_own = u
+        for _ in range(data.draw(integers(0, 1 if mbound >= 0 else 2))):
+            var t = self.draw_sig_type(data, pool, sig_own)
+            var c = draw_conv(data, mut_often)
+            if mbound >= 0 and c == CONV_MUT and self.mentions(t, 1):
+                c = CONV_READ
+            params.append(t)
+            convs.append(c)
+        return self.draw_sig_type(data, pool, sig_own)
+
     def draw_declarations(mut self, mut data: ConjectureData) raises:
         # mut_read and alias mutants, and disjoint near misses, need calls
         # with `mut` arguments; mut_uninit and mut_reinit, bodies with them
@@ -1425,6 +1545,7 @@ struct Program(Movable):
                         self.p0_ty,
                         data.draw(integers(0, MAX_RANK)),
                         False,
+                        -1,
                         -1,
                     )
                 )
@@ -1529,7 +1650,6 @@ struct Program(Movable):
             var lo = 0 if (
                 self.traits[t].has_k or self.traits[t].make >= 0
             ) else 1
-            var pool = self.type_pool([t], n_structs)
             for _ in range(data.draw(integers(lo, 2))):
                 var m = len(self.methods)
                 var self_conv = (
@@ -1543,9 +1663,10 @@ struct Program(Movable):
                     self_conv = CONV_DEINIT
                 var params = List[Int]()
                 var convs = List[Int]()
-                for _ in range(data.draw(integers(0, 2))):
-                    params.append(self.draw_sig_type(data, pool, self.p0_ty))
-                    convs.append(draw_conv(data, mut_often))
+                var mbound = -1
+                var ret = self.draw_signature(
+                    data, [t], [], self.p0_ty, mut_often, params, convs, mbound
+                )
                 self.methods.append(
                     MethodDecl(
                         String("m", m),
@@ -1555,12 +1676,13 @@ struct Program(Movable):
                         self_conv,
                         params^,
                         convs^,
-                        self.draw_sig_type(data, pool, self.p0_ty),
+                        ret,
                         data.draw(integers(0, MAX_RANK)),
                         # (no default body for a `deinit self` method: a
                         # counted struct's has to call `_died()`)
                         data.draw(booleans()) and self_conv != CONV_DEINIT,
                         -1,
+                        mbound,
                     )
                 )
                 self.traits[t].methods.append(m)
@@ -1570,10 +1692,10 @@ struct Program(Movable):
             var bounds = [self.structs[s].bound] if self.structs[
                 s
             ].generic else List[Int]()
-            var pool = self.type_pool(bounds, n_structs)
             var own_ty = self.self_type(s)
+            var extra = List[Int]()
             if self.structs[s].valued:
-                pool += self.value_family(s, 0)
+                extra = self.value_family(s, 0)
             for _ in range(data.draw(integers(0, 2))):
                 var m = len(self.methods)
                 var self_conv = (
@@ -1587,9 +1709,17 @@ struct Program(Movable):
                     self_conv = CONV_DEINIT
                 var params = List[Int]()
                 var convs = List[Int]()
-                for _ in range(data.draw(integers(0, 2))):
-                    params.append(self.draw_sig_type(data, pool, own_ty))
-                    convs.append(draw_conv(data, mut_often))
+                var mbound = -1
+                var ret = self.draw_signature(
+                    data,
+                    bounds,
+                    extra,
+                    own_ty,
+                    mut_often,
+                    params,
+                    convs,
+                    mbound,
+                )
                 self.methods.append(
                     MethodDecl(
                         String("m", m),
@@ -1599,10 +1729,11 @@ struct Program(Movable):
                         self_conv,
                         params^,
                         convs^,
-                        self.draw_sig_type(data, pool, own_ty),
+                        ret,
                         data.draw(integers(0, MAX_RANK)),
                         False,
                         -1,
+                        mbound,
                     )
                 )
                 self.structs[s].own.append(m)
@@ -2022,22 +2153,31 @@ struct Program(Movable):
             var s = c // 64
             var i = c % 64
             var md = self.methods[self.structs[s].impl_methods[i]].copy()
-            var self_ty = self.self_type(s)
+            var args = self.impl_args(s, self.structs[s].impl_methods[i])
             # concrete types, which substitution leaves alone
             var concrete: List[Int] = [self.int_ty, self.res_ty]
             for x in range(len(self.structs)):
                 concrete += self.concrete_types(x)
             # what to change: the result type, the convention of `self`,
-            # or a parameter's type or convention
+            # a parameter's type or convention, or a generic method's bound
+            # (another trait, stricter or not, is an error)
             var changes: List[Int] = [0]
             if not md.is_static:
                 if md.self_conv == CONV_READ:
                     changes.append(1)
                 if len(md.params) > 0:
                     changes += [2, 3]
+            if md.mbound >= 0 and len(self.traits) > 1:
+                changes += [4, 4]
             var change = changes[pick(data, len(changes))]
-            if change == 0:
-                var old = self.subst(md.ret, [self_ty])
+            if change == 4:
+                var others = List[Int]()
+                for t in range(len(self.traits)):
+                    if t != md.mbound:
+                        others.append(t)
+                md.mbound = others[pick(data, len(others))]
+            elif change == 0:
+                var old = self.subst(md.ret, args)
                 var others = List[Int]()
                 for t in concrete:
                     if t != old:
@@ -2048,7 +2188,7 @@ struct Program(Movable):
             else:
                 var j = pick(data, len(md.params))
                 if change == 2:
-                    var old = self.subst(md.params[j], [self_ty])
+                    var old = self.subst(md.params[j], args)
                     var others = List[Int]()
                     for t in concrete:
                         if t != old:
@@ -2104,8 +2244,13 @@ struct Program(Movable):
     def trait_ctx(mut self, m: Int) -> Ctx:
         var t = self.methods[m].trait_id
         var rank = self.methods[m].rank
-        var pool = self.type_pool([t], len(self.structs))
-        var ctx = Ctx([t], ["Self"], rank, -1, pool^)
+        var bounds: List[Int] = [t]
+        var names: List[String] = ["Self"]
+        if self.is_generic_method(m):
+            bounds.append(self.methods[m].mbound)
+            names.append("U")
+        var pool = self.type_pool(bounds, len(self.structs))
+        var ctx = Ctx(bounds^, names^, rank, -1, pool^)
         ctx.push("self", self.p0_ty, kind_of_conv(self.methods[m].self_conv))
         self.push_params(
             ctx, self.methods[m].params, self.methods[m].convs, "p"
@@ -2125,15 +2270,31 @@ struct Program(Movable):
         var generic = self.structs[s].generic
         var bounds = [self.structs[s].bound] if generic else List[Int]()
         var rank = self.methods[m].rank
-        var pool = self.type_pool(bounds, len(self.structs))
         var valued = self.structs[s].valued
+        var names = ["Self.T"] if generic else (
+            ["Self.n"] if valued else List[String]()
+        )
+        if self.is_generic_method(m):
+            # U is PARAM 1 (-1: PARAM 0 is a value or unused); an
+            # implementation of a trait's may call it W (a rename near
+            # miss)
+            if len(bounds) == 0:
+                bounds.append(-1)
+                if not valued:
+                    names.append("_")
+            bounds.append(self.methods[m].mbound)
+            var rename = self.methods[m].trait_id >= 0 and self.near_chance(
+                data, NR_RENAME
+            )
+            names.append("W" if rename else "U")
+            if rename:
+                self.near_made = True
+        var pool = self.type_pool(bounds, len(self.structs))
         if valued:
             pool += self.value_family(s, 0)
         var ctx = Ctx(
             bounds^,
-            ["Self.T"] if generic else (
-                ["Self.n"] if valued else List[String]()
-            ),
+            names^,
             rank,
             self_ty if data.draw(booleans()) else -1,
             pool^,
@@ -2143,7 +2304,7 @@ struct Program(Movable):
             ctx.push("self", self_ty, kind_of_conv(self.methods[m].self_conv))
         var params = self.methods[m].params.copy()
         if self.methods[m].trait_id >= 0:
-            params = self.subst_all(params, [self_ty])
+            params = self.subst_all(params, self.impl_args(s, m))
         self.push_params(
             ctx,
             params,
@@ -2158,8 +2319,16 @@ struct Program(Movable):
         """Method m's result type in struct s."""
         if self.methods[m].trait_id < 0:
             return self.methods[m].ret
-        var self_ty = self.self_type(s)
-        return self.subst(self.methods[m].ret, [self_ty])
+        var args = self.impl_args(s, m)
+        return self.subst(self.methods[m].ret, args)
+
+    def impl_args(mut self, s: Int, m: Int) -> List[Int]:
+        """What to substitute into trait method m's signature in struct s's
+        implementation: Self, and U (PARAM 1) for itself."""
+        var out: List[Int] = [self.self_type(s)]
+        if self.is_generic_method(m):
+            out.append(self.intern(PARAM, 1, -1))
+        return out^
 
     def gen_body(
         mut self,
@@ -2197,7 +2366,9 @@ struct Program(Movable):
             )
             ctx.push(name^, self.int_ty, V_OWNED)
             r = self.checksum(ctx)
-        self.bodies.append(Body(stmts^, r, ctx.self_print, self.died))
+        self.bodies.append(
+            Body(stmts^, r, ctx.self_print, self.died, ctx.param_names.copy())
+        )
         return len(self.bodies) - 1
 
     def is_deinit_self(self, v: Int) -> Bool:
@@ -2632,6 +2803,7 @@ struct Program(Movable):
                 var conv = self.methods[m].self_conv
                 if (
                     self.methods[m].is_static
+                    or self.is_generic_method(m)
                     or not (
                         conv == CONV_READ or (disjoint and conv == CONV_MUT)
                     )
@@ -4242,6 +4414,7 @@ struct Program(Movable):
             for m in self.methods_on(r, ctx.bounds):
                 if (
                     self.has_mut(m)
+                    and not self.is_generic_method(m)
                     and self.methods[m].rank < ctx.rank
                     and self.callable_here(ctx, m, r, True)
                 ):
@@ -4560,7 +4733,7 @@ struct Program(Movable):
                 for m in self.methods_on(r, ctx.bounds):
                     if (
                         self.methods[m].rank < ctx.rank
-                        and self.method_ret(m, r) == ty
+                        and self.method_fit(m, r, ty, ctx) > -2
                         and self.callable_here(ctx, m, r, stmt_root)
                     ):
                         meth_recv.append(r)
@@ -4887,6 +5060,26 @@ struct Program(Movable):
                     name = self.methods[others[pick(data, len(others))]].name
                     self.mutated = True
                     wrong = True
+            # a generic method's `U`: what the result type fixes, or any
+            # conforming type; MU_BOUND: one that doesn't conform
+            var u = -1
+            var bad_u = -1
+            var b = self.methods[m].mbound
+            if b >= 0:
+                u = self.method_fit(m, r, ty, ctx)
+                if u < 0:
+                    var ok = self.conforming(ctx, b)
+                    u = ok[pick(data, len(ok))]
+                if self.wants(MU_BOUND):
+                    var bad = List[Int]()
+                    for t in ctx.pool:
+                        if not self.conforms(t, b, ctx.bounds):
+                            bad.append(t)
+                    if len(bad) > 0 and self.chance(data, MU_BOUND):
+                        bad_u = bad[pick(data, len(bad))]
+                        self.mutated = True
+                        wrong = True
+            var mutated_before = self.mutated
             var kids = List[Int]()
             if self.methods[m].self_conv == CONV_MUT:
                 kids.append(self.take_place(data, ctx, r, True))
@@ -4895,19 +5088,22 @@ struct Program(Movable):
                 kids.append(self.gen(data, ctx, r, sub, P_OWNED))
             else:
                 kids.append(self.gen(data, ctx, r, sub, P_READ))
-            var params = self.method_params(m, r)
+            var params = self.method_params(m, r, u)
             var convs = self.methods[m].convs.copy()
             var mut_call = self.has_mut(m)
             kids += self.gen_args(data, ctx, params, convs, half, mut_call)
-            var text = String(
-                self.exprs[kids[0]].text,
-                ".",
-                name,
-                "(",
-                self.args_text(kids, 1),
-                ")",
-            )
-            var e = self.add(E_METHOD, m, ty, kids^, [], text^)
+            var text = String(self.exprs[kids[0]].text, ".", name)
+            if b >= 0:
+                # explicit half the time, and always when an argument of
+                # another type might change what U is inferred to be
+                var forced = bad_u >= 0 or (self.mutated and not mutated_before)
+                if forced or data.draw(booleans()):
+                    text += String(
+                        "[", self.cty(bad_u if bad_u >= 0 else u, ctx), "]"
+                    )
+            text += String("(", self.args_text(kids, 1), ")")
+            var tys = [u] if b >= 0 else List[Int]()
+            var e = self.add(E_METHOD, m, ty, kids^, tys^, text^)
             return self.mark(e) if wrong else e
 
         if rule == R_VALN:  # a value parameter
@@ -5146,7 +5342,10 @@ struct Program(Movable):
                 self.stats[STAT_DEINIT] += 1
                 convs[0] = CONV_VAR  # (the receiver is passed owned)
             convs += self.methods[a].convs.copy()
-            return self.call(a, -1, recv_ty, kids, convs, frame, targs, [])
+            var m_targs = self.subst_all(self.exprs[e].tys.copy(), targs)
+            if len(m_targs) > 0:
+                self.stats[STAT_GENERIC_METHOD] += 1
+            return self.call(a, -1, recv_ty, kids, convs, frame, targs, m_targs)
         if kind == E_STATIC:
             var ty = self.subst(self.exprs[e].tys[0], targs)
             return self.call(a, -1, ty, kids, [CONV_READ], frame, targs, [])
@@ -5277,9 +5476,10 @@ struct Program(Movable):
         targs: List[Int],
         f_targs: List[Int],
     ) raises -> Int:
-        """Calls method m (receiver type recv_ty) or function f (type
-        arguments f_targs): evaluates the arguments in order (in the
-        caller's targs), runs the body, then writes the `mut` ones back."""
+        """Calls method m (receiver type recv_ty) or function f, with type
+        arguments f_targs (a generic method's U): evaluates the arguments
+        in order (in the caller's targs), runs the body, then writes the
+        `mut` ones back."""
         var callee = List[Int]()
         var has_mut = False
         var moved = List[Int]()
@@ -5296,7 +5496,7 @@ struct Program(Movable):
         if f >= 0:
             result = self.run_body(self.fns[f].body, callee, f_targs)
         else:
-            result = self.call_method(m, recv_ty, callee)
+            result = self.call_method(m, recv_ty, callee, f_targs)
         if has_mut:
             self.stats[STAT_MUT_CALL] += 1
             for i in range(len(args)):
@@ -5390,16 +5590,25 @@ struct Program(Movable):
         return SIG_NONE
 
     def call_method(
-        mut self, m: Int, recv_ty: Int, mut frame: List[Int]
+        mut self,
+        m: Int,
+        recv_ty: Int,
+        mut frame: List[Int],
+        m_targs: List[Int] = [],
     ) raises -> Int:
         """Static dispatch on the receiver's type, resolved: the struct's
-        own body, its implementation, or the trait's default."""
+        own body, its implementation, or the trait's default. m_targs is
+        a generic method's [U]."""
         if self.tkind[recv_ty] != STRUCT:
             raise Error("evaluator: receiver type not resolved")
         var s = self.tid[recv_ty]
         var targs = List[Int]()
         if self.structs[s].generic or self.structs[s].valued:
             targs.append(self.targ[recv_ty])
+        if len(m_targs) > 0:
+            if len(targs) == 0:
+                targs.append(self.int_ty)  # (PARAM 0 isn't used)
+            targs += m_targs.copy()
         if self.methods[m].struct_id >= 0:
             self.stats[STAT_OWN] += 1
             return self.run_body(self.methods[m].body, frame, targs)
@@ -5412,7 +5621,9 @@ struct Program(Movable):
             ] += 1
             return self.run_body(self.structs[s].impl_bodies[i], frame, targs)
         self.stats[STAT_DEFAULT] += 1
-        return self.run_body(self.methods[m].body, frame, [recv_ty])
+        var d_targs: List[Int] = [recv_ty]
+        d_targs += m_targs.copy()
+        return self.run_body(self.methods[m].body, frame, d_targs)
 
     def k_value(mut self, ty: Int, t: Int) raises -> Int:
         var s = self.tid[ty]
@@ -5536,13 +5747,13 @@ struct Program(Movable):
                 ":\n",
             )
         var prefixes = materialize[CONV_PREFIX]()
-        var s = String(
-            "    def ",
-            self.methods[m].name,
-            "(",
-            prefixes[self.methods[m].self_conv],
-            "self",
-        )
+        var s = String("    def ", self.methods[m].name)
+        var renamed = False
+        if self.is_generic_method(m):
+            var u = names[1] if len(names) > 1 else String("U")
+            renamed = u != "U"
+            s += String("[", u, ": Tr", self.methods[m].mbound, "]")
+        s += String("(", prefixes[self.methods[m].self_conv], "self")
         for i in range(len(params)):
             s += String(
                 ", ",
@@ -5552,7 +5763,10 @@ struct Program(Movable):
                 ": ",
                 self.ty_str(params[i], names, self_print),
             )
-        s += String(") -> ", self.ty_str(ret, names, self_print), ":\n")
+        s += String(") -> ", self.ty_str(ret, names, self_print), ":")
+        if renamed:
+            s += MARK_NEAR
+        s += "\n"
         return s^
 
     def counted_text(self, st: Int, names: List[String]) -> String:
@@ -5577,7 +5791,7 @@ struct Program(Movable):
 
     def declarations_text(mut self) -> String:
         var s = String()
-        var self_names: List[String] = ["Self"]
+        var self_names: List[String] = ["Self", "U"]
         var cap_names = materialize[CAP_NAMES]()
         for t in range(len(self.traits)):
             s += String("trait Tr", t, "(")
@@ -5674,13 +5888,16 @@ struct Program(Movable):
             for i in range(len(self.structs[st].impl_methods)):
                 var m = self.structs[st].impl_methods[i]
                 var b = self.structs[st].impl_bodies[i]
-                var params = self.subst_all(
-                    self.methods[m].params.copy(), [self_ty]
-                )
-                var ret = self.subst(self.methods[m].ret, [self_ty])
+                var args = self.impl_args(st, m)
+                var params = self.subst_all(self.methods[m].params.copy(), args)
+                var ret = self.subst(self.methods[m].ret, args)
                 s += "\n"
                 var sig = self.sig_text(
-                    m, params, ret, names, self.bodies[b].self_print
+                    m,
+                    params,
+                    ret,
+                    self.bodies[b].names,
+                    self.bodies[b].self_print,
                 )
                 if marked and i == self.mark_impl:
                     sig = sig.replace("\n", String(MARK, "\n"))
@@ -5693,7 +5910,7 @@ struct Program(Movable):
                     m,
                     self.methods[m].params,
                     self.methods[m].ret,
-                    names,
+                    self.bodies[b].names,
                     self.bodies[b].self_print,
                 )
                 s += self.body_text(b, "        ")

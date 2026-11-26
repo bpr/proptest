@@ -1662,6 +1662,54 @@ stage 2 programs, 1,000 value_expr near misses and 1,000 value mutants
 mutants of all kinds (seeds 7214, 7215). No new compiler bug: Mojo
 folded every `(m - 1) + 1`, and inferred every n.
 
+## Generic methods
+
+A method can have type parameters of its own, in a trait or a struct:
+`def m1[U: Tr0](self, p0: U, p1: Int) -> U`. Probes on the nightly:
+- Calls infer U from the arguments (`s.m1(S0(1), 2)`) or write it
+  (`s.m1[S0](S0(1), 2)`), also through a type parameter (`x.m1[S0](...)`
+  with `x: T`, `T: Tr1`), and at compile time.
+- A struct's implementation of a generic trait method must repeat the
+  bound exactly. A stricter bound (`U: Tr2` for `U: Tr0`, Tr2 refining
+  Tr0) or a looser one is "'S0' does not implement all requirements for
+  'Tr1'". Renaming the parameter (`[V: Tr0]`) is fine.
+- A type argument that doesn't conform is "'m1' parameter 'U' has 'Tr0'
+  type, but value has type 'AnyStruct[B[S0]]'".
+
+In FM a quarter of the methods that aren't static, in traits and structs
+(half for the rename near miss), take `[U: TrN]` with any trait N. U is
+PARAM 1 in every context: in a trait, PARAM 0 is Self; in a generic
+struct, `Self.T`; in a struct with a value parameter, `Self.n`; in other
+structs PARAM 0 is unused (its bound is -1, like a value parameter's,
+so the pool leaves it out). The first parameter has type U, so that
+Mojo can infer it, and the other parameters and the result are often U
+too. Parameters whose types mention U are never `mut`.
+
+A call's U comes from the result type wanted. The method's signature,
+instantiated for the receiver, has a new kind HOLE where U is, and
+`match_hole` matches it against the type wanted (everything else in the
+signature is fixed, unlike in `unify`, where a function's parameters are
+variables). If nothing fixes U it's drawn from the types that conform to
+the bound. The call writes `[U]` half the time, and always when a mutant
+changed an argument's type. The evaluator adds U to the callee's type
+arguments (`[Self, U]`, `[T, U]`, or `[_, U]`).
+
+| Kind | Construct | Mojo's error, or why it's valid |
+|---|---|---|
+| `bound` | also `x.m[X](...)` with X not conforming to m's bound | parameter 'U' has 'TrN' type, but value has type |
+| `sig` | also an implementation of a generic method with another trait as its bound | does not implement all requirements |
+| near `rename` | an implementation of a generic trait method names its parameter W | the name isn't part of the signature |
+
+In 1,000 stage 2 programs (seed 7311), 139 called a generic method
+while running, 8,580 times in all. Of 200 sig mutants, 21 were on a
+generic method, and of 200 bound mutants, 43 (seed 7303).
+
+**Validation.** On nightly 1.3.0.dev2026112505 everything was OK: 1,300
+stage 2 programs, 600 rename near misses, 200 sig, 200 bound and 400
+bound-or-sig mutants (seeds 7301-7304, 7311, 7312, 7316), and 1,000 near
+misses and 1,000 mutants of all kinds (seeds 7314, 7315). No new
+compiler bug.
+
 ## Beyond the paths
 
 Mojo features FM leaves out for now:
@@ -1673,8 +1721,8 @@ Mojo features FM leaves out for now:
   to unambiguous overload sets.
 - **More of the type system:** retroactive conformance with
   `__extension` (e.g. `Int` to a trait), conditional conformance
-  (`where` clauses), associated types, generic methods (and value
-  parameters on methods), parameters inferred from a field of an argument
-  or not inferable at all (`p0: V[n + 1]` needs an explicit n), and
-  keyword and default arguments.
+  (`where` clauses), associated types, value parameters on methods,
+  methods with two parameters of their own, parameters not inferable at
+  all (`p0: V[n + 1]` needs an explicit n), and keyword and default
+  arguments.
 - **`Variant` and `isa`:** the counterpart of FJ's downcasts.
