@@ -55,6 +55,14 @@
 # copy or a new value); a counted struct's call `_died()` before each
 # return, since `__deinit__` doesn't run. The deinit near misses move a
 # field out of self, or self itself, at the end of one and leave it moved.
+# Half of the fields have an accessor `def fK_ref(ref self) ->
+# ref[self.fK] T`, and blocks declare `ref rN = <place>` bindings: both
+# are other spellings of a place the generator tracks (`spell`), used
+# only where the place itself would be, and never moved; the evaluator
+# ignores the difference. The ref mutants declare an accessor with the
+# wrong origin, move through a ref, or assign through a temporary's
+# accessor; the ref_reinit near miss uses a binding after its origin is
+# moved and reinitialized.
 #
 # Every program terminates: each method and function has a rank, and a
 # body calls only methods and functions of lower rank; loops have constant
@@ -182,6 +190,9 @@ comptime S_BREAK = 7
 """`break`, the last statement of a branch of an `if` in a loop."""
 comptime S_CONTINUE = 8
 """`continue`, likewise."""
+comptime S_REF = 9
+"""`ref rN = <place>`: a binding that is another spelling of the place
+(the evaluator ignores it)."""
 
 # what executing a statement did, for the evaluator
 comptime SIG_NONE = 0
@@ -239,7 +250,10 @@ comptime STAT_BREAK = 15
 """`break` and `continue`."""
 comptime STAT_DEINIT = 16
 """Calls of `deinit self` methods."""
-comptime N_STATS = 17
+comptime STAT_REF = 17
+"""Places evaluated that are spelled through a `ref`: a binding or an
+accessor."""
+comptime N_STATS = 18
 comptime STAT_NAMES: List[String] = [
     "own",
     "required",
@@ -258,6 +272,7 @@ comptime STAT_NAMES: List[String] = [
     "return",
     "break",
     "deinit",
+    "ref",
 ]
 
 # Stage 3: ill-typed mutants (DECL_FUZZ_MUTANTS=1). Each program gets one
@@ -306,7 +321,15 @@ the loop."""
 comptime MU_PARTIAL_USE = 18
 """A field moved out (`var v = x.f^`), then a use of x or x.f before the
 field is reassigned."""
-comptime N_MU = 19
+comptime MU_REF_ORIGIN = 19
+"""A field accessor declared with another origin (`ref[self]`, or another
+field's) than the field it returns."""
+comptime MU_REF_MOVE = 20
+"""`^` on a place spelled through a `ref` (`rN^`, `x.f0_ref()^`)."""
+comptime MU_REF_RVALUE = 21
+"""An assignment through an accessor of a temporary (`T(...).f0_ref() =
+e`), which is immutable."""
+comptime N_MU = 22
 comptime MU_NAMES: List[String] = [
     "type",
     "use_moved",
@@ -327,6 +350,9 @@ comptime MU_NAMES: List[String] = [
     "ret_uninit",
     "break_moved",
     "partial_use",
+    "ref_origin",
+    "ref_move",
+    "ref_rvalue",
 ]
 comptime MU_ODDS = 6
 """Each chance to apply the mutation is taken 1 time in MU_ODDS."""
@@ -375,7 +401,10 @@ reassigned (an error in any other method)."""
 comptime NR_DEINIT_MOVE = 13
 """At the end of a `deinit self` method, self moved out whole (`var v =
 self^`) and not reassigned (an error for a `mut` argument)."""
-comptime N_NR = 14
+comptime NR_REF_REINIT = 14
+"""`ref rN = x` (or a field of x), x moved and reinitialized, then a use
+of rN: the binding is to the place, not to the value."""
+comptime N_NR = 15
 comptime NR_NAMES: List[String] = [
     "disjoint",
     "read_alias",
@@ -391,6 +420,7 @@ comptime NR_NAMES: List[String] = [
     "partial_move",
     "deinit_drop",
     "deinit_move",
+    "ref_reinit",
 ]
 comptime MARK_NEAR = "@@N@@"
 """In generated text, marks the line of the near miss."""
@@ -599,6 +629,9 @@ struct StructDecl(Copyable):
     var counted: Bool
     """Whether its constructors and `__deinit__` are its own, counting
     its values in the ledger (only when `Movable` or `Copyable`)."""
+    var refs: List[Bool]
+    """Per field, whether it has an accessor `def fK_ref(ref self) ->
+    ref[self.fK] T`."""
 
 
 @fieldwise_init
@@ -713,8 +746,17 @@ struct Ctx(Copyable):
     """Inside statements drawn while a field is moved out (no early exit
     there: it would reassign the variable whole)."""
     var region_loops: Int
-    """in_loop where those statements start, or -1: a loop there gets no
+    """`in_loop` where those statements start, or -1: a loop there gets no
     loop inside it (the workaround in `partial_stmts`)."""
+    var ref_names: List[String]
+    """The `ref` bindings in scope: each one's name..."""
+    var ref_var: List[Int]
+    """...the variable it's a place in..."""
+    var ref_field: List[Int]
+    """...the field of it (-1 for the whole variable)..."""
+    var ref_depth: List[Int]
+    """...and the block depth of its declaration (it goes out of scope at
+    the end of that block)."""
 
     def __init__(
         out self,
@@ -750,6 +792,10 @@ struct Ctx(Copyable):
         self.break_var = -1
         self.no_exit = 0
         self.region_loops = -1
+        self.ref_names = []
+        self.ref_var = []
+        self.ref_field = []
+        self.ref_depth = []
 
     def push(mut self, var name: String, ty: Int, kind: Int):
         self.names.append(name^)
@@ -760,7 +806,21 @@ struct Ctx(Copyable):
         self.touched.append(False)
         self.excl.append(False)
 
+    def drop_refs(mut self, depth: Int, n: Int):
+        """Ends the scope of the bindings declared at depth or deeper, or
+        to a variable from n on."""
+        var i = 0
+        while i < len(self.ref_names):
+            if self.ref_depth[i] >= depth or self.ref_var[i] >= n:
+                _ = self.ref_names.pop(i)
+                _ = self.ref_var.pop(i)
+                _ = self.ref_field.pop(i)
+                _ = self.ref_depth.pop(i)
+            else:
+                i += 1
+
     def truncate(mut self, n: Int):
+        self.drop_refs(Int.MAX, n)
         while len(self.names) > n:
             _ = self.names.pop()
             _ = self.types.pop()
@@ -869,6 +929,11 @@ struct Program(Movable):
     var died: Bool
     """...and a counted struct's: its returns call `_died()`, since the
     struct's `__deinit__` doesn't run."""
+    var bad_ref: Int
+    """For MU_REF_ORIGIN, the accessor with the wrong origin (struct * 64 +
+    field), or -1..."""
+    var bad_origin: String
+    """...and the origin it's declared with."""
     var keep_dead: Int
     """The `mut` argument a mut_uninit mutant left moved (blocks don't
     reinitialize it, and the body's return is marked), or -1."""
@@ -913,6 +978,8 @@ struct Program(Movable):
         self.deinit_body = False
         self.died = False
         self.keep_dead = -1
+        self.bad_ref = -1
+        self.bad_origin = String()
         self.ret_value = -1
         self.mark_struct = -1
         self.mark_fields = False
@@ -1255,6 +1322,9 @@ struct Program(Movable):
                         source = sources[pick(data, len(sources))]
                 k_sources.append(source)
             var counted = data.draw(booleans())
+            var refs = List[Bool]()
+            for _ in range(len(fields)):
+                refs.append(data.draw(booleans()))
             self.structs.append(
                 StructDecl(
                     String("B" if generic else "S", s),
@@ -1270,6 +1340,7 @@ struct Program(Movable):
                     k_values^,
                     k_sources^,
                     counted,
+                    refs^,
                 )
             )
 
@@ -1658,8 +1729,28 @@ struct Program(Movable):
 
     def mutate_declarations(mut self, mut data: ConjectureData) raises:
         """The mutations of declarations, made after the bodies are drawn:
-        MU_MISSING, MU_SIG and MU_CAP."""
+        MU_REF_ORIGIN, MU_MISSING, MU_SIG and MU_CAP."""
         var kind = self.mutant
+        if kind == MU_REF_ORIGIN:
+            # (struct * 64 + field) of an accessor; its origin becomes
+            # `self` or another field
+            var cands = List[Int]()
+            for st in range(len(self.structs)):
+                for f in range(len(self.structs[st].refs)):
+                    if self.structs[st].refs[f]:
+                        cands.append(st * 64 + f)
+            if len(cands) == 0:
+                return
+            self.bad_ref = cands[pick(data, len(cands))]
+            var f = self.bad_ref % 64
+            var n = len(self.structs[self.bad_ref // 64].fields)
+            var origins: List[String] = ["self"]
+            for g in range(n):
+                if g != f:
+                    origins.append(String("self.f", g))
+            self.bad_origin = origins[pick(data, len(origins))]
+            self.mutated = True
+            return
         if kind == MU_MISSING:
             # (struct, index, 0 for a method or 1 for a constant)
             var cands = List[Int]()
@@ -2082,6 +2173,7 @@ struct Program(Movable):
         var moved = -1
         var to_use = -1  # a variable moved for a use_moved mutant
         var to_reinit = -1  # a variable moved for a reinit near miss
+        var near_ref = -1  # (for ref_reinit, the binding to use after it)
         var n = data.draw(integers(0, n_max))
         var plan_at = -1  # (before which statement the plan acts)
         if keep_moved >= 0 or reinit_in >= 0:
@@ -2096,9 +2188,28 @@ struct Program(Movable):
                 var v = setup[pick(data, len(setup))]
                 out.append(self.move_stmt(ctx, v))
                 ctx.move_depth[v] = ctx.depth
+            if data.draw(integers(0, MU_ODDS - 1)) == 0:
+                var places = self.ref_places(ctx)
+                if len(places) > 0:
+                    var p = places[pick(data, len(places))]
+                    out.append(self.ref_stmt(data, ctx, p // 64, p % 64 - 1))
             if to_reinit >= 0 and data.draw(booleans()):
-                out += self.reinit_stmts(data, ctx, to_reinit)
+                out += self.reinit_stmts(data, ctx, to_reinit, near_ref)
                 to_reinit = -1
+                near_ref = -1
+            if to_reinit < 0 and self.wants_near(NR_REF_REINIT):
+                # `ref rN = x` (or x.fK), x moved, reinitialized later in
+                # the block, then rN used
+                var owned = self.owned_vars(ctx, len(ctx.names))
+                if len(owned) > 0 and self.near_chance(data, NR_REF_REINIT):
+                    to_reinit = owned[pick(data, len(owned))]
+                    var nf = len(self.fields_of(ctx.types[to_reinit]))
+                    var f = data.draw(integers(-1, nf - 1))
+                    var rs = self.ref_stmt(data, ctx, to_reinit, f)
+                    _ = self.mark_near(self.stmts[rs].e)
+                    near_ref = len(ctx.ref_names) - 1
+                    out.append(rs)
+                    out.append(self.move_stmt(ctx, to_reinit))
             if to_reinit < 0 and self.wants_near(NR_REINIT):
                 # move a variable (in a loop, perhaps an outer one), and
                 # reinitialize it later in the block
@@ -2173,7 +2284,7 @@ struct Program(Movable):
                 var dead = self.moved_vars(ctx)
                 if len(dead) > 0 and self.chance(data, MU_USE_MOVED):
                     var v = dead[pick(data, len(dead))]
-                    var e = self.mark(self.place_expr(ctx, v, -1))
+                    var e = self.mark(self.spell(data, ctx, v, -1))
                     out.append(
                         self.add_stmt(Stmt(S_USE, -1, e, -1, 0, [], [], ""))
                     )
@@ -2189,11 +2300,11 @@ struct Program(Movable):
                 self.mutated = True
                 self.loop_mark = ctx.depth
         if to_reinit >= 0:
-            out += self.reinit_stmts(data, ctx, to_reinit)
+            out += self.reinit_stmts(data, ctx, to_reinit, near_ref)
         if to_use >= 0 and self.wants(MU_USE_MOVED):
             # no chance was taken after the move
             self.chances += 1
-            var e = self.mark(self.place_expr(ctx, to_use, -1))
+            var e = self.mark(self.spell(data, ctx, to_use, -1))
             out.append(self.add_stmt(Stmt(S_USE, -1, e, -1, 0, [], [], "")))
         if exit >= 0:
             if exit == S_RETURN:
@@ -2205,6 +2316,8 @@ struct Program(Movable):
             for v in range(n_outer):
                 ctx.live[v] = live_at_start[v]
                 ctx.move_depth[v] = depth_at_start[v]
+            if ctx.depth > 0:
+                ctx.drop_refs(ctx.depth, n_outer)
             ctx.truncate(n_outer)
             return out^
         if ctx.depth > 0:
@@ -2222,6 +2335,7 @@ struct Program(Movable):
                 ):
                     out.append(self.gen_reinit(data, ctx, v))
             ctx.no_move -= Int(loop)
+            ctx.drop_refs(ctx.depth, n_outer)
             ctx.truncate(n_outer)
         return out^
 
@@ -2558,14 +2672,20 @@ struct Program(Movable):
             return out^
 
     def reinit_stmts(
-        mut self, mut data: ConjectureData, mut ctx: Ctx, v: Int
+        mut self, mut data: ConjectureData, mut ctx: Ctx, v: Int, b: Int
     ) raises -> List[Int]:
         """For a reinit near miss: `v = e` for the moved variable v, then a
-        use of it."""
+        use of it, or (ref_reinit) of binding b to it."""
         ctx.new_statement()
         var st = self.gen_reinit(data, ctx, v)
         _ = self.mark_near(self.stmts[st].target)
-        var use = self.place_expr(ctx, v, -1)
+        var use: Int
+        if b >= 0:
+            use = self.place_expr(ctx, v, ctx.ref_field[b])
+            self.exprs[use].text = String(MARK_NEAR, ctx.ref_names[b])
+            self.exprs[use].tys = [1]
+        else:
+            use = self.place_expr(ctx, v, -1)
         return [st, self.add_stmt(Stmt(S_USE, -1, use, -1, 0, [], [], ""))]
 
     def returning_end(
@@ -3201,6 +3321,75 @@ struct Program(Movable):
         var text = String(ctx.names[v], ".", self.field_name(ctx.types[v], f))
         return self.add(E_FIELD, f, fty, [var_e], [], text^)
 
+    def ref_stmt(
+        mut self, mut data: ConjectureData, mut ctx: Ctx, v: Int, f: Int
+    ) raises -> Int:
+        """`ref rN = <the place v or v.f<f>>`, in scope until the end of the
+        block."""
+        ctx.new_statement()
+        var e = self.spell(data, ctx, v, f)
+        var name = String("r", ctx.counter)
+        ctx.counter += 1
+        ctx.ref_names.append(name.copy())
+        ctx.ref_var.append(v)
+        ctx.ref_field.append(f)
+        ctx.ref_depth.append(ctx.depth)
+        return self.add_stmt(Stmt(S_REF, -1, e, -1, 0, [], [], name^))
+
+    def ref_places(mut self, ctx: Ctx) -> List[Int]:
+        """The places of live variables (v * 64 + f + 1) that can be bound:
+        not a read Int (an argument or loop variable), which is passed by
+        value and has no memory origin."""
+        var out = List[Int]()
+        for v in range(len(ctx.names)):
+            if not ctx.live[v]:
+                continue
+            if ctx.kinds[v] != V_READ or ctx.types[v] != self.int_ty:
+                out.append(v * 64)
+            for f in range(len(self.fields_of(ctx.types[v]))):
+                out.append(v * 64 + f + 1)
+        return out^
+
+    def has_accessor(self, ty: Int, f: Int) -> Bool:
+        return (
+            f >= 0
+            and self.tkind[ty] == STRUCT
+            and self.structs[self.tid[ty]].refs[f]
+        )
+
+    def spell(
+        mut self, mut data: ConjectureData, ctx: Ctx, v: Int, f: Int
+    ) raises -> Int:
+        """The place `v` or `v.f<f>` (as place_expr), perhaps spelled
+        through a `ref`: an accessor `v.f<f>_ref()`, a binding to the place,
+        or a binding to v then `.f<f>` (or the accessor). Only for a live v
+        (but for a use_moved mutant), and not for a move: a `ref` names
+        the place, which Mojo checks like the variable itself."""
+        var e = self.place_expr(ctx, v, f)
+        var texts: List[String] = [self.exprs[e].text]
+        var vty = ctx.types[v]
+        var acc = self.has_accessor(vty, f)
+        if acc:
+            texts.append(String(ctx.names[v], ".f", f, "_ref()"))
+        for b in range(len(ctx.ref_names)):
+            if ctx.ref_var[b] != v:
+                continue
+            if ctx.ref_field[b] == f:
+                texts.append(ctx.ref_names[b])
+            elif ctx.ref_field[b] < 0:
+                texts.append(
+                    String(ctx.ref_names[b], ".", self.field_name(vty, f))
+                )
+                if acc:
+                    texts.append(String(ctx.ref_names[b], ".f", f, "_ref()"))
+        if len(texts) == 1:
+            return e
+        var i = pick(data, len(texts))
+        if i > 0:
+            self.exprs[e].text = texts[i]
+            self.exprs[e].tys = [1]  # (for STAT_REF)
+        return e
+
     def gen_reinit(
         mut self, mut data: ConjectureData, mut ctx: Ctx, v: Int
     ) raises -> Int:
@@ -3270,7 +3459,32 @@ struct Program(Movable):
                 var e = self.gen(
                     data, ctx, ty, BODY_SIZE - 1, P_OWNED, False, True
                 )
-                var target = self.mark(self.place_expr(ctx, v, f))
+                var target = self.mark(self.spell(data, ctx, v, f))
+                return self.add_stmt(
+                    Stmt(S_ASSIGN, target, e, -1, 0, [], [], String())
+                )
+        if self.wants(MU_REF_RVALUE):
+            # (type * 64 + field) with an accessor
+            var cands = List[Int]()
+            for t in ctx.pool:
+                var fs = self.fields_of(t)
+                for f in range(len(fs)):
+                    if self.has_accessor(t, f):
+                        cands.append(t * 64 + f)
+            if len(cands) > 0 and self.chance(data, MU_REF_RVALUE):
+                var c = cands[pick(data, len(cands))]
+                var t = c // 64
+                var f = c % 64
+                var recv = self.gen(data, ctx, t, BODY_SIZE - 2, P_OWNED)
+                if self.is_place(recv):  # (an ImplicitlyCopyable value)
+                    var text = String(self.exprs[recv].text, ".copy()")
+                    recv = self.add(E_COPY, 0, t, [recv], [], text^)
+                var fty = self.fields_of(t)[f]
+                var text = String(self.exprs[recv].text, ".f", f, "_ref()")
+                var target = self.mark(
+                    self.add(E_FIELD, f, fty, [recv], [], text^)
+                )
+                var e = self.gen_typed(data, ctx, fty, BODY_SIZE - 2, P_OWNED)
                 return self.add_stmt(
                     Stmt(S_ASSIGN, target, e, -1, 0, [], [], String())
                 )
@@ -3360,7 +3574,11 @@ struct Program(Movable):
                 # the value may read `v` but not move or mut-borrow it
                 ctx.touched[v] = True
             var e = self.gen_typed(data, ctx, ty, BODY_SIZE - 1, P_OWNED, True)
-            var target = self.place_expr(ctx, v, f)
+            # (a moved v, perhaps by e, is assigned by name: through a
+            # `ref`, it would be a use of v)
+            var target = self.spell(data, ctx, v, f) if ctx.live[
+                v
+            ] else self.place_expr(ctx, v, f)
             if f < 0:
                 ctx.live[v] = True
                 ctx.move_depth[v] = -1
@@ -3689,7 +3907,9 @@ struct Program(Movable):
                 var p = good[pick(data, len(good))]
                 ctx.touched[p // 64] = True
                 ctx.taken.append(p)
-                return self.mark_near(self.place_expr(ctx, p // 64, p % 64 - 1))
+                return self.mark_near(
+                    self.spell(data, ctx, p // 64, p % 64 - 1)
+                )
         if len(bad) > 0 and (
             # (places_for let the call go ahead for the mutant)
             len(places) == 0
@@ -3698,7 +3918,7 @@ struct Program(Movable):
             self.chances += Int(len(places) == 0)
             var p = bad[pick(data, len(bad))]
             ctx.touched[p // 64] = True
-            return self.mark(self.place_expr(ctx, p // 64, p % 64 - 1))
+            return self.mark(self.spell(data, ctx, p // 64, p % 64 - 1))
         if len(places) == 0:
             raise Error("STUCK")
         var p = places[pick(data, len(places))]
@@ -3706,7 +3926,7 @@ struct Program(Movable):
         ctx.excl[v] = True
         ctx.touched[v] = True
         ctx.taken.append(p)
-        return self.place_expr(ctx, v, p % 64 - 1)
+        return self.spell(data, ctx, v, p % 64 - 1)
 
     def callable_here(
         mut self, ctx: Ctx, m: Int, recv: Int, stmt_root: Bool
@@ -3897,7 +4117,9 @@ struct Program(Movable):
             if len(good) > 0 and self.near_chance(data, self.near):
                 var p = good[pick(data, len(good))]
                 ctx.touched[p // 64] = True
-                return self.mark_near(self.place_expr(ctx, p // 64, p % 64 - 1))
+                return self.mark_near(
+                    self.spell(data, ctx, p // 64, p % 64 - 1)
+                )
         if (
             conv == CONV_VAR
             and later
@@ -3933,7 +4155,7 @@ struct Program(Movable):
             var bad = self.alias_places(ctx, ty)
             if len(bad) > 0 and self.chance(data, MU_ALIAS):
                 var p = bad[pick(data, len(bad))]
-                return self.mark(self.place_expr(ctx, p // 64, p % 64 - 1))
+                return self.mark(self.spell(data, ctx, p // 64, p % 64 - 1))
         return self.gen_typed(
             data, ctx, ty, size, P_OWNED if conv == CONV_VAR else P_READ
         )
@@ -3970,7 +4192,8 @@ struct Program(Movable):
                 and self.chance(data, MU_USE_MOVED)
             ):
                 var v = dead[pick(data, len(dead))]
-                var e = self.place_expr(ctx, v, -1)
+                # (through a binding: a `ref` outliving its origin)
+                var e = self.spell(data, ctx, v, -1)
                 if pos == P_OWNED and cap == CAP_C:
                     var text = String(self.exprs[e].text, ".copy()")
                     e = self.add(E_COPY, 0, ty, [e], [], text^)
@@ -3994,6 +4217,37 @@ struct Program(Movable):
                 ctx.touched[v] = True
                 var text = String(ctx.names[v], "^")
                 return self.mark(self.add(E_MOVE, v, ty, [], [], text^))
+
+        if self.wants(MU_REF_MOVE) and pos == P_OWNED and kind != INT:
+            # `^` on a place spelled through a `ref`
+            var texts = List[String]()
+            for v in range(len(ctx.names)):
+                if not ctx.live[v] or ctx.excl[v]:
+                    continue
+                var vty = ctx.types[v]
+                var fs = self.fields_of(vty)
+                for f in range(len(fs)):
+                    if fs[f] == ty and self.has_accessor(vty, f):
+                        texts.append(String(ctx.names[v], ".f", f, "_ref()"))
+                for b in range(len(ctx.ref_names)):
+                    if ctx.ref_var[b] != v:
+                        continue
+                    var f = ctx.ref_field[b]
+                    if (vty if f < 0 else fs[f]) == ty:
+                        texts.append(ctx.ref_names[b])
+                    elif f < 0:
+                        for g in range(len(fs)):
+                            if fs[g] == ty:
+                                texts.append(
+                                    String(
+                                        ctx.ref_names[b],
+                                        ".",
+                                        self.field_name(vty, g),
+                                    )
+                                )
+            if len(texts) > 0 and self.chance(data, MU_REF_MOVE):
+                var text = String(texts[pick(data, len(texts))], "^")
+                return self.mark(self.add(E_LIT, 0, ty, [], [], text^))
 
         # T-Var, and fields of variables (so that `self.f0` is a ground
         # term for `Self.T`), each used as the position allows
@@ -4221,7 +4475,7 @@ struct Program(Movable):
                 and self.chance(data, MU_IMPLICIT_COPY)
             ):
                 ctx.touched[v] = True
-                return self.mark(self.place_expr(ctx, v, c.atom_fields[i]))
+                return self.mark(self.spell(data, ctx, v, c.atom_fields[i]))
             if mode == A_MOVE:
                 ctx.live[v] = False
                 ctx.move_depth[v] = ctx.depth
@@ -4230,7 +4484,7 @@ struct Program(Movable):
                     E_MOVE, v, ty, [], [], String(ctx.names[v], "^")
                 )
             ctx.touched[v] = True
-            var place = self.place_expr(ctx, v, c.atom_fields[i])
+            var place = self.spell(data, ctx, v, c.atom_fields[i])
             if mode == A_COPY:
                 var text = String(self.exprs[place].text, ".copy()")
                 return self.add(E_COPY, 0, ty, [place], [], text^)
@@ -4327,6 +4581,13 @@ struct Program(Movable):
                 self.field_name(c.field_recv[i], c.field_idx[i]),
             )
             var fe = self.add(E_FIELD, c.field_idx[i], ty, [recv], [], text^)
+            if self.has_accessor(c.field_recv[i], c.field_idx[i]) and data.draw(
+                booleans()
+            ):
+                self.exprs[fe].text = String(
+                    self.exprs[recv].text, ".f", c.field_idx[i], "_ref()"
+                )
+                self.exprs[fe].tys = [1]
             if (
                 pos == P_OWNED
                 and cap == CAP_C
@@ -4526,6 +4787,7 @@ struct Program(Movable):
         if kind == E_LIT:
             return self.new_int(a)
         if kind == E_VAR:
+            self.stats[STAT_REF] += len(self.exprs[e].tys)
             return self.read_place(e, frame)
         if kind == E_FMOVE:  # (the field is reassigned before any use)
             self.stats[STAT_MOVE] += 1
@@ -4562,6 +4824,7 @@ struct Program(Movable):
                 return self.eval(kids[2], frame, targs)
             return self.eval(kids[3], frame, targs)
         if kind == E_FIELD:
+            self.stats[STAT_REF] += len(self.exprs[e].tys)
             var v = self.eval(kids[0], frame, targs)
             return self.vkids[v][a]
         if kind == E_NEW:
@@ -4716,6 +4979,7 @@ struct Program(Movable):
         var moved = List[Int]()
         for i in range(len(args)):
             if convs[i] == CONV_MUT:
+                self.stats[STAT_REF] += len(self.exprs[args[i]].tys)
                 callee.append(self.read_place(args[i], frame))
                 has_mut = True
             else:
@@ -4773,6 +5037,7 @@ struct Program(Movable):
             frame.append(self.eval(e, frame, targs) if e >= 0 else -1)
         elif kind == S_ASSIGN:
             self.stats[STAT_ASSIGN] += 1
+            self.stats[STAT_REF] += len(self.exprs[self.stmts[s].target].tys)
             var v = self.eval(e, frame, targs)
             self.write_place(self.stmts[s].target, v, frame)
         elif kind == S_EXPR:
@@ -4789,6 +5054,8 @@ struct Program(Movable):
             self.stats[STAT_RETURN] += 1
             self.ret_value = self.eval(e, frame, targs)
             return SIG_RETURN
+        elif kind == S_REF:  # (another spelling of a place)
+            self.stats[STAT_REF] += 1
         elif kind == S_BREAK:
             self.stats[STAT_BREAK] += 1
             return SIG_BREAK
@@ -4890,6 +5157,10 @@ struct Program(Movable):
         if s.kind == S_RETURN:
             var died = String(indent, "_died()\n") if s.a == 1 else String()
             return String(died, indent, "return ", self.exprs[s.e].text, "\n")
+        if s.kind == S_REF:
+            return String(
+                indent, "ref ", s.name, " = ", self.exprs[s.e].text, "\n"
+            )
         if s.kind == S_BREAK:
             return String(indent, "break\n")
         if s.kind == S_CONTINUE:
@@ -5064,6 +5335,26 @@ struct Program(Movable):
                         "Self.T.K", self.structs[st].k_sources[i], " + "
                     )
                 s += String("(", self.structs[st].k_values[i], ")\n")
+            for f in range(len(self.structs[st].fields)):
+                if not self.structs[st].refs[f]:
+                    continue
+                var bad = self.bad_ref == st * 64 + f
+                var origin = self.bad_origin if bad else String("self.f", f)
+                var mark = MARK if bad else ""
+                s += String(
+                    "\n    def f",
+                    f,
+                    "_ref(ref self) -> ref[",
+                    origin,
+                    "] ",
+                    self.ty_str(self.structs[st].fields[f], names, -1),
+                    ":",
+                    mark,
+                    "\n        return self.f",
+                    f,
+                    mark,
+                    "\n",
+                )
             for i in range(len(self.structs[st].impl_methods)):
                 var m = self.structs[st].impl_methods[i]
                 var b = self.structs[st].impl_bodies[i]

@@ -1436,10 +1436,96 @@ nightly 1.3.0.dev2026112505, all OK:
 No compiler bugs so far: Mojo destroyed every consumed value exactly
 once, at -O0, at -O3 and at compile time.
 
+## `ref` results and bindings
+
+A method can return a reference, `-> ref[origin] T`, and `ref r = e`
+binds a name to a place. Probes on the nightly:
+- The origin must be exactly the returned place's: `def get(ref self)
+  -> ref[self] Int: return self.f1` is "cannot return reference with
+  incompatible origin: 'origin_of(self.f1)' vs 'origin_of(self)'", and
+  so is `ref[self.f2]`. `ref[self.f1]` is right.
+- With `ref self`, the result is as mutable as the receiver: through a
+  `read` argument or a temporary (`S(1, 2).get() = 5`), an assignment is
+  "expression must be mutable in assignment", and passing it `mut` is
+  "value passed to mutable argument must be mutable".
+- A binding is to the place, not to its value. After `ref r = x.get()`,
+  `x = S(5, 6)` makes r read 5. If x is moved and then reassigned, r
+  reads the new value, even when the move is in a branch. A use of r
+  while x is moved is "use of uninitialized value 'x'", and so is an
+  assignment through r, though `x = e` would be fine there. If x's
+  field `s` is moved out, a binding to `x.s.f1` is "use of uninitialized
+  value 'x.s.f1'", and one to another field is fine.
+- `r^` and `x.get()^` are "expression does not designate a value with
+  an origin": nothing moves through a ref.
+- Exclusivity is checked through refs, and precisely: `f(w, t)` with
+  `ref t = w.s` (w passed `mut`, t read) is "aliasing values passed
+  mutably ... and passed immutably", as `f(w, w.s)` is, and so is
+  `f(w, w.s_ref())`. Disjoint fields through two bindings, or two
+  accessors, are fine. (Ints passed read are copies, so they never
+  alias.)
+- Copies are as for the place itself: `var y = r` of a type that isn't
+  `ImplicitlyCopyable` is "cannot be implicitly copied", and
+  `r.copy()` is fine.
+- A read Int argument has no memory: `ref r = a` is "value of type
+  'Int' doesn't have a memory origin in 'ref' binding". Read struct
+  arguments, even `ImplicitlyCopyable` ones, and loop variables can be
+  bound.
+- Bindings work in `deinit self` methods, in generic functions and on a
+  generic struct's `Self.T` field.
+
+Since a binding names a place, FM treats `ref` as spelling. Half of the
+fields have an accessor `def fK_ref(ref self) -> ref[self.fK] T: return
+self.fK`, and before each statement of a block there is a 1 in 6 chance
+of `ref rN = <place>`, for a place of a live variable (the variable, or
+one of its fields). The binding is in scope until the end of its block.
+Where the generator would write a place of a live variable, `spell`
+may write it another way: `x.fK_ref()`, a binding to the place, or a
+binding to x followed by `.fK` or `.fK_ref()`. R_FIELD also uses an
+accessor on any receiver, half the time. This applies to reads, copies,
+`mut` arguments and receivers, assignment targets, and the near-miss
+and mutant places, but not to:
+- moves, which go through a ref by name only;
+- assignments to a moved variable;
+- the paths' reinitializations and uses.
+
+The expression stays a variable or a field to the generator and the
+evaluator. So Γ, exclusivity within a statement, the paths and the
+evaluator need no change, and the probes show that Mojo agrees: it
+checks a use through a ref as a use of the place.
+
+Mutants and near misses then come almost for free. Through a binding to
+a moved variable, a use_moved mutant is a ref used after its origin
+moved. Through a binding to a read argument, mut_read and assign_read
+mutate through an immutable ref. An alias mutant may alias through a
+binding. Three new mutants and one near miss cover the rest:
+
+| Kind | Construct | Mojo's error, or why it's valid |
+|---|---|---|
+| `ref_origin` | an accessor declared `-> ref[self]`, or another field's origin | cannot return reference with incompatible origin |
+| `ref_move` | `rN^`, `rN.fK^` or `x.fK_ref()^` in an owned position | expression does not designate a value with an origin |
+| `ref_rvalue` | `T(...).fK_ref() = e` (or a copy's, or `x^`'s) | expression must be mutable in assignment |
+| near `ref_reinit` | `ref rN = x` (or `x.fK`), `var v = x^`, `x = e`, then `_use(rN)` | the binding is to the place, which is initialized again |
+
+In 1,000 stage 2 programs (seed 5201), 597 evaluated a place spelled
+through a ref, 65,804 in all.
+
+**Validation.** At first, 26 of 60 stage 2 programs failed to build:
+`ref rN = a` on read Int arguments (the generator's mistake; see the
+last probe). After the fix, on nightly 1.3.0.dev2026112505, all OK:
+- 1,000 stage 2 programs, 400 ref_reinit near misses and 600 ref
+  mutants (seeds 5201-5203);
+- 1,000 near misses and 1,000 mutants of all kinds (seeds 5204-5205).
+
+No compiler bugs so far: through accessors and bindings, Mojo's
+initialization, mutability and exclusivity checks matched the
+generator's, and every program computed the evaluator's result.
+
 ## Beyond the paths
 
 Mojo features FM leaves out for now:
-- **More ownership:** `ref` results and origins.
+- **More ownership:** functions returning a union of origins
+  (`-> ref[a, b] T`), where the place depends on a value; `mut self`
+  accessors; refs stored in structs (`Pointer`, `Span`).
 - **Overloading and `@implicit` conversions:** Mojo's resolution rules
   aren't fully specified, so the evaluator would have to restrict itself
   to unambiguous overload sets.
