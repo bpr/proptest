@@ -62,7 +62,13 @@
 # ignores the difference. The ref mutants declare an accessor with the
 # wrong origin, move through a ref, or assign through a temporary's
 # accessor; the ref_reinit near miss uses a binding after its origin is
-# moved and reinitialized.
+# moved and reinitialized. A quarter of the other structs have a value
+# parameter (`struct V[n: Int]`), used with one or two values (`V[3]`,
+# each occurrence spelled as some expression equal to it, `V[(1 + 2)]`,
+# which Mojo folds) and read as `V[3].n` or `Self.n`, also in constants
+# (`comptime K0 = Self.n + (5)`). The value mutant writes another value
+# where one is expected; the value_expr near miss writes Self as
+# `V[Self.n + 0]` or another equal expression.
 #
 # Every program terminates: each method and function has a rank, and a
 # body calls only methods and functions of lower rank; loops have constant
@@ -126,6 +132,9 @@ comptime PARAM = 2
 """A type parameter of the context: `T`, `U`, `Self.T` or a trait's `Self`."""
 comptime RES = 3
 """`Res`, the prelude's counted resource (Copyable, one Int field `val`)."""
+comptime VAL = 4
+"""A comptime Int, the argument of a struct with a value parameter
+(`struct V[n: Int]`): tid is the value. Not a type of values."""
 
 # capabilities, weakest first
 comptime CAP_M = 0
@@ -175,6 +184,8 @@ comptime E_COPY = 10
 comptime E_MOVE = 11
 comptime E_FMOVE = 12
 """`x.f^`, a field moved out (kids: the place)."""
+comptime E_VALN = 13
+"""`V[k].n` or `Self.n`: a value parameter (tys[0] is the struct type)."""
 
 # statement kinds
 comptime S_VAR = 0
@@ -210,6 +221,7 @@ comptime R_FIELD = 5
 comptime R_METHOD = 6
 comptime R_K = 7
 comptime R_CALL = 8
+comptime R_VALN = 9
 
 # what an `if` does to one variable, for the path-dependent mutants and
 # near misses: its branches move it (it was live), or reinitialize it (it
@@ -253,7 +265,9 @@ comptime STAT_DEINIT = 16
 comptime STAT_REF = 17
 """Places evaluated that are spelled through a `ref`: a binding or an
 accessor."""
-comptime N_STATS = 18
+comptime STAT_VALUE = 18
+"""Value parameters read (`Self.n`, `V[k].n`, `Self.n` in a constant)."""
+comptime N_STATS = 19
 comptime STAT_NAMES: List[String] = [
     "own",
     "required",
@@ -273,6 +287,7 @@ comptime STAT_NAMES: List[String] = [
     "break",
     "deinit",
     "ref",
+    "value",
 ]
 
 # Stage 3: ill-typed mutants (DECL_FUZZ_MUTANTS=1). Each program gets one
@@ -329,7 +344,11 @@ comptime MU_REF_MOVE = 20
 comptime MU_REF_RVALUE = 21
 """An assignment through an accessor of a temporary (`T(...).f0_ref() =
 e`), which is immutable."""
-comptime N_MU = 22
+comptime MU_VALUE = 22
+"""A value of a struct with a value parameter, with another value
+(`V[4](...)` or `V[Self.n + 1](...)`), where `V[3]` or `Self` is
+expected."""
+comptime N_MU = 23
 comptime MU_NAMES: List[String] = [
     "type",
     "use_moved",
@@ -353,6 +372,7 @@ comptime MU_NAMES: List[String] = [
     "ref_origin",
     "ref_move",
     "ref_rvalue",
+    "value",
 ]
 comptime MU_ODDS = 6
 """Each chance to apply the mutation is taken 1 time in MU_ODDS."""
@@ -404,7 +424,10 @@ self^`) and not reassigned (an error for a `mut` argument)."""
 comptime NR_REF_REINIT = 14
 """`ref rN = x` (or a field of x), x moved and reinitialized, then a use
 of rN: the binding is to the place, not to the value."""
-comptime N_NR = 15
+comptime NR_VALUE_EXPR = 15
+"""In a struct with a value parameter, a value of Self written with an
+equal expression (`V[Self.n + 0](...)`, `V[0 + Self.n]`, ...)."""
+comptime N_NR = 16
 comptime NR_NAMES: List[String] = [
     "disjoint",
     "read_alias",
@@ -421,6 +444,7 @@ comptime NR_NAMES: List[String] = [
     "deinit_drop",
     "deinit_move",
     "ref_reinit",
+    "value_expr",
 ]
 comptime MARK_NEAR = "@@N@@"
 """In generated text, marks the line of the near miss."""
@@ -632,6 +656,10 @@ struct StructDecl(Copyable):
     var refs: List[Bool]
     """Per field, whether it has an accessor `def fK_ref(ref self) ->
     ref[self.fK] T`."""
+    var valued: Bool
+    """Whether it has a value parameter, `[n: Int]` (never with `T`)..."""
+    var values: List[Int]
+    """...and the values it's used with outside its own bodies."""
 
 
 @fieldwise_init
@@ -757,6 +785,8 @@ struct Ctx(Copyable):
     var ref_depth: List[Int]
     """...and the block depth of its declaration (it goes out of scope at
     the end of that block)."""
+    var self_ty: Int
+    """In a struct's body, its type (with `Self.T` or `Self.n`), or -1."""
 
     def __init__(
         out self,
@@ -796,6 +826,7 @@ struct Ctx(Copyable):
         self.ref_var = []
         self.ref_field = []
         self.ref_depth = []
+        self.self_ty = -1
 
     def push(mut self, var name: String, ty: Int, kind: Int):
         self.names.append(name^)
@@ -882,6 +913,7 @@ struct Cands(Copyable):
     var k_recv: List[Int]
     var k_trait: List[Int]
     var call_fn: List[Int]
+    var valn: List[Int]
 
 
 struct Program(Movable):
@@ -1023,6 +1055,8 @@ struct Program(Movable):
         if ty == self_print:
             return "Self"
         var kind = self.tkind[ty]
+        if kind == VAL:  # (spelled by resolve_values)
+            return String("@@=", self.tid[ty], "@@")
         if kind == INT:
             return "Int"
         if kind == RES:
@@ -1090,8 +1124,7 @@ struct Program(Movable):
         generic structs over them (two levels deep)."""
         var pool: List[Int] = [self.int_ty, self.res_ty]
         for s in range(n_structs):
-            if not self.structs[s].generic:
-                pool.append(self.intern(STRUCT, s, -1))
+            pool += self.concrete_types(s)
         for p in range(len(bounds)):
             pool.append(self.intern(PARAM, p, -1))
         var start = 0
@@ -1111,6 +1144,21 @@ struct Program(Movable):
             start = end
         return pool^
 
+    def concrete_types(mut self, s: Int) -> List[Int]:
+        """Struct s's types outside its bodies, unless it's generic: S, or
+        V[k] for each of its values."""
+        if self.structs[s].generic:
+            return []
+        if not self.structs[s].valued:
+            return [self.intern(STRUCT, s, -1)]
+        var out = List[Int]()
+        for k in self.structs[s].values.copy():
+            out.append(self.intern(STRUCT, s, self.intern(VAL, k, -1)))
+        return out^
+
+    def is_valued(self, ty: Int) -> Bool:
+        return self.tkind[ty] == STRUCT and self.structs[self.tid[ty]].valued
+
     def methods_on(self, ty: Int, bounds: List[Int]) -> List[Int]:
         """Non-static methods callable on a value of type ty."""
         var out = List[Int]()
@@ -1127,7 +1175,8 @@ struct Program(Movable):
         """What to substitute into m's signature for receiver type recv."""
         if self.methods[m].trait_id >= 0:
             return [recv]
-        if self.structs[self.methods[m].struct_id].generic:
+        ref sd = self.structs[self.methods[m].struct_id]
+        if sd.generic or sd.valued:
             return [self.targ[recv]]
         return []
 
@@ -1153,6 +1202,8 @@ struct Program(Movable):
 
     def unify(self, pat: Int, ty: Int, mut assign: List[Int]) -> Bool:
         var kind = self.tkind[pat]
+        if kind == VAL:
+            return ty == pat
         if kind == PARAM:
             var i = self.tid[pat]
             if assign[i] < 0:
@@ -1280,8 +1331,20 @@ struct Program(Movable):
         # (acyclic, like FJ's fields) that are at least as capable,
         # conformances, associated constants
         var n_structs = data.draw(integers(1, 5))
+        var value_kind = self.mutant == MU_VALUE or self.near == NR_VALUE_EXPR
         for s in range(n_structs):
             var generic = data.draw(integers(0, 2)) == 0
+            # a value parameter for 1/4 of the others (3/4 for the value
+            # kinds), with one or two values
+            var valued = not generic and data.draw(integers(0, 3)) < (
+                3 if value_kind else 1
+            )
+            var values = List[Int]()
+            if valued:
+                for _ in range(data.draw(integers(1, 2))):
+                    var k = data.draw(integers(-2, 5))
+                    if not has(values, k):
+                        values.append(k)
             var bound = pick(data, n_traits) if generic else -1
             var bounds = [bound] if generic else List[Int]()
             var cap_max = self.traits[bound].cap if generic else CAP_IC
@@ -1313,6 +1376,8 @@ struct Program(Movable):
                 k_traits.append(u)
                 k_values.append(data.draw(integers(-5, 20)))
                 var source = -1
+                if valued and data.draw(booleans()):
+                    source = -2  # (`Self.n + v`)
                 if generic and data.draw(integers(0, 3)) > 0:
                     var sources = List[Int]()
                     for v in self.closure([bound]):
@@ -1327,7 +1392,7 @@ struct Program(Movable):
                 refs.append(data.draw(booleans()))
             self.structs.append(
                 StructDecl(
-                    String("B" if generic else "S", s),
+                    String("B" if generic else ("V" if valued else "S"), s),
                     generic,
                     bound,
                     cap,
@@ -1341,6 +1406,8 @@ struct Program(Movable):
                     k_sources^,
                     counted,
                     refs^,
+                    valued,
+                    values^,
                 )
             )
 
@@ -1392,6 +1459,8 @@ struct Program(Movable):
             ].generic else List[Int]()
             var pool = self.type_pool(bounds, n_structs)
             var own_ty = self.self_type(s)
+            if self.structs[s].valued:
+                pool.append(own_ty)
             for _ in range(data.draw(integers(0, 2))):
                 var m = len(self.methods)
                 var self_conv = (
@@ -1491,7 +1560,7 @@ struct Program(Movable):
         """Whether e is built from literals and associated constants only
         (Mojo folds it), conservatively."""
         var k = self.exprs[e].kind
-        if k == E_LIT or k == E_K:
+        if k == E_LIT or k == E_K or k == E_VALN:
             return True
         if k != E_BIN and k != E_TERN:
             return False
@@ -1708,6 +1777,31 @@ struct Program(Movable):
         """An expression for a position that expects type ty: for
         MU_TYPE, perhaps one of another type (no two types in the pool
         convert to each other)."""
+        if (
+            self.is_valued(ty)
+            and self.wants(MU_VALUE)
+            and self.chance(data, MU_VALUE)
+        ):
+            # `V[k + d](...)` or `V[Self.n + d](...)`
+            var d = data.draw(integers(1, 3))
+            var arg = self.targ[ty]
+            var vtext: String
+            if self.tkind[arg] == VAL:
+                vtext = String("@@=", self.tid[arg] + d, "@@")
+            else:
+                vtext = String("Self.n + ", d)
+            var fts = self.fields_of(ty)
+            var vars = List[Int](length=len(fts), fill=CONV_VAR)
+            var kids = self.gen_args(data, ctx, fts, vars, size - 1, False)
+            var text = String(
+                self.structs[self.tid[ty]].name,
+                "[",
+                vtext,
+                "](",
+                self.args_text(kids, 0),
+                ")",
+            )
+            return self.mark(self.add(E_NEW, 0, ty, kids^, [], text^))
         if self.wants(MU_TYPE) and self.chance(data, MU_TYPE):
             var others = List[Int]()
             for t in ctx.pool:
@@ -1795,8 +1889,7 @@ struct Program(Movable):
             # concrete types, which substitution leaves alone
             var concrete: List[Int] = [self.int_ty, self.res_ty]
             for x in range(len(self.structs)):
-                if not self.structs[x].generic:
-                    concrete.append(self.intern(STRUCT, x, -1))
+                concrete += self.concrete_types(x)
             # what to change: the result type, the convention of `self`,
             # or a parameter's type or convention
             var changes: List[Int] = [0]
@@ -1883,7 +1976,7 @@ struct Program(Movable):
         return ctx^
 
     def self_type(mut self, s: Int) -> Int:
-        if self.structs[s].generic:
+        if self.structs[s].generic or self.structs[s].valued:
             return self.intern(STRUCT, s, self.p0_ty)
         return self.intern(STRUCT, s, -1)
 
@@ -1896,13 +1989,19 @@ struct Program(Movable):
         var bounds = [self.structs[s].bound] if generic else List[Int]()
         var rank = self.methods[m].rank
         var pool = self.type_pool(bounds, len(self.structs))
+        var valued = self.structs[s].valued
+        if valued:
+            pool.append(self_ty)
         var ctx = Ctx(
             bounds^,
-            ["Self.T"] if generic else List[String](),
+            ["Self.T"] if generic else (
+                ["Self.n"] if valued else List[String]()
+            ),
             rank,
             self_ty if data.draw(booleans()) else -1,
             pool^,
         )
+        ctx.self_ty = self_ty
         if not self.methods[m].is_static:
             ctx.push("self", self_ty, kind_of_conv(self.methods[m].self_conv))
         var params = self.methods[m].params.copy()
@@ -4292,6 +4391,12 @@ struct Program(Movable):
                     atom_fields.append(f)
                     atom_modes.append(A_COPY)
         var makes = self.make_candidates(ctx, ty)
+        # `V[k].n` and `Self.n`
+        var valn = List[Int]()
+        if kind == INT:
+            for t in ctx.pool:
+                if self.is_valued(t):
+                    valn.append(t)
 
         # candidates for each rule; FJ: one rule among the possible ones
         var field_recv = List[Int]()
@@ -4355,6 +4460,8 @@ struct Program(Movable):
         var rules = List[Int]()
         if kind == INT or len(atom_vars) > 0:
             rules.append(R_ATOM)
+        if len(valn) > 0:
+            rules.append(R_VALN)
         if kind == STRUCT or kind == RES:
             rules.append(R_NEW)
         if len(makes) > 0:
@@ -4416,6 +4523,7 @@ struct Program(Movable):
             k_recv^,
             k_trait^,
             call_fn^,
+            valn^,
         )
         while len(rules) > 0:
             var rule = rules[pick(data, len(rules))]
@@ -4492,6 +4600,28 @@ struct Program(Movable):
 
         if rule == R_NEW:  # T-New: the fields are consumed
             var bad = self.bad_type_text(data, ctx, ty)
+            var near = False
+            if (
+                ty == ctx.self_ty
+                and self.is_valued(ty)
+                and self.near_chance(data, NR_VALUE_EXPR)
+            ):
+                var exprs: List[String] = [
+                    "Self.n + 0",
+                    "0 + Self.n",
+                    "Self.n * 1",
+                    "1 * Self.n",
+                    "Self.n - 0",
+                    "(Self.n + 2) - 2",
+                    "2 + Self.n - 2",
+                ]
+                bad = String(
+                    self.structs[self.tid[ty]].name,
+                    "[",
+                    exprs[pick(data, len(exprs))],
+                    "]",
+                )
+                near = True
             var fts = self.fields_of(ty)
             var vars = List[Int](length=len(fts), fill=CONV_VAR)
             var kids = self.gen_args(data, ctx, fts, vars, sub, False)
@@ -4502,6 +4632,8 @@ struct Program(Movable):
                 ")",
             )
             var e = self.add(E_NEW, 0, ty, kids^, [], text^)
+            if near:
+                return self.mark_near(e)
             return self.mark(e) if bad != "" else e
 
         if rule == R_MAKE:  # static call: τ.make<t>(e)
@@ -4641,6 +4773,13 @@ struct Program(Movable):
             var e = self.add(E_METHOD, m, ty, kids^, [], text^)
             return self.mark(e) if wrong else e
 
+        if rule == R_VALN:  # a value parameter
+            var t = c.valn[pick(data, len(c.valn))]
+            var text = String(self.cty(t, ctx), ".n")
+            if t == ctx.self_ty and data.draw(booleans()):
+                text = "Self.n"
+            return self.add(E_VALN, 0, ty, [], [t], text^)
+
         if rule == R_K:  # an associated constant: τ.K<t>
             var i = pick(data, len(c.k_recv))
             var text = String(self.cty(c.k_recv[i], ctx), ".K", c.k_trait[i])
@@ -4701,7 +4840,7 @@ struct Program(Movable):
         if (
             not self.wants(MU_BOUND)
             or self.tkind[ty] != STRUCT
-            or self.targ[ty] < 0
+            or not self.structs[self.tid[ty]].generic
         ):
             return ""
         var s = self.tid[ty]
@@ -4850,6 +4989,10 @@ struct Program(Movable):
         if kind == E_STATIC:
             var ty = self.subst(self.exprs[e].tys[0], targs)
             return self.call(a, -1, ty, kids, [CONV_READ], frame, targs, [])
+        if kind == E_VALN:
+            self.stats[STAT_VALUE] += 1
+            var ty = self.subst(self.exprs[e].tys[0], targs)
+            return self.new_int(self.tid[self.targ[ty]])
         if kind == E_K:
             self.stats[STAT_K] += 1
             var ty = self.subst(self.exprs[e].tys[0], targs)
@@ -5092,7 +5235,7 @@ struct Program(Movable):
             raise Error("evaluator: receiver type not resolved")
         var s = self.tid[recv_ty]
         var targs = List[Int]()
-        if self.structs[s].generic:
+        if self.structs[s].generic or self.structs[s].valued:
             targs.append(self.targ[recv_ty])
         if self.methods[m].struct_id >= 0:
             self.stats[STAT_OWN] += 1
@@ -5118,6 +5261,9 @@ struct Program(Movable):
         if source >= 0:
             self.stats[STAT_K_SOURCE] += 1
             v += self.k_value(self.targ[ty], source)
+        elif source == -2:  # `Self.n + v`
+            self.stats[STAT_VALUE] += 1
+            v += self.tid[self.targ[ty]]
         return v
 
     # ---- printing
@@ -5300,7 +5446,10 @@ struct Program(Movable):
             s += "\n\n"
         for st in range(len(self.structs)):
             var generic = self.structs[st].generic
-            var names = ["Self.T"] if generic else List[String]()
+            var valued = self.structs[st].valued
+            var names = ["Self.T"] if generic else (
+                ["Self.n"] if valued else List[String]()
+            )
             var self_ty = self.self_type(st)
             var marked = st == self.mark_struct
             var counted = self.is_counted(st)
@@ -5309,6 +5458,8 @@ struct Program(Movable):
             s += String("struct ", self.structs[st].name)
             if generic:
                 s += String("[T: Tr", self.structs[st].bound, "]")
+            elif valued:
+                s += "[n: Int]"
             s += String("(", cap_names[self.structs[st].cap])
             for t in self.structs[st].traits:
                 s += String(", Tr", t)
@@ -5334,6 +5485,8 @@ struct Program(Movable):
                     s += String(
                         "Self.T.K", self.structs[st].k_sources[i], " + "
                     )
+                elif self.structs[st].k_sources[i] == -2:
+                    s += "Self.n + "
                 s += String("(", self.structs[st].k_values[i], ")\n")
             for f in range(len(self.structs[st].fields)):
                 if not self.structs[st].refs[f]:
@@ -5413,6 +5566,36 @@ struct Program(Movable):
             s += self.body_text(self.entries[i], "    ")
             s += "\n\n"
         return s^
+
+
+def resolve_values(mut data: ConjectureData, text: String) raises -> String:
+    """Spells each value argument `@@=<k>@@` as an expression equal to k
+    (Mojo folds it), drawn per occurrence: `V[3]`, `V[(1 + 2)]`, ..."""
+    var out = String()
+    var rest = text
+    while True:
+        var found = rest.find("@@=")
+        if not found:
+            break
+        var i = found.value()
+        var j = rest.find("@@", i + 3).value()
+        var k = Int(rest[byte = i + 3 : j])
+        out += rest[byte=:i]
+        var form = data.draw(integers(0, 3))
+        if form == 0:
+            out += String(k) if k >= 0 else String("(", k, ")")
+        elif form == 1:
+            var a = data.draw(integers(-3, 3))
+            out += String("(", a, " + ", k - a, ")")
+        elif form == 2:
+            var a = data.draw(integers(0, 6))
+            out += String("(", k + a, " - ", a, ")")
+        else:
+            out += String("(", k, " * 1)")
+        var tail = String(rest[byte = j + 2 :])
+        rest = tail^
+    out += rest
+    return out^
 
 
 def resolve_marks(text: String) -> String:
@@ -5509,7 +5692,7 @@ def draw_program(
                 args.append(data.draw(integers(-20, 20)))
         arg_lists.append(args^)
 
-    var decls = p.declarations_text()
+    var decls = resolve_values(data, p.declarations_text())
     var program = String(PRELUDE_HEAD, RUN_TIME_RES, decls, "def main():\n")
     program += "    _ledger_init()\n"
     var comptime_program = String(

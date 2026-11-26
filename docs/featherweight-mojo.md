@@ -1520,6 +1520,97 @@ No compiler bugs so far: through accessors and bindings, Mojo's
 initialization, mutability and exclusivity checks matched the
 generator's, and every program computed the evaluator's result.
 
+## Value parameters
+
+A struct can take a comptime value, `struct V[n: Int]`; `V[3]` and
+`V[4]` are different types. Probes on the nightly:
+- Arguments are folded: `V[1 + 2]`, `V[(5 - 2)]` and `V[6 // 2]` are all
+  `V[3]`, as an argument, a field's type or a type argument
+  (`B[V[2 * 1 + 1]]`).
+- Symbolic arguments are canonicalized: in V's body, `V[Self.n + 0]`,
+  `V[0 + Self.n]` and `V[Self.n * 1]` are `Self`, and `V[1 + Self.n]` is
+  `V[Self.n + 1]`.
+- Mismatches are errors: `take3(V[4](1))` with `take3(x: V[3])` is
+  "cannot be converted from 'V[Int(4)]' to 'V[Int(3)]'", and returning
+  `W[Self.n + 1](...)` as Self is "cannot implicitly convert 'W[(n +
+  Int(1))]' value to 'W[n]'".
+- `Self.n` and `V[3].n` are Int expressions, also in static methods and
+  in associated constants (`comptime K0 = Self.n + (5)`), which a generic
+  function reads through `T.K0`.
+
+In FM a quarter of the structs that aren't generic take `[n: Int]`
+(three quarters for the value kinds), with one or two values from -2 to
+5. Types outside V's bodies are `V[k]` for those values; in its bodies,
+Self is `V[Self.n]`. A value is a type of its own kind (VAL), so `V[3]`
+is the type `STRUCT V` with argument `VAL 3`, and substitution,
+unification and dispatch work as they do for `B[T]`: a call on a `V[3]`
+runs V's bodies with `Self.n = 3`. An Int position can be `V[k].n` or
+`Self.n` (rule R_VALN), and half of V's associated constants are
+`Self.n + (v)`.
+
+The printer writes each value as a marker, which `resolve_values`
+replaces, occurrence by occurrence, with an expression equal to it:
+`3`, `(1 + 2)`, `(5 - 2)` or `(3 * 1)`. So one program names the same
+type several ways, and Mojo has to fold each one to see that they're
+the same.
+
+| Kind | Construct | Mojo's error, or why it's valid |
+|---|---|---|
+| `value` | `V[k + d](...)` where `V[k]` is expected, or `V[Self.n + d](...)` where Self is (d from 1 to 3) | cannot be converted, or cannot implicitly convert |
+| near `value_expr` | Self written `V[e](...)` with e `Self.n + 0`, `0 + Self.n`, `Self.n * 1`, `1 * Self.n`, `Self.n - 0`, `(Self.n + 2) - 2` or `2 + Self.n - 2` | e is canonicalized to `Self.n` |
+
+In 1,000 stage 2 programs (seed 6201), 300 read a value parameter,
+144,999 times in all.
+
+**Validation.** On nightly 1.3.0.dev2026112505 the results were:
+- 1,000 stage 2 programs, 400 value mutants, and 1,000 near misses and
+  1,000 mutants of all kinds (seeds 6201, 6203-6205): all OK;
+- 400 value_expr near misses (seed 6202): 398 OK, and 2
+  `DIFF_COMPTIME` (the same program twice).
+
+**Found: a compile-time Int loses its upper 32 bits** (filed as
+[#7798](https://github.com/modular/modular/issues/7798)). In that
+program, `run_f1(-3, 0, 17)` printed 4611686027017322496 at compile time
+instead of 4611686018427387904: two fields that held `a = -3` read as
+4294967293 (0xFFFFFFFD). The trigger was an uncalled function, `run_f0`,
+with the condition `(9223372036854775807 * V0[(3 * 1)].n) !=
+V0[(1 + 2)].K0`. Reduced by hand to 20 lines, with no value parameter
+left:
+
+```mojo
+struct S(Copyable):
+    var x: Int
+
+    def __init__(out self, var x: Int):
+        self.x = x
+
+
+comptime N: Int = 3
+
+
+def unused() -> Int:
+    if (9223372036854775807 * N) != 11:
+        return 1
+    return 0
+
+
+def f(a: Int) -> Int:
+    return S(a).x
+
+
+def main():
+    comptime k = f(-3)
+    print(k, f(-3))  # 4294967293 -3
+```
+
+The wrapped product, 0x7FFFFFFFFFFFFFFD, has the low 32 bits of -3. With
+`N = 5`, `f(-5)` is the one that's wrong. `N = 2`, `< 0` instead of
+`!= 11`, returning the product instead of comparing it,
+`@fieldwise_init` instead of the explicit `__init__`, or removing
+`unused` or `S` each make it right. Nightly 1117 has it too. The value
+parameters only brought the overflowing product into a condition that
+folds.
+
 ## Beyond the paths
 
 Mojo features FM leaves out for now:
@@ -1531,6 +1622,8 @@ Mojo features FM leaves out for now:
   to unambiguous overload sets.
 - **More of the type system:** retroactive conformance with
   `__extension` (e.g. `Int` to a trait), conditional conformance
-  (`where` clauses), associated types, generic methods, `comptime` value
-  parameters (`struct B[n: Int]`), and keyword and default arguments.
+  (`where` clauses), associated types, generic methods, value
+  parameters on functions and methods (`def f[n: Int]`, inferred from
+  `V[n]` arguments) and next to type parameters, and keyword and default
+  arguments.
 - **`Variant` and `isa`:** the counterpart of FJ's downcasts.
