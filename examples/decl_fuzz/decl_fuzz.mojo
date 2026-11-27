@@ -103,8 +103,23 @@
 # is a struct. The assoc mutant binds a type that doesn't conform to the
 # bound (and the missing mutant may leave a binding out); the assoc near
 # miss writes one struct's binding as `Self.E0` throughout its
-# declarations. Methods can also take a value parameter, `def m[k:
-# Int](self, p0: V[k], ...)`.
+# declarations. The bound's own associated types give `T.E0.E1` (and
+# `Self.T.E0.E1`, `Self.E0.E1`), and substitution deeper ones. Methods
+# can also take a value parameter, `def m[k: Int](self, p0: V[k], ...)`.
+#
+# Half of the functions with a value parameter constrain it, `where n + 1
+# > 2 and n <= 4` (with perhaps a `comptime assert n - 1 >= 0` the
+# `where` implies at the start of the body). Mojo checks a call with a
+# value; for a symbolic one (`V[n + 1]` in a function over n) it needs
+# evidence, a known proposition equal to the one needed once both are in
+# a canonical form (`1 + n > 2` is `n + 1 >= 3`, but `n >= 3` doesn't give
+# `n >= 1`), which `vw_holds` models; half of the propositions are ones
+# other functions need, so that such calls are possible. The vwhere
+# mutant breaks one (a value that fails it, or a symbolic one without
+# evidence); the near miss is a call only an assert gives evidence for.
+# A quarter of the value parameters can't be inferred, `def g0[n:
+# Int](p0: V[n + 1])`: calls write the value, `g0[2](V[3](...))`, and the
+# infer mutant leaves it out.
 #
 # Exceptions: half of the functions raise, `raises` (Error) or `raises
 # Xk` (X0, X1 are counted error types with a `code`), with `if c: raise
@@ -137,7 +152,9 @@
 # build_and_compare.sh. DECL_FUZZ_NO_SHRINK=1 skips shrinking;
 # DECL_FUZZ_REPRODUCE=<blob> replays a failure from the `reproduce=` blob
 # it printed (with the same DECL_FUZZ_MUTANTS or DECL_FUZZ_NEAR);
-# DECL_FUZZ_STATS=1 prints what evaluation reached in each program (for
+# DECL_FUZZ_FORK=1 runs each test case in a child process, so that a crash
+# of the generator itself is shrunk like a failure; DECL_FUZZ_STATS=1
+# prints what evaluation reached in each program (for
 # mutants, its kind, whether it got the mutation, and its chances);
 # PROPTEST_SEED, PROPTEST_MAX_EXAMPLES and PROPTEST_WORKERS set the seed,
 # the number of programs, and the worker processes (0: one per physical
@@ -172,6 +189,8 @@ comptime POOL_LIMIT = 40
 """At most this many types in a context's type pool."""
 comptime MAX_DEPTH = 2
 """Blocks (`if`, `for`) nest at most this deep."""
+comptime MAX_NEST = 24
+"""How deep argument lists nest in an expression (deeper is STUCK)."""
 
 # type kinds
 comptime INT = 0
@@ -355,7 +374,11 @@ comptime STAT_RAISE = 23
 """`raise` statements executed."""
 comptime STAT_CATCH = 24
 """Handlers run."""
-comptime N_STATS = 25
+comptime STAT_VWHERE = 25
+"""Calls of functions with a `where` on their value parameter."""
+comptime STAT_NESTED = 26
+"""Values of nested associated types (`T.E0.E1`) made or read."""
+comptime N_STATS = 27
 comptime STAT_NAMES: List[String] = [
     "own",
     "required",
@@ -382,6 +405,8 @@ comptime STAT_NAMES: List[String] = [
     "assoc",
     "raise",
     "catch",
+    "vwhere",
+    "nested",
 ]
 
 # Stage 3: ill-typed mutants (DECL_FUZZ_MUTANTS=1). Each program gets one
@@ -463,7 +488,17 @@ comptime MU_RAISE_CTX = 27
 function that doesn't raise, or raises another typed error)."""
 comptime MU_RAISE_TYPE = 28
 """In a function that `raises Xk`, `raise Xj(...)` with j != k."""
-comptime N_MU = 29
+comptime MU_VWHERE = 29
+"""A call of a function with a `where` on its value parameter (`where n
+>= 2`) that breaks it: with a value that fails it ("violated
+constraint"), or with a symbolic one (`V[n + 1]`) for which the caller
+knows no equal proposition ("lacking evidence"), even one implying it
+(`n >= 3` doesn't give `n >= 1`)."""
+comptime MU_INFER = 30
+"""A call that leaves out the value of a parameter Mojo can't infer
+(`g0(x)` for `def g0[n: Int](p0: V[n + 1])`): "it depends on an
+unresolved parameter"."""
+comptime N_MU = 31
 comptime MU_NAMES: List[String] = [
     "type",
     "use_moved",
@@ -494,6 +529,8 @@ comptime MU_NAMES: List[String] = [
     "unhandled",
     "raise_ctx",
     "raise_type",
+    "vwhere",
+    "infer",
 ]
 comptime MU_ODDS = 6
 """Each chance to apply the mutation is taken 1 time in MU_ODDS."""
@@ -563,7 +600,12 @@ comptime NR_UNREACHABLE = 19
 """A handler that can't be reached (a type caught before, or not raised,
 or after `except:`), which Mojo only warns about; its body doesn't use
 its binding (DECL_FUZZ_NO_UNREACHABLE_WORKAROUND=1 lets it)."""
-comptime N_NR = 20
+comptime NR_VWHERE = 20
+"""A call whose `where` on a value parameter only a `comptime assert`
+gives evidence for: the assert, at the start of the caller's body, is
+implied by the caller's own `where` but isn't equal to any of it (`where
+n >= 3` and `comptime assert n - 1 >= 0`)."""
+comptime N_NR = 21
 comptime NR_NAMES: List[String] = [
     "disjoint",
     "read_alias",
@@ -585,6 +627,7 @@ comptime NR_NAMES: List[String] = [
     "where",
     "assoc",
     "unreachable",
+    "vwhere",
 ]
 comptime MARK_NEAR = "@@N@@"
 """In generated text, marks the line of the near miss."""
@@ -823,6 +866,20 @@ struct StructDecl(Copyable):
 
 
 @fieldwise_init
+struct Prop(Copyable):
+    """A proposition about a value parameter n: `n + c >= k` (ge) or `n + c
+    <= k`. Mojo compares them symbolically, as this canonical form: `n >
+    k - 1` is `n >= k`, and `1 + n` is `n + 1`, but `n - 1 >= 0` isn't
+    `n >= 1`."""
+
+    var c: Int
+    var ge: Bool
+    var k: Int
+    var form: Int
+    """How it's written (prop_text)."""
+
+
+@fieldwise_init
 struct FnDecl(Copyable):
     var name: String
     var bounds: List[Int]
@@ -839,6 +896,12 @@ struct FnDecl(Copyable):
     var raise_ty: Int
     """What it raises: -1 nothing, -2 Error (`raises`), k for `raises
     Xk`."""
+    var vwhere: List[Prop]
+    """Propositions about its value parameter in its `where` (joined by
+    `and`)..."""
+    var asserts: List[Prop]
+    """...and in `comptime assert`s at the start of its body (implied by
+    them)."""
 
 
 @fieldwise_init
@@ -968,6 +1031,8 @@ struct Ctx(Copyable):
     """While a field is moved out (no_exit), how many `try` bodies the
     context was in where that began: a raise there is caught in time only
     by a `try` begun inside the region."""
+    var nest: Int
+    """How many argument lists the expression being drawn is in."""
     var freeze_base: Int
     """In a `try` statement, the variables from outside it (before this)
     are read-only: a raise can come at any point, so a move there would
@@ -1018,6 +1083,7 @@ struct Ctx(Copyable):
         self.raised = []
         self.freeze_base = 0
         self.exit_catch = 0
+        self.nest = 0
 
     def push(mut self, var name: String, ty: Int, kind: Int):
         self.names.append(name^)
@@ -1182,7 +1248,7 @@ struct Program(Movable):
     """Associated types in a function's result that unification left for
     later (`call_assignment`): the type parameter..."""
     var pend_t: List[Int]
-    """...the trait..."""
+    """...the associated type (in terms of it)..."""
     var pend_ty: List[Int]
     """...and the type `T.E<t>` must be."""
     var err_value: Int
@@ -1197,6 +1263,11 @@ struct Program(Movable):
     """While a body with a `where` is drawn (a gated method's, or a
     function's), what it gives: PARAM p conforms to trait t (p * 64 +
     t)."""
+    var vfacts: List[Int]
+    """While a function's body is drawn, the propositions about its value
+    parameter it knows (prop_key): its `where`'s..."""
+    var vfacts_assert: List[Int]
+    """...and those only its `comptime assert`s give."""
     var bad_where: Int
     """For MU_WHERE_IMPL, the implementation (struct * 64 + index) gated
     by a stricter condition, or -1..."""
@@ -1247,6 +1318,8 @@ struct Program(Movable):
         self.err_type = -1
         self.exceptions = False
         self.facts = []
+        self.vfacts = []
+        self.vfacts_assert = []
         self.alias_ty = -1
         self.alias_text = String()
         self.alias_struct = -1
@@ -1286,6 +1359,31 @@ struct Program(Movable):
                 return b
         return self.intern(ASSOC, t, owner)
 
+    def offset_ro(self, arg: Int, c: Int) -> Int:
+        """offset, for a type already interned (-1 if it isn't)."""
+        var kind = self.tkind[arg]
+        if kind == OFF:
+            return self.offset_ro(self.targ[arg], self.tid[arg] + c)
+        var want_kind = kind
+        var want_id = -1
+        var want_arg = -1
+        if kind == VAL:
+            want_id = self.tid[arg] + c
+        elif c == 0:
+            return arg
+        else:
+            want_kind = OFF
+            want_id = c
+            want_arg = arg
+        for i in range(len(self.tkind)):
+            if (
+                self.tkind[i] == want_kind
+                and self.tid[i] == want_id
+                and self.targ[i] == want_arg
+            ):
+                return i
+        return -1
+
     def offset(mut self, arg: Int, c: Int) -> Int:
         """The value argument arg plus c: `k + c` folded, `n + c`."""
         var kind = self.tkind[arg]
@@ -1312,6 +1410,14 @@ struct Program(Movable):
             var arg = self.subst(self.targ[ty], args)
             return self.intern(STRUCT, self.tid[ty], arg)
         return ty
+
+    def subst_one(mut self, ty: Int, p: Int, arg: Int) -> Int:
+        """Replaces PARAM p (the only one in ty) by arg."""
+        var args = List[Int]()
+        for _ in range(p):
+            args.append(self.int_ty)
+        args.append(arg)
+        return self.subst(ty, args)
 
     def subst_all(mut self, tys: List[Int], args: List[Int]) -> List[Int]:
         var out = List[Int]()
@@ -1520,13 +1626,20 @@ struct Program(Movable):
         for p in range(len(bounds)):
             if bounds[p] >= 0:  # (-1: a value parameter)
                 pool.append(self.intern(PARAM, p, -1))
-        # their associated types, `T.E0` (`Self.E0` in a trait)
+        # their associated types, `T.E0` (`Self.E0` in a trait), and
+        # theirs, `T.E0.E1`
         for p in range(len(bounds)):
             if bounds[p] >= 0:
                 var n = self.intern(PARAM, p, -1)
                 for x in self.closure([bounds[p]]):
-                    if self.traits[x].assoc >= 0:
-                        pool.append(self.intern(ASSOC, x, n))
+                    var u = self.traits[x].assoc
+                    if u < 0:
+                        continue
+                    var a = self.intern(ASSOC, x, n)
+                    pool.append(a)
+                    for y in self.closure([u]):
+                        if self.traits[y].assoc >= 0:
+                            pool.append(self.intern(ASSOC, y, a))
         var start = 0
         for _ in range(2):
             var end = len(pool)
@@ -1605,13 +1718,193 @@ struct Program(Movable):
         """What parameter i of function f can be, where nothing fixes it."""
         var b = self.fns[f].bounds[i]
         if b < 0:
-            return self.value_args(ctx, self.tid[self.fns[f].params[i]])
+            # (for `V[n + c]`, n = the argument - c)
+            var p = self.fns[f].params[i]
+            var c = 0
+            if self.tkind[self.targ[p]] == OFF:
+                c = self.tid[self.targ[p]]
+            var out = List[Int]()
+            for a in self.value_args(ctx, self.tid[p]):
+                var v = self.offset_ro(a, -c)
+                if v >= 0 and self.vw_holds(f, v) and not has(out, v):
+                    out.append(v)
+            return out^
         var w = self.fns[f].wheres[i]
         var out = List[Int]()
         for t in self.conforming(ctx, b):
             if w < 0 or self.conforms(t, w, ctx.bounds):
                 out.append(t)
         return out^
+
+    # ---- `where` on value parameters
+
+    @staticmethod
+    def prop_key(p: Int, c: Int, ge: Bool, k: Int) -> Int:
+        """A proposition `n + c >= k` (or `<=`) about PARAM p, as an Int."""
+        return ((p * 2 + Int(ge)) * 4096 + c + 2048) * 4096 + k + 2048
+
+    @staticmethod
+    def prop_holds(v: Int, pr: Prop) -> Bool:
+        return v + pr.c >= pr.k if pr.ge else v + pr.c <= pr.k
+
+    @staticmethod
+    def implies(a: Prop, b: Prop) -> Bool:
+        """Whether a implies b arithmetically (which Mojo doesn't see)."""
+        if a.ge != b.ge:
+            return False
+        if a.ge:
+            return b.k - b.c <= a.k - a.c
+        return b.k - b.c >= a.k - a.c
+
+    def noninfer(self, f: Int) -> Bool:
+        """Whether function f's value parameter n can't be inferred: its
+        parameter is `V[n + c]`."""
+        var vi = self.vw_fn_index(f)
+        return vi >= 0 and self.tkind[self.targ[self.fns[f].params[vi]]] == OFF
+
+    def vw_fn_index(self, f: Int) -> Int:
+        """Function f's value parameter, or -1."""
+        return index_of(self.fns[f].bounds, -1)
+
+    def vw_holds(self, f: Int, arg: Int) -> Bool:
+        """Whether a call of function f with arg for its value parameter
+        meets its `where`: a value must make it true; `n + d` (n a value
+        parameter in scope) needs each proposition, with n + d for n, among
+        the known ones (vfacts), as Mojo needs evidence for it."""
+        if len(self.fns[f].vwhere) == 0:
+            return True
+        var kind = self.tkind[arg]
+        if kind == VAL:
+            for pr in self.fns[f].vwhere:
+                if not Self.prop_holds(self.tid[arg], pr):
+                    return False
+            return True
+        var base = arg
+        var d = 0
+        if kind == OFF:
+            base = self.targ[arg]
+            d = self.tid[arg]
+        if self.tkind[base] != PARAM:
+            return False
+        for pr in self.fns[f].vwhere:
+            var key = Self.prop_key(self.tid[base], d + pr.c, pr.ge, pr.k)
+            if not has(self.vfacts, key) and not has(self.vfacts_assert, key):
+                return False
+        return True
+
+    def vw_by_assert(self, f: Int, arg: Int) -> Bool:
+        """Whether a call meeting f's `where` (vw_holds) with a symbolic
+        arg needs evidence only a `comptime assert` gives."""
+        var kind = self.tkind[arg]
+        if kind != PARAM and kind != OFF:
+            return False
+        var base = arg if kind == PARAM else self.targ[arg]
+        var d = 0 if kind == PARAM else self.tid[arg]
+        if self.tkind[base] != PARAM:
+            return False
+        for pr in self.fns[f].vwhere:
+            var key = Self.prop_key(self.tid[base], d + pr.c, pr.ge, pr.k)
+            if not has(self.vfacts, key) and has(self.vfacts_assert, key):
+                return True
+        return False
+
+    def reqs_on(self, s: Int, skip: Int) -> List[Prop]:
+        """What a function with a value parameter of struct s (V[n]) would
+        need to know to call the other functions on V with V[n + d] (d in
+        0, 1, -1): each of their propositions, with n + d for n."""
+        var out = List[Prop]()
+        for g in range(len(self.fns)):
+            var vi = self.vw_fn_index(g)
+            if g == skip or vi < 0:
+                continue
+            if self.tid[self.fns[g].params[vi]] != s:
+                continue
+            for pr in self.fns[g].vwhere:
+                for d in [0, 1, -1]:
+                    out.append(Prop(d + pr.c, pr.ge, pr.k, 0))
+        return out^
+
+    def draw_prop(
+        mut self, mut data: ConjectureData, s: Int, f: Int
+    ) raises -> Prop:
+        """A proposition for function f's `where` about its V[n] (struct s):
+        half the time one another function on V needs (so that f can call
+        it with `V[n + d]`), else one true of some value V is used with."""
+        var reqs = self.reqs_on(s, f)
+        var form = data.draw(integers(0, 3))
+        if len(reqs) > 0 and data.draw(booleans()):
+            var r = reqs[pick(data, len(reqs))].copy()
+            r.form = form
+            # for the vwhere kinds, half the time a stronger one, which
+            # implies it but isn't evidence for it (an assert can be)
+            if (
+                self.mutant == MU_VWHERE or self.near == NR_VWHERE
+            ) and data.draw(booleans()):
+                var bound = r.k - r.c
+                bound += data.draw(integers(1, 2)) * (1 if r.ge else -1)
+                r.c = data.draw(integers(-1, 1))
+                r.k = bound + r.c
+            return r^
+        var values = self.structs[s].values.copy()
+        var v = values[pick(data, len(values))]
+        var c = data.draw(integers(-1, 1))
+        var ge = data.draw(booleans())
+        var j = data.draw(integers(0, 2))
+        return Prop(c, ge, v + c - j if ge else v + c + j, form)
+
+    def draw_assert(
+        mut self, mut data: ConjectureData, vwhere: List[Prop], s: Int, f: Int
+    ) raises -> Prop:
+        """A `comptime assert` implied by the `where` propositions but not
+        equal to any (it never fails, since every call meets the `where`):
+        one another function on V needs, if one is implied, else a weaker
+        form of a `where` proposition (`n >= 3` gives `n - 1 >= 1`)."""
+        var cands = List[Prop]()
+        for r in self.reqs_on(s, f):
+            var equal = False
+            var implied = False
+            for a in vwhere:
+                if a.ge == r.ge and a.c == r.c and a.k == r.k:
+                    equal = True
+                if Self.implies(a, r):
+                    implied = True
+            if implied and not equal:
+                cands.append(r.copy())
+        var form = data.draw(integers(0, 3))
+        if len(cands) > 0 and data.draw(integers(0, 3)) > 0:
+            var r = cands[pick(data, len(cands))].copy()
+            r.form = form
+            return r^
+        ref a = vwhere[pick(data, len(vwhere))]
+        var c = data.draw(integers(-1, 1))
+        while c == a.c:
+            c = data.draw(integers(-1, 1))
+        var j = data.draw(integers(0, 2))
+        var bound = a.k - a.c
+        return Prop(c, a.ge, bound + c - j if a.ge else bound + c + j, form)
+
+    def prop_text(mut self, pr: Prop, vi: Int, names: List[String]) -> String:
+        """`n + c >= k` in one of four forms, `n + c > k - 1`, `k <= n +
+        c`, ..., each side spelled as resolve_values draws."""
+        var lhs = self.val_str(
+            self.offset(self.intern(PARAM, vi, -1), pr.c), names
+        )
+        var k = pr.k
+        if pr.form == 1 or pr.form == 3:
+            k += -1 if pr.ge else 1
+        var rhs = String("@@=", k, "@@")
+        var op: String
+        if pr.form < 2:
+            if pr.ge:
+                op = " >= " if pr.form == 0 else " > "
+            else:
+                op = " <= " if pr.form == 0 else " < "
+            return String(lhs, op, rhs)
+        if pr.ge:
+            op = " <= " if pr.form == 2 else " < "
+        else:
+            op = " >= " if pr.form == 2 else " > "
+        return String(rhs, op, lhs)
 
     def methods_on(self, ty: Int, bounds: List[Int]) -> List[Int]:
         """Non-static methods callable on a value of type ty."""
@@ -1721,12 +2014,15 @@ struct Program(Movable):
         if kind == VAL:
             return ty == pat
         if kind == ASSOC:
-            # T.E<t> = ty: checked once T is known (call_assignment)
+            # T.E<t> = ty (or T.E<u>.E<t>): checked once T is known
+            # (call_assignment)
             var o = self.targ[pat]
+            while self.tkind[o] == ASSOC:
+                o = self.targ[o]
             if self.tkind[o] != PARAM:
                 return pat == ty
             self.pend_p.append(self.tid[o])
-            self.pend_t.append(self.tid[pat])
+            self.pend_t.append(pat)
             self.pend_ty.append(ty)
             return True
         if kind == OFF:
@@ -1811,6 +2107,11 @@ struct Program(Movable):
         for t in pool:
             if not self.conforms(t, u, bounds) or has(out, t):
                 continue
+            # (not `B[Self.T.E0.E0]`: with S binding E0 to `B[S]`, B[S].E0
+            # would be B[B[S].E0], an infinite type; one level, `B[Self.T.E0]`,
+            # recurses on a smaller argument)
+            if self.has_nested(t):
+                continue
             # Mojo overflows its stack on `comptime E0 = B1[B1[Self.T.E0]]`
             # in a B1 with a field of type `Self.T.E0`
             # (modular/modular#7814): not the struct
@@ -1835,6 +2136,21 @@ struct Program(Movable):
                 break
             t = self.targ[t]
         return n
+
+    def is_nested(self, ty: Int) -> Bool:
+        """Whether ty is an associated type of one, `T.E0.E1`."""
+        return self.tkind[ty] == ASSOC and self.tkind[self.targ[ty]] == ASSOC
+
+    def has_nested(self, ty: Int) -> Bool:
+        """Whether ty has a nested associated type (`X.E0.E1`) in it."""
+        var t = ty
+        while t >= 0:
+            if self.is_nested(t):
+                return True
+            if self.tkind[t] != STRUCT and self.tkind[t] != ASSOC:
+                return False
+            t = self.targ[t]
+        return False
 
     def has_any_assoc(self, ty: Int) -> Bool:
         var t = ty
@@ -2105,7 +2421,10 @@ struct Program(Movable):
         # (acyclic, like FJ's fields) that are at least as capable,
         # conformances, associated constants
         var n_structs = data.draw(integers(1, 5))
-        var value_kind = self.mutant == MU_VALUE or self.near == NR_VALUE_EXPR
+        var vwhere_kind = self.mutant == MU_VWHERE or self.near == NR_VWHERE
+        var value_kind = (
+            self.mutant == MU_VALUE or self.near == NR_VALUE_EXPR or vwhere_kind
+        )
         var where_kind = (
             self.mutant == MU_WHERE
             or self.mutant == MU_WHERE_IMPL
@@ -2350,7 +2669,7 @@ struct Program(Movable):
         for s in range(n_structs):
             if self.structs[s].valued:
                 valued_structs.append(s)
-        for f in range(data.draw(integers(0, 3))):
+        for f in range(data.draw(integers(2 if vwhere_kind else 0, 3))):
             var bounds = List[Int]()
             for _ in range(data.draw(integers(0, 2))):
                 bounds.append(pick(data, n_traits))
@@ -2382,6 +2701,20 @@ struct Program(Movable):
                 else:
                     params.append(self.intern(PARAM, i, -1))
                 convs.append(draw_conv(data, mut_often))
+            # a quarter of the value parameters (half for the infer mutant)
+            # can't be inferred: their parameter is `V[n + 1]` or `V[n -
+            # 1]`, and calls write the value
+            if vi >= 0 and data.draw(integers(0, 3)) < (
+                2 if self.mutant == MU_INFER else 1
+            ):
+                params[vi] = self.intern(
+                    STRUCT,
+                    vs,
+                    self.offset(
+                        self.intern(PARAM, vi, -1),
+                        1 if data.draw(booleans()) else -1,
+                    ),
+                )
             for _ in range(data.draw(integers(0, 2))):
                 params.append(self.draw_sig_type(data, pool, own_ty))
                 convs.append(draw_conv(data, mut_often))
@@ -2410,6 +2743,32 @@ struct Program(Movable):
                     if len(ws) > 0:
                         w = ws[pick(data, len(ws))]
                 wheres.append(w)
+            # half of the value parameters need `where n + c >= k` (or
+            # `<=`; 3/4 for the vwhere kinds), with perhaps a `comptime
+            # assert` it implies in the body
+            var vwhere = List[Prop]()
+            var asserts = List[Prop]()
+            if vi >= 0 and data.draw(integers(0, 3)) < (
+                3 if vwhere_kind else 2
+            ):
+                for _ in range(data.draw(integers(1, 2))):
+                    vwhere.append(self.draw_prop(data, vs, f))
+                var reqs = self.reqs_on(vs, f)
+                if self.near == NR_VWHERE and len(reqs) > 0:
+                    # (the near miss: a `where` stronger than what
+                    # another function needs, and an assert of that)
+                    var r = reqs[pick(data, len(reqs))].copy()
+                    r.form = data.draw(integers(0, 3))
+                    var w = r.copy()
+                    var bound = r.k - r.c
+                    bound += data.draw(integers(1, 2)) * (1 if r.ge else -1)
+                    w.c = data.draw(integers(-1, 1))
+                    w.k = bound + w.c
+                    w.form = data.draw(integers(0, 3))
+                    vwhere[0] = w^
+                    asserts.append(r^)
+                elif data.draw(integers(0, 2)) < (2 if vwhere_kind else 1):
+                    asserts.append(self.draw_assert(data, vwhere, vs, f))
             self.fns.append(
                 FnDecl(
                     String("g", f),
@@ -2417,10 +2776,16 @@ struct Program(Movable):
                     params^,
                     convs^,
                     self.draw_sig_type(data, pool, own_ty),
-                    data.draw(integers(0, MAX_RANK)),
+                    # (rising for the vwhere kinds: a function's `where`
+                    # is drawn for calling the earlier ones)
+                    min(f + 1, MAX_RANK) if vwhere_kind else data.draw(
+                        integers(0, MAX_RANK)
+                    ),
                     -1,
                     wheres^,
                     raise_ty,
+                    vwhere^,
+                    asserts^,
                 )
             )
 
@@ -3305,6 +3670,13 @@ struct Program(Movable):
             for i in range(len(self.fns[f].wheres)):
                 if self.fns[f].wheres[i] >= 0:
                     self.facts.append(i * 64 + self.fns[f].wheres[i])
+            var vi = self.vw_fn_index(f)
+            for pr in self.fns[f].vwhere:
+                self.vfacts.append(Self.prop_key(vi, pr.c, pr.ge, pr.k))
+            for pr in self.fns[f].asserts:
+                var key = Self.prop_key(vi, pr.c, pr.ge, pr.k)
+                if not has(self.vfacts, key):
+                    self.vfacts_assert.append(key)
             var pool = self.fn_pool(f)
             var ctx = Ctx(bounds^, self.fn_names(f), rank, -1, pool^)
             ctx.raise_ty = self.fns[f].raise_ty
@@ -3312,6 +3684,8 @@ struct Program(Movable):
             var ret = self.fns[f].ret
             self.fns[f].body = self.gen_body(data, ctx^, ret)
             self.facts = []
+            self.vfacts = []
+            self.vfacts_assert = []
         # entry points
         for _ in range(data.draw(integers(1, 4))):
             var pool = self.type_pool([], len(self.structs))
@@ -5238,6 +5612,12 @@ struct Program(Movable):
         which would borrow it (an aliasing error): such an argument gets
         `.copy()`, or is drawn again without x if its type isn't
         Copyable."""
+        # (a struct can contain itself through associated types: B's field
+        # `Self.T.E0.E0` in B[S], with S.E0 = C and C.E0 = B[S]; values of
+        # it can't be made)
+        if ctx.nest > MAX_NEST:
+            raise Error("STUCK")
+        ctx.nest += 1
         var kids = List[Int]()
         var moved = -1
         var moved_kind = 0
@@ -5291,6 +5671,7 @@ struct Program(Movable):
         for j in range(len(kids)):
             if convs[j] != CONV_MUT:
                 kids[j] = self.where_copies([kids[j]])[0]
+        ctx.nest -= 1
         return kids^
 
     def gen_arg(
@@ -6257,6 +6638,15 @@ struct Program(Movable):
             for i in range(n_tp):
                 if targs[i] < 0:
                     var ok = self.targ_choices(ctx, f, i)
+                    # (the vwhere near miss wants a value only an assert
+                    # gives evidence for)
+                    if self.wants_near(NR_VWHERE):
+                        var by_assert = List[Int]()
+                        for v in ok:
+                            if self.vw_by_assert(f, v):
+                                by_assert.append(v)
+                        if len(by_assert) > 0:
+                            ok = by_assert^
                     targs[i] = ok[pick(data, len(ok))]
         # MU_BOUND: a type argument that doesn't conform, (i, type)
         var bad_i = -1
@@ -6311,6 +6701,30 @@ struct Program(Movable):
                 bad_i = vs[pick(data, len(vs))]
                 bad_t = self.offset(targs[bad_i], data.draw(integers(1, 3)))
                 self.mutated = True
+        # MU_VWHERE: a value argument that breaks the function's `where`
+        # (the arguments have the types it makes, so that's the only
+        # error; not when the result's type would change); NR_VWHERE: one
+        # that only a `comptime assert` gives evidence for
+        var vbad = False
+        var vnear = False
+        var vi = self.vw_fn_index(f)
+        if vi >= 0 and len(self.fns[f].vwhere) > 0:
+            if self.wants(MU_VWHERE) and not self.mentions(self.fns[f].ret, vi):
+                var cands = List[Int]()
+                var vs = self.tid[self.fns[f].params[vi]]
+                for v in self.value_args(ctx, vs):
+                    if not self.vw_holds(f, v):
+                        cands.append(v)
+                if len(cands) > 0 and self.chance(data, MU_VWHERE):
+                    targs[vi] = cands[pick(data, len(cands))]
+                    vbad = True
+                    self.mutated = True
+            elif (
+                self.wants_near(NR_VWHERE)
+                and self.vw_by_assert(f, targs[vi])
+                and self.near_chance(data, NR_VWHERE)
+            ):
+                vnear = True
         var params = self.fns[f].params.copy()
         if n_tp > 0:
             params = self.subst_all(params, targs)
@@ -6321,8 +6735,24 @@ struct Program(Movable):
         # an argument of another type might change what the type
         # arguments are inferred to be, so they're explicit then
         var forced = bad_i >= 0 or (self.mutated and not mutated_before)
+        # MU_INFER: a value that can't be inferred left out
+        var no_infer = False
+        # (only for a value: Mojo matches `V[k + 1]` with `V[n + 1]`, n =
+        # k, though not `V[1 + k]`, modular/modular#7816)
+        if (
+            self.noninfer(f)
+            and not forced
+            and self.tkind[targs[vi]] == VAL
+            and self.chance(data, MU_INFER)
+        ):
+            no_infer = True
+            self.mutated = True
         var text = self.fns[f].name
-        if n_tp > 0 and (data.draw(booleans()) or forced):
+        if (
+            n_tp > 0
+            and (data.draw(booleans()) or forced or self.noninfer(f))
+            and not no_infer
+        ):
             text += "["
             for i in range(n_tp):
                 if i > 0:
@@ -6333,7 +6763,9 @@ struct Program(Movable):
             text += "]"
         text += String("(", self.args_text(kids, 0), ")")
         var e = self.add(E_CALL, f, ty, kids^, targs^, text^)
-        return self.mark(e) if bad_i >= 0 else e
+        if vnear:
+            return self.mark_near(e)
+        return self.mark(e) if bad_i >= 0 or vbad or no_infer else e
 
     def targ_str(self, f: Int, i: Int, t: Int, ctx: Ctx) -> String:
         """Type argument i of a call of function f: a type, or a value."""
@@ -6388,14 +6820,14 @@ struct Program(Movable):
         # inferred from the arguments)
         for j in range(len(self.pend_p)):
             var p = self.pend_p[j]
-            var t = self.pend_t[j]
+            var pat = self.pend_t[j]
             var want = self.pend_ty[j]
             if assign[p] >= 0:
-                if self.assoc(t, assign[p]) != want:
+                if self.subst_one(pat, p, assign[p]) != want:
                     return []
                 continue
             for c in self.targ_choices(ctx, f, p):
-                if self.assoc(t, c) == want:
+                if self.subst_one(pat, p, c) == want:
                     assign[p] = c
                     break
             if assign[p] < 0:
@@ -6404,6 +6836,8 @@ struct Program(Movable):
             var b = self.fns[f].bounds[i]
             if assign[i] >= 0:
                 if b >= 0 and not self.conforms(assign[i], b, ctx.bounds):
+                    return []
+                if b < 0 and not self.vw_holds(f, assign[i]):
                     return []
                 var w = self.fns[f].wheres[i]
                 if w >= 0 and not self.conforms(assign[i], w, ctx.bounds):
@@ -6512,6 +6946,8 @@ struct Program(Movable):
         if kind == E_METHOD:
             if self.tkind[self.exprs[kids[0]].ty] == ASSOC:
                 self.stats[STAT_ASSOC] += 1
+                if self.is_nested(self.exprs[kids[0]].ty):
+                    self.stats[STAT_NESTED] += 1
             var recv_ty = self.subst(self.exprs[kids[0]].ty, targs)
             var convs: List[Int] = [self.methods[a].self_conv]
             if convs[0] == CONV_DEINIT:
@@ -6527,6 +6963,8 @@ struct Program(Movable):
         if kind == E_STATIC:
             if self.tkind[self.exprs[e].tys[0]] == ASSOC:
                 self.stats[STAT_ASSOC] += 1
+                if self.is_nested(self.exprs[e].tys[0]):
+                    self.stats[STAT_NESTED] += 1
             var ty = self.subst(self.exprs[e].tys[0], targs)
             return self.call(a, -1, ty, kids, [CONV_READ], frame, targs, [])
         if kind == E_VALN:
@@ -6537,6 +6975,8 @@ struct Program(Movable):
             self.stats[STAT_K] += 1
             if self.tkind[self.exprs[e].tys[0]] == ASSOC:
                 self.stats[STAT_ASSOC] += 1
+                if self.is_nested(self.exprs[e].tys[0]):
+                    self.stats[STAT_NESTED] += 1
             var ty = self.subst(self.exprs[e].tys[0], targs)
             return self.new_int(self.k_value(ty, a))
         # E_CALL
@@ -6548,6 +6988,8 @@ struct Program(Movable):
             if w >= 0:
                 self.stats[STAT_WHERE] += 1
                 break
+        if len(self.fns[a].vwhere) > 0:
+            self.stats[STAT_VWHERE] += 1
         var f_targs = self.subst_all(self.exprs[e].tys.copy(), targs)
         var convs = self.fns[a].convs.copy()
         return self.call(-1, a, -1, kids, convs, frame, targs, f_targs)
@@ -7280,10 +7722,22 @@ struct Program(Movable):
                             ")",
                         )
                     )
+            var vi = index_of(fd.bounds, -1)
+            var vwhere = fd.vwhere.copy()
+            var asserts = fd.asserts.copy()
+            var body = fd.body
+            for pr in vwhere:
+                conds.append(self.prop_text(pr, vi, fn_names))
             if len(conds) > 0:
                 s += " where " + " and ".join(conds)
             s += ":\n"
-            s += self.body_text(fd.body, "    ")
+            for pr in asserts:
+                s += String(
+                    "    comptime assert ",
+                    self.prop_text(pr, vi, fn_names),
+                    "\n",
+                )
+            s += self.body_text(body, "    ")
             s += "\n\n"
         for i in range(len(self.entries)):
             s += String("def run_f", i, "(a: Int, b: Int, c: Int) -> Int:\n")
@@ -7650,10 +8104,17 @@ def main() raises:
     )
     settings.phases = Phases(explain=False)
     if len(kinds) > 0 or len(near_kinds) > 0:
-        # a program where the mutation wasn't made is filtered out
-        settings.suppress_health_check = [HealthCheck.filter_too_much]
+        # a program where the mutation wasn't made is filtered out (and
+        # the vwhere kinds' bigger programs overrun often)
+        settings.suppress_health_check = [
+            HealthCheck.filter_too_much,
+            HealthCheck.data_too_large,
+        ]
     if getenv("DECL_FUZZ_NO_SHRINK") != "":
         settings.phases = Phases(shrink=False, explain=False)
+    if getenv("DECL_FUZZ_FORK") != "":
+        # (a crash in the generator becomes a failure, shrunk)
+        settings.fork = True
     var blob = getenv("DECL_FUZZ_REPRODUCE")
     if blob != "":
         # replay a failure from its `reproduce=` blob

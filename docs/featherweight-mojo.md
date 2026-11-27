@@ -2007,6 +2007,141 @@ function (a DIFF_EXPECTED: Mojo was right); raising calls between a
 partial move and the field's reassignment, including in the
 reassignment's value.
 
+## `where` on value parameters
+
+Mojo's constraints (`where n > 0` on a function, a method or a struct)
+are checked symbolically ([the manual's constraints
+page](https://docs.modular.com/mojo/manual/metaprogramming/constraints)).
+A call with a value is evaluated ("violated constraint" if it's false).
+A call with a symbolic value needs evidence, a known proposition: the
+caller's own `where`, a `comptime assert` before the call, or a
+`comptime if`. Probes on nightly 1.3.0.dev2026112605 pinned down which
+known propositions count as evidence:
+- Both sides are canonicalized: `1 + n`, `(n + 2) + (-1)` and `n + 1` are
+  the same, so are `n * 2` and `n + n`, and constants fold (`n > (1 -
+  1)` is `n > 0`).
+- `>` and `>=` (and `<`, `<=`) are related by one: `n > 0` is `n >= 1`,
+  `n <= 4` is `n < 5`, and the sides can be swapped (`0 < n`).
+- A conjunct of a known `and` counts, and a known A gives `A or B`.
+- Nothing else does: the constant doesn't move across (`n > 1` doesn't
+  give `n - 1 > 0`), there's no deduction (`n >= 3` doesn't give `n >=
+  1`; `n == 3` doesn't give `n > 0`), and negation isn't normalized
+  (`-n < 0`, `not (n <= 0)`). The error is "lacking evidence to prove
+  correctness", noting the proposition needed (`((n - Int(1)) > Int(0))`).
+- Constraints are checked in dead code too (`if False:`, a ternary's
+  branch).
+
+So in FM a proposition about a value parameter n is `n + c >= k` or `n
++ c <= k` (`Prop`), which is its canonical form: `c` stays on the left.
+Half of the functions with a value parameter get one or two in their
+`where` (joined by `and`, after any `conforms_to`), each written in one of
+four forms (`n + c > k - 1`, `k <= n + c`, ...) with both sides spelled
+as `resolve_values` draws them. Half of them are copied from another
+function over the same V, with n + d for n (d in 0, 1, -1), so that this
+one can call that one with `V[n + d]`; the others are true of one of V's
+values. A third of them (two thirds for the vwhere kinds) start their
+body with a `comptime assert` their `where` implies arithmetically, but
+not equal to any of it: it never fails, since every instantiation meets
+the `where`.
+
+While a function's body is drawn, `vfacts` holds the keys of what it
+knows. `vw_holds` checks a call: a value must make each proposition
+true; `n + d` needs each one, with n + d for n, among the keys. It
+filters the value choices (`targ_choices`, also for the near misses'
+callees) and the values unification fixes (`call_assignment`). A
+struct's own methods and value methods know nothing, so they call these
+functions only with values.
+
+| Kind | Construct | Mojo's error, or why it's valid |
+|---|---|---|
+| `vwhere` | a call whose value fails the `where`, or whose symbolic value has no evidence (often a stronger known proposition) | violated constraint; lacking evidence to prove correctness |
+| near `vwhere` | a call whose only evidence is the `comptime assert` (the `where` is stronger) | the assert is a known proposition |
+
+For the vwhere kinds, functions' ranks rise with their index, so that
+each can call the ones whose requirements its `where` copied; for the
+near miss the first proposition is a strictly stronger form of one,
+and the assert is that one.
+
+### Parameters Mojo can't infer
+
+A quarter of the value parameters (half for the infer mutant) aren't
+inferable: the function's first parameter is `V[n + 1]` or `V[n - 1]`
+(Mojo doesn't solve through the arithmetic, "it depends on an
+unresolved parameter 'n'"), so every call writes the value,
+`g0[2](V[3](...))`. `targ_choices` gives n = the argument's value - c.
+The infer mutant leaves the brackets out, only where the argument is a
+value: the first round's 8 accepted infer mutants showed that Mojo does
+infer through the arithmetic when the argument's type has the same
+shape, `g1(V[k + 1](...))` for `p0: V[n + 1]` (n = k), or a result typed
+`V1[Self.n - 1]` for `p0: V1[n - 1]`. It matches operand by operand:
+the equal type `V[1 + k]` gives n = 1 and then "cannot be converted from
+'V[(Int(1) + k)]' to 'V[Int(2)]'", and `V[k - (-1)]`, `V[(k + 2) +
+(-1)]`, `V[k]` and any value fail ("it depends on an unresolved
+parameter"). Sound, but it depends on the spelling of equal types, and
+the message names a value nobody wrote (filed as
+[#7816](https://github.com/modular/modular/issues/7816)):
+
+```mojo
+def g1[n: Int](p0: V[n + 1]) -> Int:
+    return n
+
+def h[k: Int](p0: V[k]) -> Int:
+    var a = g1(V[k + 1](p0.f0))  # n = k
+    var b = g1(V[1 + k](p0.f0))  # error: ... to 'V[Int(2)]'
+    return a + b
+```
+
+### Nested associated types
+
+A bound's associated type can have one of its own: with `trait Tr0:
+comptime E0: Tr1` and `trait Tr1: comptime E1: Tr2`, `T.E0.E1` is a
+type with Tr2's methods, makes and constants (probed on the nightly,
+at compile time too). ASSOC already allowed any owner; the pools now
+hold `T.E<x>.E<y>` for each y the bound of x implies, so signatures
+(`Self.E0.E1` in a trait), fields (`Self.T.E0.E1`) and bindings
+(`comptime E0 = Self.T.E1.E1`) use them, and substitution makes deeper
+ones (`U.E1.E1.E1`). Unification records the pattern with its type
+parameter at the root of the chain, and `call_assignment` substitutes
+each candidate into it.
+
+In 1,000 stage 2 programs (seed 7801), 92 have a `where` on a value
+parameter, 56 a `comptime assert`, 34 a parameter Mojo can't infer, and
+177 a nested associated type; while running, 19 call a function with a
+value `where` (188 calls), and 14 use a nested type (367 times).
+
+**Validation.** With the final generator on nightly
+1.3.0.dev2026112605 everything was OK: 500 stage 2 programs, 81 vwhere
+near misses, 300 vwhere, 134 infer and 300 assoc-or-missing mutants,
+and 400 near misses and 400 mutants of all kinds (seeds 31-37; the
+near misses and infer mutants are filtered hard, so fewer than asked
+for). Before that, 376 stage 2 programs, 225 vwhere mutants and 580
+near misses and mutants of all kinds were OK too (seeds 21-26). No
+compiler crash or miscompilation; the inference quirk above
+(#7816) is the only finding.
+
+Generator bugs found on the way:
+- The 8 accepted infer mutants above (Mojo was right).
+- An infinite type: a binding with a nested associated type,
+  `comptime E0 = B[Self.T.E0.E0]` with S binding E0 to `B[S]`, makes
+  `B[S].E0` the type `B[B[S].E0]`, and normalizing it never ended (a
+  stack overflow in `subst`, worker processes killed by SIGSEGV). A
+  binding with one level, `B[Self.T.E0]`, recurses on a smaller
+  argument, so bindings now leave out types with a nested associated
+  type in them.
+- A struct that contains itself through associated types (B's field
+  `Self.T.E0.E0` in `B[S]`, with S.E0 = C and C.E0 = B[S]) made drawing
+  one of its values recurse until the data ran out; with nested fields
+  it got deep enough to overflow the stack first. Argument lists now
+  nest at most MAX_NEST (24) deep, and a deeper draw is STUCK.
+  `DECL_FUZZ_FORK=1` (each test case in a child process) shrinks such
+  crashes of the generator.
+- The vwhere near miss was rare (7 in 200): a call needing only the
+  assert needs an earlier function, of lower rank, whose need the
+  caller's `where` strengthens. For the vwhere kinds ranks now rise
+  with the index, and the near miss draws that structure on purpose;
+  the overruns of their bigger programs no longer fail the
+  `data_too_large` health check.
+
 ## Beyond the paths
 
 Mojo features FM leaves out for now:
@@ -2017,10 +2152,10 @@ Mojo features FM leaves out for now:
   aren't fully specified, so the evaluator would have to restrict itself
   to unambiguous overload sets.
 - **More of the type system:** retroactive conformance with
-  `__extension` (e.g. `Int` to a trait), `where` on value parameters
-  (`where n > 0`), associated types of associated types (`T.E0.E1`) and
-  constraints on them (`where T.E0 == A`), value parameters on methods,
-  methods with two parameters of their own, parameters not inferable at
-  all (`p0: V[n + 1]` needs an explicit n), and keyword and default
+  `__extension` (e.g. `Int` to a trait), constraints on associated types
+  (`where T.E0 == A`), `where` on methods, value methods and structs
+  (`struct V[n: Int] where n > 0`, which every `V[n - 1]` would need
+  evidence for), `comptime if` as evidence, methods with two parameters
+  of their own, non-inferable type parameters, and keyword and default
   arguments.
 - **`Variant` and `isa`:** the counterpart of FJ's downcasts.
