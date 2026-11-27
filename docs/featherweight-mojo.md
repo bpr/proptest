@@ -698,7 +698,9 @@ didn't have:
   only to `mut` or `var`.
 - **A method with another signature than a trait default is an
   overload** (`ACCEPTED`), and the default still satisfies the trait.
-  `sig` changes only methods without defaults.
+  `sig` changes only methods without defaults. (When it differs only in
+  conventions or `raises`, it's no overload: it's never called at all,
+  as found with raising methods below.)
 - **`^` on an `Int` has no effect** (`ACCEPTED`; Mojo warns "transfer
   from a value of trivial register type 'Int' has no effect"). The
   variable stays initialized, so `use_moved` and `loop_move` leave Ints
@@ -2221,6 +2223,172 @@ checked under the assumption `not True`, which proves every constraint.
 We added it there as a
 [comment](https://github.com/modular/modular/issues/7770#issuecomment-7209558100). The generator makes no vwhere mutants in ternary
 branches (`in_branch`), as for the other dead-branch kinds.
+
+## More exceptions: raising methods, `else`, `finally`, re-raising, carried values
+
+Probes on 2026112605:
+- **Trait methods.** A struct's implementation of a trait method has to
+  raise what the declaration does, or nothing: for `raises X0`, `raises
+  X0` or no `raises`; for `raises`, `raises` or none. Anything else
+  (`raises X1`, `raises` for `raises X0`, `raises X0` for `raises`, or
+  raising for a method that doesn't) is "'S' does not implement all
+  requirements for 'Tr'", with a note naming both error types. A call
+  on the struct itself goes by the implementation (one that doesn't
+  raise needs no `try`); a call through `T: Tr`, by the trait.
+- **`else` and `finally`** work as in Python: `else` runs when the body
+  finishes without raising and without `return`, `break` or `continue`,
+  and an error raised in it isn't caught by the same `try`'s handlers;
+  `finally` always runs, last, and a `return` in it drops an error on
+  its way out. Neither can see the body's variables ("use of unknown
+  declaration"). For moves, Mojo treats the handlers and `else` as
+  branches that join before `finally`: an outer variable moved in `else`
+  and not reinitialized is "use of uninitialized value" in `finally`,
+  and fine if `else` reinitializes it.
+- **Re-raising.** A typed handler's binding is owned: it can be
+  assigned, moved, and re-raised with `raise e^`, as its type (to an
+  outer `try`'s handler, or out of a function raising it or Error). A
+  bare `except e:` binds the errors left after the typed handlers as
+  their common type: with one type left, e is of that type (`e.code`
+  works, and `raise e^` raises it), else an Error (as the changelog
+  says). It's borrowed: `raise e^` works, with a warning that the
+  transfer has no effect.
+- **Carried values.** An error type can carry a struct value, but to
+  become an Error it must be Writable, and the default `write_to`
+  derived from the fields fails when one isn't ("Could not derive
+  Writable for X2 - member field `val: S` does not implement Writable",
+  when the conversion is instantiated), so it needs one written by
+  hand.
+
+In FM:
+- **Raising methods.** A third of the non-static methods (half for the
+  exception kinds), not `deinit self` ones (a counted struct's must call
+  `_died()`), raise: `raises` or `raises Xk` (MethodDecl.raise_ty).
+  Which trait methods each struct implements is drawn before the bodies
+  (`plan_impls`), with what each implementation raises (`impl_raises`: a
+  quarter of a raising method's raise nothing), so that a call's error
+  type is known where it's drawn: `method_raise` gives the
+  implementation's for a struct receiver, the trait's for a type
+  parameter (or an associated type of one). Method calls go only where
+  `raise_ok` allows, and `try` bodies record what they raise, as for
+  functions; near misses' callees don't raise. The evaluator retypes an
+  error leaving a `raises` body as an Error (`run_raising`).
+- **X2** (half the programs, 3/4 for the exception kinds) is a third
+  error type, with a second field `val` of a concrete Copyable struct
+  (`Program.carry_ty`) and a hand-written `write_to`. `raise X2(code,
+  val)` draws an owned value; handlers read `eN.val` (or copy it).
+- **Handlers.** Half the bare handlers bind the error, `except eN:`,
+  typed as Mojo does: the one type left, or Error (ERR -2, with no
+  fields). A third of the handlers with a binding end with `raise eN^`
+  where the error goes (`raise_ok` for that type), not after an exit.
+  The read-only mutants (assign_read, mut_read) leave bindings out: a
+  typed handler owns its error.
+- **`else` and `finally`** clauses come a quarter of the time each (half
+  for the try kinds), as S_HANDLER statements with target H_ELSE and
+  H_FINALLY, last in the `try`'s handler list. They're drawn like
+  handlers, with the outer variables read-only and the enclosing
+  context's `raise_ok`: an error from either goes outward. The evaluator
+  (`try_part`) runs `else` only after a body with no exit, and `finally`
+  on every way out, keeping a pending error or `return` value unless
+  `finally` exits itself.
+
+| Kind | Construct | Mojo's error, or why it's valid |
+|---|---|---|
+| `raise_impl` | a struct's implementation raising other than its trait's declaration allows | does not implement all requirements |
+| `try_scope` | `_use(vN)` in `finally`, for a variable the `try` body declared | use of unknown declaration |
+| `try_move` | `var vM = v^` in `else` for an outer variable, `_use(v)` in `finally` | use of uninitialized value |
+| near `try_move` | the same, with `v = ...` after the move in `else` | valid: `v` is initialized on every path into `finally` |
+
+raise_ctx also calls raising methods where nothing catches them, and
+raise_type also re-raises a handler's error (of the wrong type, or an
+Error) in a function raising another type.
+
+In 1,000 stage 2 programs (seed 7901), 162 run a `finally` (738
+times), 91 an `else` (376), 19 re-raise (36), 39 raise an X2 (73), and
+13 have an error leave a method (67); 251 raise and catch.
+
+**Found: an "override" of a trait default that raises more is ignored**
+([#6854](https://github.com/modular/modular/issues/6854), filed by someone
+else for the `raises` case;
+[commented](https://github.com/modular/modular/issues/6854#issuecomment-7223673505)
+with the conventions and error type cases). A struct method differing from a trait's default only
+in its argument conventions or in raising more (`raises` for a method
+that doesn't, `raises X1` for `raises X0`) is accepted without a
+warning, and never called: calls through a type parameter, and direct
+calls on the struct when the default doesn't raise, run the default
+(when it raises, a direct call is "ambiguous"). Without a default it's
+"does not implement all requirements"; two such methods in a struct are
+"cannot overload on argument conventions". The raise_impl mutant was
+accepted 15 times out of 200 for that reason: it now changes only
+implementations of methods without a default, as `sig` does.
+
+**Found: a reference in a `finally`**
+([#7818](https://github.com/modular/modular/issues/7818)). In the `finally`
+of a `try` whose body can raise, a reference to a value (a `ref` result
+taken from a temporary or a local, or `print`'s arguments) is "use of
+uninitialized value" in two situations, on 1117, 1125 and 1126: inside
+the `finally` of another `try` nested in it (whose body can raise), and
+in the live branch of a ternary with a constant condition. The
+workaround: no `finally` clause inside a `finally`, and no ternary with
+a constant condition in one (it's drawn as one of its values instead;
+DECL_FUZZ_NO_NESTED_FINALLY_WORKAROUND=1 lifts both).
+
+**Found: errors leaving a `try` with a `finally` lose their type**
+([#7819](https://github.com/modular/modular/issues/7819)). When a
+handler raises and the `finally` can raise two types, Mojo unifies the
+error types leaving the `try`: "cannot find a unified error type", or
+with Writable types an Error, which the outer `try`'s typed handlers
+then don't catch ("unhandled error types in try body: 'Error'"). And in
+a `try` with only a `finally` and a body that can't raise, a typed error
+raised in the `finally` is an Error ("cannot implicitly convert 'Error'
+value to 'X0'"); FM never makes such a `try`. The workaround: a
+`finally` raises one error type, drawn when it's begun among those its
+context lets out (`Ctx.fin_type`;
+DECL_FUZZ_NO_FINALLY_UNIFY_WORKAROUND=1 lifts it), and no raise_ctx or
+raise_type mutants in one (a wrongly typed raise in a `finally` is also
+reported at the `try`, not at the `raise`).
+
+**Found: a `return` in a `deinit self` method's `try` leaves self
+uninitialized in the `finally`**
+([#7820](https://github.com/modular/modular/issues/7820)): "use of uninitialized
+value 'self'" at a use of a field there, on 1117, 1125 and 1126; with a
+`var` parameter instead, it's accepted. The workaround: no `finally` in
+`deinit self` methods (DECL_FUZZ_NO_DEINIT_FINALLY_WORKAROUND=1 allows
+it).
+
+**Found: #7812 reaches the `finally`**
+([comment](https://github.com/modular/modular/issues/7812#issuecomment-7218657873)). With an unreachable handler (the
+unreachable near miss, whose body is `pass`), a `finally` clause of the
+same `try` can't use local variables either: "use of uninitialized
+value". The workaround: no `finally` on a `try` with the near miss's
+handler (lifted with DECL_FUZZ_NO_UNREACHABLE_WORKAROUND=1).
+
+Generator bugs found on the way: the try_move near miss's reinitializing
+value could call a raising function, so that the `finally` could see
+the variable moved (Mojo was right: it's now drawn with no raising
+calls); a bare handler's binding was typed Error even when one error
+type was left, so that a re-raise of it was taken for an Error (an outer
+bare handler then unreachable, with #7812's symptom); assign_read used
+a typed handler's binding, which it owns (2 accepted mutants; it and
+mut_read now leave bindings out); and the first version of the
+one-type `finally` returned from `raise_if` after raising `Ctx.depth`,
+so that an entry point's top-level block took itself for a nested one
+and dropped its locals (DIFF_EXPECTED: the result read another
+variable's slot; and "use of unknown declaration" for `ref` bindings).
+Found with an evaluator trace of a replayed case (a fake oracle failing
+only on the program's text gave the reproduce blob).
+
+**Validation.** With the final generator on nightly 1.3.0.dev2026112605
+everything was OK: 800 stage 2 programs, 600 near misses and 400
+mutants of all kinds, 300 deinit_drop, deinit_move and try_move near
+misses, and 300 mutants of the exception kinds (seeds 111-115). Before
+the last two fixes, a round of 2,800 programs of the same mix (seeds
+81-86) was all OK; one of 2,300 (seeds 91-96) had 6 near misses failing
+from the rename-`U=` interplay below, and 1,000 more (seeds 101-103) the
+one `deinit self` case. A keyword call `x.m[U=S1, k=3]` on a struct
+whose implementation renamed U (the rename near miss) is "unexpected
+keyword parameter 'U'": a concrete receiver's call uses the
+implementation's names, so the rename near miss makes no `U=` calls.
+
 
 ## Beyond the paths
 
