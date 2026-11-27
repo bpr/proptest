@@ -2390,6 +2390,223 @@ keyword parameter 'U'": a concrete receiver's call uses the
 implementation's names, so the rename near miss makes no `U=` calls.
 
 
+## Patterns: `match`, `case` clauses, `guard`, tuple bindings
+
+The 2026112705 nightly has `match` with literal, `|`, `== e`, name,
+`var`/`ref` name, struct, tuple, enum-case and list patterns and `if`
+guards; `if case`; `if`, `comptime if` and `guard` with
+semicolon-separated clauses mixing Boolean conditions and `case
+<pattern> = <subject>`, each seeing the bindings of those before it;
+`guard ... else:`, whose `else` must not fall through and whose bindings
+stay in scope after it; and `var` bindings that move out of a temporary
+tuple (or enum).
+
+Probes on 2026112705:
+- **Struct patterns** name fields (`S1(f0=x, f2=_)`, any subset, not
+  positionally: "struct patterns do not support positional or unpacked
+  arguments"); the head is any spelling of the type, `Self`, `B[T]`,
+  `V[(n + 1)]`, `Self.E0`, but a generic struct needs its argument (`B(...)`
+  is "'B[_]' is not concrete"). A field's `== e` is written `f= == e`
+  (`f=== e` doesn't parse); `as` isn't allowed in a field.
+- **Bindings to a variable's fields are references.** After `case
+  P(x=x, y=_)` on a variable v, `v.x = 100` then `x` reads 100; after
+  `v` is reassigned whole, the new value; after `var w = v^`, `x` is "use
+  of uninitialized value 'v'". They're immutable: assigning one is
+  "expression must be mutable in assignment", passing it `mut` "must be
+  mutable", `x^` "expression does not designate a value with an origin".
+  A `var` binding is a copy, so its type must be ImplicitlyCopyable
+  ("cannot be implicitly copied", also out of a temporary struct, #7659);
+  out of a temporary tuple it moves (`case (var a, var b) = (R(1),
+  R(2))` with R only Movable). Out of scope (an `if case`'s `else`, after
+  it) a binding is "use of unknown declaration".
+- **Errors:** a field the struct doesn't have, "'z' is not a field of
+  'P'"; another struct type, "cannot match value of type 'P' against
+  pattern type 'C'"; a literal for a struct field, "'C' does not
+  implement the '__eq__' method"; a `guard` whose `else` falls through,
+  "guard 'else' block must not fall through" (not checked when the
+  `else` is dead: its patterns always match).
+- `match`, `guard`, the clauses and tuple bindings work at compile time
+  (`comptime k = f(...)`) as at run time.
+
+In FM: S_MATCH (with S_CASE cases), S_IFC (`if` with clauses), S_GUARD
+and S_DESTR (`var (bA, bB) = (e1, e2)`), with a clause set (CL_BOOL
+comparisons and CL_CASE patterns, `Program.clauses` and `csets`) and
+patterns as trees (`PatNode`, PK_*):
+- **Subjects:** a live variable of a struct type with fields (the
+  pattern's names then bind its fields), a temporary struct (a place is
+  copied, `v.copy()`), a tuple of two or three temporaries (owned, so
+  moves happen here: only in the first clause, which always runs), or
+  for `match` an Int (`Int(v)` for a place).
+- **Patterns:** a struct pattern names a random nonempty subset of the
+  fields; a field's pattern is `_`, a name, `var` name (ImplicitlyCopyable
+  fields), a literal, `l1 | l2` or `== e` (Int fields), or a struct
+  pattern one level down (on a variable subject without names: they
+  would be deeper places). A tuple's elements are `var` names (all of
+  them, see below), or `_`, names and tests.
+- **Bindings** of a variable's fields go with the `ref` bindings: a name
+  is another spelling of the place `v.fK`, used where it would be read
+  (`spell`), never written, borrowed `mut`, or bound by a `ref` (the
+  write spellings skip read-only bindings, `Ctx.ref_ro`). That gives
+  Mojo's reference semantics for free: the evaluator reads the place.
+  The other bindings are locals: read ones (a name on a temporary,
+  holding the value) or owned ones (`var`). The evaluator matches
+  values (`match_pat`, `run_clauses`) and pushes the locals in the order
+  the generator did.
+- **Statements:** a `match` has one to three cases (a third guarded) and
+  perhaps a last `case _:`, and stops after a case that matches
+  everything (no unreachable cases); an `if` has one to three clauses
+  (at least one `case`) and perhaps an `else`; a `guard` (where the
+  body can exit) has an `else` that returns, or in a loop breaks or
+  continues, drawn without the bindings, which come back after it.
+
+| Kind | What |
+|---|---|
+| pat_field | a struct pattern names a field `z` its struct doesn't have |
+| pat_type | a struct pattern for another struct type than the subject's |
+| pat_scope | `_use(bN)` of a binding in the `else` of the `if` or `guard` that binds it |
+| guard_fall | a `guard`'s `else` falls through (not a dead one) |
+| pat_var | `var` binding of a variable's field that isn't ImplicitlyCopyable |
+
+The existing read-variable mutants reach the bindings too: assign_read
+assigns a read local, move_read and ref_move move one or a read-only
+binding.
+
+**Found: a negative literal in two cases makes a `match` exhaustive**
+(filed as [#7828](https://github.com/modular/modular/issues/7828)). `match a:` with `case -1:` twice (or `(-1000003)`, not
+adjacent either) is taken to cover every value: the code after the
+`match` is compiled as a trap (SIGILL, at -O0 and -O3; at compile time
+"failed to fold operation hlcf.unreachable"), later cases don't run,
+and a missing `return` after it isn't diagnosed. A positive literal or
+0 twice, two different negative ones, `-1 | -1`, or a struct field's
+`-1` twice work. Found as a BUILD_FAIL of the compile-time twin, then a
+SIGILL at run time, reduced with the statement reducer and by hand. The
+workaround: no literal in two cases of an Int's `match`
+(`fresh_literals`; DECL_FUZZ_NO_DUP_CASE_WORKAROUND=1 lifts it).
+
+**Found: #7767 without a `ref`** ([comment](https://github.com/modular/modular/issues/7767#issuecomment-7229729195)). A `var` binding in a
+temporary tuple beside an element pattern that can fail (`case (var z,
+3) = (a + 1, a)`, also `(3, var z)`, `(var z, == a)`, `(var z, (3,
+_))`) is "use of uninitialized value '(tuple element)'" in `if case`,
+`match` and `guard`; so is `ref r = z` after `(var z, w)` or `(var z,
+_)`, in `if case` and `match`, or after `(var z, var w)` once w is
+moved; and two of them passed `mut` to one call, `g(z, w)`, are
+"aliasing values passed mutably" (the pieces share the tuple's origin).
+And **in a `guard`, a tuple clause after the
+first copies its elements** ([comment](https://github.com/modular/modular/issues/7659#issuecomment-7229728751) on #7659): `guard a > 0;
+case (var z, var w) = (R(1), R(2)) else:` with R only Movable is
+"cannot be implicitly copied" (first, or in an `if`, it moves). The
+workarounds: a temporary tuple with a `var` element has only `var`
+elements, which no `ref` binds, none is passed `mut`, and none is
+moved (a move of one could make another "uninitialized", with no `ref`
+in sight) (`Ctx.from_tuple`; DECL_FUZZ_NO_TUPLE_VAR_WORKAROUND=1 lifts these), and
+none after a `guard`'s first clause
+(DECL_FUZZ_NO_GUARD_VAR_WORKAROUND=1).
+
+**Found: #7813 through an unreachable case** ([comment](https://github.com/modular/modular/issues/7813#issuecomment-7229730079)). A
+`raise` in a case that can't run (after one matching everything, or a
+repeated literal) in a `try` is "'hlcf.unreachable' op attribute
+'fallthroughError' failed to satisfy constraint" (and generated
+programs with one segfaulted at the `try`, as in #7813). Mojo also
+takes the `else` of an `if` or `guard` whose patterns always match for
+dead, ignoring Boolean clauses (it warns "unreachable code after match
+that always completes" for `guard a > 0; case P(x=x, y=_) = ... else:`,
+whose `else` does run when `a <= 0`: filed as [#7829](https://github.com/modular/modular/issues/7829)), so a
+raising call there makes the enclosing `try`'s handler for it
+unreachable (#7812). The workaround: no unreachable cases, and such an
+`else` is drawn as a constant `if`'s dead branch, without raise points
+or mutants (`dead_else`). Constant subjects and comparisons (`match
+100:`, `if c; S2.K2 == (-3); ...`, a case's `if 1 < 2`) fold the same way
+(`const_clauses`): their branches are drawn as dead ones, and a `guard`
+with one isn't drawn (a false one would leave the rest of its block
+dead).
+
+**Not reduced yet: a `guard` that always matches, at the end of a `try`
+body, can hide a use after a move in the `try`'s `else`.** A try_move
+mutant (`else: var v = p0^`, then `p0` used in the `finally`, or after
+the `try`) was accepted; replacing the `guard` (`guard case (var b13,
+var b14, var b15) = (..., x.m2(...), ...) else: return ...`, with raising
+calls in its subject) by `_ = 0` gives the expected "use of
+uninitialized value 'p0'". Reduced to a 40-line generated program (a
+trait's default method with nested `try`s), but my small versions are
+rejected as they should be. The workaround: no such `guard` in a `try`
+body (DECL_FUZZ_NO_GUARD_TRY_WORKAROUND=1 allows it).
+
+**Found: #7818 in a `comptime if`** ([comment](https://github.com/modular/modular/issues/7818#issuecomment-7229730998)): a reference in a
+branch of a `comptime if` in a `finally` is "use of uninitialized
+value"; the nested-finally workaround now draws no `comptime if` in a
+`finally`. And **#7811 in a pattern** ([comment](https://github.com/modular/modular/issues/7811#issuecomment-7229729567)): in a body with
+`where conforms_to(T, Tr1)`, a value of type `B[T(Tr0 & Tr1)]` (from a
+method of T returning `B[Self]`) doesn't match `case B[T](...)`: "cannot
+match value of type"; under the where workaround, patterns skip types
+that mention a type parameter.
+
+Generator bugs on the way: a case's clause set was looked up after its
+body was drawn (a nested pattern statement had added others); `f=== e`;
+the guard_fall mutant in a dead `else` (47 accepted); pat_var on a
+temporary struct, which #7659 would make a move; and an `if`'s clauses
+drawn one block deeper than the `if`, so that a move in a clause looked
+like one in a block that a later loop's assignment reinitialized
+(BUILD_FAIL "use of uninitialized value", and the move_copy near miss's
+evaluator reading a moved variable); a move in an `== e` pattern or a
+case's guard, which runs only if what comes before matched (an Int's
+`v^`, which Mojo ignores, left the evaluator's v moved); the type
+mutant in a tuple's elements, whose types are free (4 accepted); and
+an implicit_copy mutant's place as a subject, which the subject's
+`.copy()` made valid (1 accepted); and a constant subject (`match
+100:`), which Mojo folds, so that a ret_uninit mutant in its dead case
+was accepted: a constant subject's branches are now drawn like a
+constant `if`'s (`const_clauses`). Two older ones the rounds showed: a
+raise point that leaves the function while a `mut` argument is moved
+(`mut_moved`; Mojo says "use of uninitialized value" at the raise, as at
+a `return`), and the harness's `Res` ledger at 0x7E5500000000, where
+mmap can place a malloc arena under ASLR: the MAP_FIXED_NOREPLACE
+mapping then failed, unchecked, and the counts corrupted the heap (an
+UNBALANCED with a pointer for a count, then a glibc assertion, at -O3,
+once in 600 programs). It's now at 0x100000000000, and checked. And
+the reinitializations at the end of a nested block could move a
+variable the loop over them had passed (`v0 = p0^`), which the next case
+of a `match` then reassigned, so that it looked live after the `match`
+on every path: they now never move (as in loops before). And an older one the round showed:
+the assoc mutant rebinding an associated type that a nested `Self.E0.E1`
+or an implementation's signature (`B2[Self.E1]`, written with the
+binding) uses, which Mojo reports there first (WRONG_LINE, 1 in 40 assoc
+mutants on some seeds, on 2026112605 too); it now rebinds only unused
+ones.
+
+Probed, not generated yet:
+- **Conditional types** `A if c else B` (in parameters, results, fields
+  and `comptime` aliases) refine to the arm inside `comptime if c:`, its
+  `else`, and after `comptime assert c`, and convert from the selected
+  arm; an unrefined value works where both arms conform to the bound.
+  Mojo recognizes `2 < k`, `k >= 3`, `(k + 0) > 2` and `not not (k > 2)`
+  as `k > 2`, but not `k + 1 > 3`, `k - 2 > 0`, or `k <= 2` as `not (k >
+  2)`.
+- **Mixed packs:** `f(A(1), *args, B(2))` and `f(*args, *args)` work, also
+  with an empty pack and `mut` packs; `bump(*args, *args)` on a `mut`
+  pack is "aliasing values passed mutably".
+
+In 1,000 stage 2 programs (seed 7911), 485 execute a pattern statement
+(11,538 times), 466 have a pattern match (10,438 times), and 273 run a
+`guard`'s `else` (3,821 times).
+
+**Validation**, on nightly 1.3.0.dev2026112705. With the final
+generator, everything was OK: 600 stage 2 programs, 600 near misses,
+1,400 mutants of all kinds and 300 of the pattern kinds (seeds
+2851-2863). The rounds before it (about 9,000 programs, seeds
+2701-2842) found the bugs and generator bugs above. Two generated
+programs (of 600) overflowed the compiler's stack with no location (a
+recursion in MLIR's `CyclicAttrTypeReplacer`). Reduced, it is #7814 with
+another trigger: `comptime E2 = B1[Self]` in a `B1` with a field of type
+`Self.T.E2.E2` ([comment](https://github.com/modular/modular/issues/7814#issuecomment-7229730460)). The #7814 workaround now also keeps a
+struct out of its own bindings twice (`B1[Self]`) when one of its fields
+has a nested associated type. With it, 600 stage 2 programs, 300
+near misses and 300 mutants (seeds 2881-2883) were OK but for one
+`-O3` build crash in `mlir::Operation::fold`, seen in five of its first ten
+builds, while the machine was loaded (load average 47 on 16 CPUs), and
+in none of the 40 after, even under CPU load: not reduced or filed. A baseline of 900 programs with
+the generator before this step was all OK on 2026112705.
+
+
 ## Beyond the paths
 
 Mojo features FM leaves out for now:
@@ -2405,3 +2622,9 @@ Mojo features FM leaves out for now:
   (`struct V[n: Int] where n > 0`, which every `V[n - 1]` would need
   evidence for, in signatures too), and keyword and default arguments.
 - **`Variant` and `isa`:** the counterpart of FJ's downcasts.
+- **Conditional types and variadic packs** (probed, see "Patterns"):
+  `V[n] if <prop> else W` in signatures of functions over n, refined by
+  `comptime if`; functions over `*args: *Ts` that combine their elements
+  with `comptime for`, called with arguments and unpacked packs mixed.
+- **More patterns:** enum cases (`Optional`, `__enum`), list patterns,
+  `ref` names, `while case`, `comptime match`, clauses in `comptime if`.

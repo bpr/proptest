@@ -156,6 +156,25 @@
 # variable in them; try_move moves an outer one in `else` and uses it in
 # `finally`, and the near miss reinitializes it first).
 #
+# Patterns: bodies have `match` statements (on a variable, a temporary
+# struct or an Int, with guards, perhaps ending with `case _:`), `if`
+# statements whose semicolon-separated clauses mix comparisons and `case
+# <pattern> = <subject>` (each clause seeing the bindings of those
+# before it), `guard <clauses> else:` with an `else` that exits, and
+# `var (bA, bB) = (e1, e2)`. A struct pattern names some of the fields
+# (`S1(f0=b3, f2=(-1) | 7)`); a field's pattern is `_`, a name, `var
+# name` (an ImplicitlyCopyable copy), a literal, `l1 | l2`, `== e`, or a
+# struct pattern. A tuple pattern (on a tuple of temporaries) moves its
+# elements into `var` names. A name in a variable subject's pattern is
+# another spelling of the field's place, read-only (Mojo binds a
+# reference: a later assignment to the variable shows through it), so it
+# goes with the `ref` bindings (`Ctx.ref_ro`); on a temporary it's a read
+# local. The pattern mutants name a field the struct doesn't have
+# (pat_field), match another struct type (pat_type), use a binding out
+# of its scope (pat_scope), let a `guard`'s `else` fall through
+# (guard_fall), or bind a field that isn't ImplicitlyCopyable with `var`
+# (pat_var).
+#
 # Every program terminates: each method and function has a rank, and a
 # body calls only methods and functions of lower rank; loops have constant
 # bounds. The generator also evaluates the program itself (`Program.eval`,
@@ -330,6 +349,43 @@ comptime S_CIF = 13
 """`comptime if <prop>:` over the function's value parameter (a = its
 prop_key, name = its text), with body and orelse; outer variables are
 read-only in both."""
+comptime S_MATCH = 14
+"""`match <subject>:`, the subject a variable (target: its slot; name: its
+name) or an expression (e), with its cases in body (S_CASE)."""
+comptime S_CASE = 15
+"""A case of a `match` (a = its clause set: the pattern, perhaps then a
+guard), with its body."""
+comptime S_IFC = 16
+"""`if <clauses>:` with semicolon-separated clauses, Boolean ones and
+`case <pattern> = <subject>` (a = the clause set), body and orelse."""
+comptime S_GUARD = 17
+"""`guard <clauses> else:` (a = the clause set), with orelse, which exits;
+the bindings stay in scope after it."""
+comptime S_DESTR = 18
+"""`var (bA, bB) = (e1, e2)` (a = the clause set: a tuple of `var`
+bindings)."""
+
+# patterns (PatNode.kind)
+comptime PK_WILD = 0
+comptime PK_BIND = 1
+"""A name: a read-only `ref` binding to a field of a variable subject
+(push False), or a read local holding the value (push True)."""
+comptime PK_VAR = 2
+"""`var name`: an owned local (a copy, or moved out of a tuple)."""
+comptime PK_LIT = 3
+"""An Int literal (a: its index in LITERALS)."""
+comptime PK_OR = 4
+"""`l1 | l2`: literals a and b."""
+comptime PK_EQ = 5
+"""`== e` (a: the expression)."""
+comptime PK_STRUCT = 6
+"""`Head(f=p, ...)` (name: the head): fields and their patterns, kids."""
+comptime PK_TUPLE = 7
+"""`(p, ...)`: the elements' patterns, kids."""
+
+# clauses of an `if`, `guard` or `case`
+comptime CL_BOOL = 0
+comptime CL_CASE = 1
 
 # what executing a statement did, for the evaluator
 comptime SIG_NONE = 0
@@ -426,7 +482,13 @@ comptime STAT_RAISING_METHOD = 32
 """Errors raised out of a method."""
 comptime STAT_CARRY = 33
 """X2 errors (carrying a struct) raised."""
-comptime N_STATS = 34
+comptime STAT_MATCH = 34
+"""`match`, `if` with a `case` clause, and `guard` statements executed."""
+comptime STAT_PATTERN = 35
+"""Patterns that matched (a `case` run, a clause that held)."""
+comptime STAT_GUARD = 36
+"""`guard` statements whose `else` ran."""
+comptime N_STATS = 37
 comptime STAT_NAMES: List[String] = [
     "own",
     "required",
@@ -462,6 +524,9 @@ comptime STAT_NAMES: List[String] = [
     "reraise",
     "raising_method",
     "carry",
+    "match",
+    "pattern",
+    "guard_exit",
 ]
 
 # Stage 3: ill-typed mutants (DECL_FUZZ_MUTANTS=1). Each program gets one
@@ -569,7 +634,22 @@ variable the `try` body declared: "use of unknown declaration"."""
 comptime MU_TRY_MOVE = 34
 """An outer variable moved in a `try` statement's `else` clause, then
 used in its `finally`: "use of uninitialized value"."""
-comptime N_MU = 35
+comptime MU_PAT_FIELD = 35
+"""A struct pattern naming a field its struct doesn't have: "'z' is not a
+field of 'S1'"."""
+comptime MU_PAT_TYPE = 36
+"""A struct pattern for another type than its subject's: "cannot match
+value of type 'S1' against pattern type 'S2'"."""
+comptime MU_PAT_SCOPE = 37
+"""A pattern's binding used out of its scope: in the `else` of an `if`
+whose clause binds it, or of a `guard`: "use of unknown declaration"."""
+comptime MU_GUARD_FALL = 38
+"""A `guard` whose `else` falls through: "guard 'else' block must not
+fall through"."""
+comptime MU_PAT_VAR = 39
+"""A `var` binding of a struct's field that isn't `ImplicitlyCopyable`
+(it would be a copy): "cannot be implicitly copied"."""
+comptime N_MU = 40
 comptime MU_NAMES: List[String] = [
     "type",
     "use_moved",
@@ -606,6 +686,11 @@ comptime MU_NAMES: List[String] = [
     "raise_impl",
     "try_scope",
     "try_move",
+    "pat_field",
+    "pat_type",
+    "pat_scope",
+    "guard_fall",
+    "pat_var",
 ]
 comptime MU_ODDS = 6
 """Each chance to apply the mutation is taken 1 time in MU_ODDS."""
@@ -761,7 +846,7 @@ def _use[T: AnyType](x: T):
 
 """
 
-comptime RUN_TIME_RES = """comptime _LEDGER = 0x7E5500000000
+comptime RUN_TIME_RES = """comptime _LEDGER = 0x100000000000
 
 
 def _live() -> Pointer[Int, MutUntrackedOrigin]:
@@ -771,7 +856,12 @@ def _live() -> Pointer[Int, MutUntrackedOrigin]:
 
 def _ledger_init():
     # PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE
-    _ = external_call["mmap", Int](_LEDGER, 4096, 3, 0x100022, -1, 0)
+    # (an address mmap doesn't hand out: one taken would make the counts
+    # land in other memory)
+    var at = external_call["mmap", Int](_LEDGER, 4096, 3, 0x100022, -1, 0)
+    if at != _LEDGER:
+        print("LEDGER_MAP_FAILED")
+        external_call["exit", NoneType](3)
 
 
 def _check(i: Int):
@@ -1062,6 +1152,38 @@ struct Stmt(Copyable):
 
 
 @fieldwise_init
+struct PatNode(Copyable):
+    """A pattern (PK_*)."""
+
+    var kind: Int
+    var ty: Int
+    """The type it matches."""
+    var a: Int
+    var b: Int
+    var push: Bool
+    """Whether it adds a variable (a PK_BIND or PK_VAR)."""
+    var name: String
+    """A binding's name, or a struct pattern's head."""
+    var fields: List[Int]
+    var kids: List[Int]
+
+
+@fieldwise_init
+struct Clause(Copyable):
+    """A clause: CL_BOOL `l op r`, or CL_CASE `case <pattern l> =
+    <subject>`, the subject a variable (subj: its slot, text: its name),
+    an expression or a tuple's elements (sexprs), or a `match`'s (neither)."""
+
+    var kind: Int
+    var op: Int
+    var l: Int
+    var r: Int
+    var subj: Int
+    var sexprs: List[Int]
+    var text: String
+
+
+@fieldwise_init
 struct Ctx(Copyable):
     """Γ with each variable's kind and state, the type parameters in scope,
     the rank of the body, and the exclusivity state of the statement being
@@ -1126,8 +1248,17 @@ struct Ctx(Copyable):
     var ref_field: List[Int]
     """...the field of it (-1 for the whole variable)..."""
     var ref_depth: List[Int]
-    """...and the block depth of its declaration (it goes out of scope at
-    the end of that block)."""
+    """...the block depth of its declaration (it goes out of scope at the
+    end of that block)..."""
+    var ref_ro: List[Bool]
+    """...and whether it's read-only (a pattern's binding)."""
+    var from_tuple: List[Bool]
+    """Per variable: bound out of a temporary tuple by a pattern, which no
+    `ref` binds: one is checked against the tuple's last element, so a
+    move of that is "use of uninitialized value '(tuple element)'" at the
+    `ref`'s use (modular/modular#7767); none is passed `mut`: two of
+    one tuple share its origin ("aliasing values passed mutably"); and
+    none is moved: a move of one can make the others uninitialized."""
     var self_ty: Int
     """In a struct's body, its type (with `Self.T` or `Self.n`), or -1."""
     var raise_ty: Int
@@ -1195,6 +1326,8 @@ struct Ctx(Copyable):
         self.ref_var = []
         self.ref_field = []
         self.ref_depth = []
+        self.ref_ro = []
+        self.from_tuple = []
         self.self_ty = -1
         self.raise_ty = -1
         self.catching = 0
@@ -1213,6 +1346,7 @@ struct Ctx(Copyable):
         self.move_depth.append(-1)
         self.touched.append(False)
         self.excl.append(False)
+        self.from_tuple.append(False)
 
     def drop_refs(mut self, depth: Int, n: Int):
         """Ends the scope of the bindings declared at depth or deeper, or
@@ -1224,6 +1358,7 @@ struct Ctx(Copyable):
                 _ = self.ref_var.pop(i)
                 _ = self.ref_field.pop(i)
                 _ = self.ref_depth.pop(i)
+                _ = self.ref_ro.pop(i)
             else:
                 i += 1
 
@@ -1237,6 +1372,7 @@ struct Ctx(Copyable):
             _ = self.move_depth.pop()
             _ = self.touched.pop()
             _ = self.excl.pop()
+            _ = self.from_tuple.pop()
 
     def new_statement(mut self):
         for i in range(len(self.names)):
@@ -1304,6 +1440,10 @@ struct Program(Movable):
     var bodies: List[Body]
     var exprs: List[Expr]
     var stmts: List[Stmt]
+    var pats: List[PatNode]
+    var clauses: List[Clause]
+    var csets: List[List[Int]]
+    """Clause sets: the clauses of an `if`, `guard` or `case`."""
     var entries: List[Int]
     """Bodies of run_f0, run_f1, ..."""
     var vtag: List[Int]
@@ -1414,6 +1554,9 @@ struct Program(Movable):
         self.bodies = []
         self.exprs = []
         self.stmts = []
+        self.pats = []
+        self.clauses = []
+        self.csets = []
         self.entries = []
         self.vtag = []
         self.vint = []
@@ -2330,12 +2473,14 @@ struct Program(Movable):
             if self.has_nested(t):
                 continue
             # Mojo overflows its stack on `comptime E0 = B1[B1[Self.T.E0]]`
-            # in a B1 with a field of type `Self.T.E0`
-            # (modular/modular#7814): not the struct
-            # twice around an associated type
+            # in a B1 with a field of type `Self.T.E0`, and on
+            # `comptime E0 = B1[Self]` in one with a field of type
+            # `Self.T.E0.E0` (modular/modular#7814): not the struct
+            # twice around an associated type, nor twice at all if a
+            # field has a nested associated type
             if (
                 self.nest_count(t, s) >= 2
-                and self.has_any_assoc(t)
+                and (self.has_any_assoc(t) or self.has_nested_field(s))
                 and getenv("DECL_FUZZ_NO_ASSOC_NEST_WORKAROUND") == ""
             ):
                 continue
@@ -2357,6 +2502,13 @@ struct Program(Movable):
     def is_nested(self, ty: Int) -> Bool:
         """Whether ty is an associated type of one, `T.E0.E1`."""
         return self.tkind[ty] == ASSOC and self.tkind[self.targ[ty]] == ASSOC
+
+    def has_nested_field(self, s: Int) -> Bool:
+        """Whether a field of struct s has a nested associated type."""
+        for f in self.structs[s].fields:
+            if self.has_nested(f):
+                return True
+        return False
 
     def has_nested(self, ty: Int) -> Bool:
         """Whether ty has a nested associated type (`X.E0.E1`) in it."""
@@ -3478,7 +3630,18 @@ struct Program(Movable):
             var cands = List[Int]()
             for st in range(len(self.structs)):
                 for i in range(len(self.structs[st].a_traits)):
-                    var u = self.traits[self.structs[st].a_traits[i]].assoc
+                    var at = self.structs[st].a_traits[i]
+                    var u = self.traits[at].assoc
+                    # (not one the bodies may use the bound's own
+                    # associated type through, `Self.E0.E1`, nor one a
+                    # signature mentions, `B2[Self.E0]` in the struct's
+                    # implementation is written with the binding: a type
+                    # that doesn't conform is an error at that use first)
+                    var used = self.traits[u].assoc >= 0
+                    for m in range(len(self.methods)):
+                        used = used or self.sig_has_assoc(m, at)
+                    if used:
+                        continue
                     for t in concrete:
                         if not self.conforms(t, u, []):
                             cands.append((st * 64 + i) * 1024 + t)
@@ -4137,7 +4300,10 @@ struct Program(Movable):
             if to_reinit < 0 and self.wants_near(NR_REF_REINIT):
                 # `ref rN = x` (or x.fK), x moved, reinitialized later in
                 # the block, then rN used
-                var owned = self.owned_vars(ctx, len(ctx.names))
+                var owned = List[Int]()
+                for v in self.owned_vars(ctx, len(ctx.names)):
+                    if not ctx.from_tuple[v]:  # (see Ctx.from_tuple)
+                        owned.append(v)
                 if len(owned) > 0 and self.near_chance(data, NR_REF_REINIT):
                     to_reinit = owned[pick(data, len(owned))]
                     var nf = len(self.fields_of(ctx.types[to_reinit]))
@@ -4259,10 +4425,12 @@ struct Program(Movable):
             ctx.truncate(n_outer)
             return out^
         if ctx.depth > 0:
-            # (in a loop's body, no moves in the reinitializations: one
-            # could move a variable already passed over, which the next
-            # iteration uses)
-            ctx.no_move += Int(loop)
+            # (no moves in the reinitializations: one could move a
+            # variable already passed over, which the next iteration uses
+            # in a loop's body, and which the next case of a `match`, or an
+            # `if`'s other branch, could reinitialize, so that it looks
+            # live after the statement)
+            ctx.no_move += 1
             for v in range(n_outer):
                 if (
                     live_at_start[v]
@@ -4272,7 +4440,7 @@ struct Program(Movable):
                     and v != self.keep_dead
                 ):
                     out.append(self.gen_reinit(data, ctx, v))
-            ctx.no_move -= Int(loop)
+            ctx.no_move -= 1
             ctx.drop_refs(ctx.depth, n_outer)
             ctx.truncate(n_outer)
         return out^
@@ -5217,9 +5385,18 @@ struct Program(Movable):
                 ctx.kinds[v] == V_OWNED
                 and ctx.live[v]
                 and ctx.types[v] != self.int_ty
+                and not self.tuple_bound(ctx, v)
             ):
                 out.append(v)
         return out^
+
+    def tuple_bound(self, ctx: Ctx, v: Int) -> Bool:
+        """Whether v was bound out of a temporary tuple by a pattern (and
+        the workaround applies): see Ctx.from_tuple."""
+        return (
+            ctx.from_tuple[v]
+            and getenv("DECL_FUZZ_NO_TUPLE_VAR_WORKAROUND") == ""
+        )
 
     def loop_movable(
         self, ctx: Ctx, n_outer: Int, body: List[Int]
@@ -5274,13 +5451,14 @@ struct Program(Movable):
         """`ref rN = <the place v or v.f<f>>`, in scope until the end of the
         block."""
         ctx.new_statement()
-        var e = self.spell(data, ctx, v, f)
+        var e = self.spell(data, ctx, v, f, True)
         var name = String("r", ctx.counter)
         ctx.counter += 1
         ctx.ref_names.append(name.copy())
         ctx.ref_var.append(v)
         ctx.ref_field.append(f)
         ctx.ref_depth.append(ctx.depth)
+        ctx.ref_ro.append(False)
         return self.add_stmt(Stmt(S_REF, -1, e, -1, 0, [], [], name^))
 
     def ref_places(mut self, ctx: Ctx) -> List[Int]:
@@ -5290,6 +5468,11 @@ struct Program(Movable):
         var out = List[Int]()
         for v in range(len(ctx.names)):
             if not ctx.live[v] or self.tkind[ctx.types[v]] == ERR:
+                continue
+            if (
+                ctx.from_tuple[v]
+                and getenv("DECL_FUZZ_NO_TUPLE_VAR_WORKAROUND") == ""
+            ):
                 continue
             if ctx.kinds[v] != V_READ or ctx.types[v] != self.int_ty:
                 out.append(v * 64)
@@ -5305,13 +5488,20 @@ struct Program(Movable):
         )
 
     def spell(
-        mut self, mut data: ConjectureData, ctx: Ctx, v: Int, f: Int
+        mut self,
+        mut data: ConjectureData,
+        ctx: Ctx,
+        v: Int,
+        f: Int,
+        write: Bool = False,
     ) raises -> Int:
         """The place `v` or `v.f<f>` (as place_expr), perhaps spelled
         through a `ref`: an accessor `v.f<f>_ref()`, a binding to the place,
         or a binding to v then `.f<f>` (or the accessor). Only for a live v
         (but for a use_moved mutant), and not for a move: a `ref` names
-        the place, which Mojo checks like the variable itself."""
+        the place, which Mojo checks like the variable itself. To write
+        to the place (or bind it), not through a pattern's binding, which
+        is read-only."""
         var e = self.place_expr(ctx, v, f)
         var texts: List[String] = [self.exprs[e].text]
         var vty = ctx.types[v]
@@ -5319,7 +5509,7 @@ struct Program(Movable):
         if acc:
             texts.append(String(ctx.names[v], ".f", f, "_ref()"))
         for b in range(len(ctx.ref_names)):
-            if ctx.ref_var[b] != v:
+            if ctx.ref_var[b] != v or (write and ctx.ref_ro[b]):
                 continue
             if ctx.ref_field[b] == f:
                 texts.append(ctx.ref_names[b])
@@ -5446,7 +5636,24 @@ struct Program(Movable):
             kinds += [S_TRY, S_TRY]
             if self.try_kind():
                 kinds += [S_TRY, S_TRY, S_TRY, S_TRY]
-        if self.cif_fn >= 0 and ctx.depth < MAX_DEPTH:
+        if (
+            ctx.depth < MAX_DEPTH
+            and ctx.no_exit == 0
+            and getenv("DECL_FUZZ_NO_PATTERNS") == ""
+        ):
+            kinds += [S_MATCH, S_MATCH]
+            if self.mutant >= MU_PAT_FIELD and self.mutant <= MU_PAT_VAR:
+                kinds += [S_MATCH, S_MATCH, S_MATCH, S_MATCH]
+        if (
+            self.cif_fn >= 0
+            and ctx.depth < MAX_DEPTH
+            and not (
+                # (a reference in its branches is "use of uninitialized
+                # value", modular/modular#7818)
+                ctx.in_finally > 0
+                and getenv("DECL_FUZZ_NO_NESTED_FINALLY_WORKAROUND") == ""
+            )
+        ):
             kinds.append(S_CIF)
             if self.mutant == MU_VWHERE or self.near == NR_VWHERE:
                 kinds += [S_CIF, S_CIF]
@@ -5488,6 +5695,8 @@ struct Program(Movable):
             return self.try_statement(data, ctx)
         if kind == S_CIF:
             return self.cif_statement(data, ctx)
+        if kind == S_MATCH:
+            return self.pattern_statement(data, ctx)
 
         if kind == S_VAR:
             # half the time a type with `mut` methods, to call them on
@@ -5541,7 +5750,7 @@ struct Program(Movable):
             var e = self.gen_typed(data, ctx, ty, BODY_SIZE - 1, P_OWNED, True)
             # (a moved v, perhaps by e, is assigned by name: through a
             # `ref`, it would be a use of v)
-            var target = self.spell(data, ctx, v, f) if ctx.live[
+            var target = self.spell(data, ctx, v, f, True) if ctx.live[
                 v
             ] else self.place_expr(ctx, v, f)
             if f < 0:
@@ -5834,6 +6043,11 @@ struct Program(Movable):
                 or ctx.excl[v]
             ):
                 continue
+            if (
+                ctx.from_tuple[v]
+                and getenv("DECL_FUZZ_NO_TUPLE_VAR_WORKAROUND") == ""
+            ):
+                continue  # (see Ctx.from_tuple)
             if ctx.types[v] == ty:
                 out.append(v * 64)
             var fs = self.fields_of(ctx.types[v])
@@ -5873,7 +6087,7 @@ struct Program(Movable):
                 ctx.touched[p // 64] = True
                 ctx.taken.append(p)
                 return self.mark_near(
-                    self.spell(data, ctx, p // 64, p % 64 - 1)
+                    self.spell(data, ctx, p // 64, p % 64 - 1, True)
                 )
         if len(bad) > 0 and (
             # (places_for let the call go ahead for the mutant)
@@ -5891,7 +6105,7 @@ struct Program(Movable):
         ctx.excl[v] = True
         ctx.touched[v] = True
         ctx.taken.append(p)
-        return self.spell(data, ctx, v, p % 64 - 1)
+        return self.spell(data, ctx, v, p % 64 - 1, True)
 
     def callable_here(
         mut self, ctx: Ctx, m: Int, recv: Int, stmt_root: Bool
@@ -6264,6 +6478,7 @@ struct Program(Movable):
                     and not ctx.touched[v]
                     and ctx.no_move == 0
                     and not (discard and self.mutant >= 0)
+                    and not self.tuple_bound(ctx, v)
                 ):
                     atom_vars.append(v)
                     atom_fields.append(-1)
@@ -6468,6 +6683,19 @@ struct Program(Movable):
                 rules = rest^
         raise Error("STUCK")
 
+    def mut_moved(self, ctx: Ctx) -> Bool:
+        """Whether a `mut` argument (not a `deinit self`) is moved now: an
+        error leaving the function then is "use of uninitialized value"
+        at the raise point, as a `return` would be."""
+        for v in range(len(ctx.names)):
+            if (
+                ctx.kinds[v] == V_MUT
+                and not ctx.live[v]
+                and not self.is_deinit_self(v)
+            ):
+                return True
+        return False
+
     def raise_ok(self, ctx: Ctx, r: Int) -> Bool:
         """Whether a call raising r (FnDecl.raise_ty) can go here: in a `try`
         body (its handlers will cover r), or where the error propagates
@@ -6476,6 +6704,8 @@ struct Program(Movable):
         if r == -1:
             return True
         if ctx.no_exit > 0 and ctx.catching <= ctx.exit_catch:
+            return False
+        if ctx.catching == 0 and self.mut_moved(ctx):
             return False
         if ctx.fin_type != -9 and ctx.catching == ctx.fin_catch:
             if r != ctx.fin_type:
@@ -6548,6 +6778,8 @@ struct Program(Movable):
         if ctx.no_exit > 0 and ctx.catching <= ctx.exit_catch:
             return []
         var caught = ctx.catching > 0
+        if not caught and self.mut_moved(ctx):
+            return []
         if (
             caught
             and (ctx.const_if > 0 or ctx.no_move > 0)
@@ -6649,6 +6881,679 @@ struct Program(Movable):
         ctx.freeze_base = freeze
         var text = self.prop_text(pr, vi, ctx.param_names)
         return self.add_stmt(Stmt(S_CIF, -1, -1, -1, key, body^, orelse^, text))
+
+    # ---- patterns: `match`, `if` with `case` clauses, `guard`, `var (..)`
+
+    def pattern_ok(mut self, ty: Int) -> Bool:
+        """Whether a struct pattern can match ty: a struct (or Res) with
+        fields. In a body with a `where`, not one that mentions a type
+        parameter: Mojo gives the subject the refined type, which doesn't
+        match the pattern's (modular/modular#7811: "cannot match value of
+        type 'B0[T(Tr1)]' against pattern type 'B0[T]'"), unless
+        DECL_FUZZ_NO_WHERE_WORKAROUND=1."""
+        var k = self.tkind[ty]
+        if self.where_workaround() and self.mentions_param(ty):
+            return False
+        return (k == STRUCT or k == RES) and len(self.fields_of(ty)) > 0
+
+    def add_pat(mut self, var p: PatNode) -> Int:
+        self.pats.append(p^)
+        return len(self.pats) - 1
+
+    def tuple_var_workaround(self) -> Bool:
+        """A `var` binding from a temporary tuple is "use of uninitialized
+        value '(tuple element)'" beside an element pattern that can fail
+        (`case (var z, 3) = (e1, e2)`), and in `if` and `match` when it's
+        bound by a `ref` and another element isn't a `var` (`case (var
+        z, w) = (e1, e2)` then `ref r = z`): a tuple with a `var` element
+        has only `var` elements (DECL_FUZZ_NO_TUPLE_VAR_WORKAROUND=1 lifts
+        it). In a `guard`, one after the first clause copies its elements
+        ("cannot be implicitly copied"): no `var` elements there
+        (DECL_FUZZ_NO_GUARD_VAR_WORKAROUND=1 allows them)."""
+        return getenv("DECL_FUZZ_NO_TUPLE_VAR_WORKAROUND") == ""
+
+    def sub_pattern(
+        mut self,
+        mut data: ConjectureData,
+        mut ctx: Ctx,
+        ty: Int,
+        field: Int,
+        place: Bool,
+        nested: Int,
+        refutable: Bool,
+        mut binds: List[Int],
+        allow_var: Bool = True,
+    ) raises -> Int:
+        """The pattern for one field (field >= 0) or tuple element of type
+        ty. In a variable subject (place), a name binds the field
+        read-only, and nested patterns bind nothing (their places would
+        be deeper); without refutable, only `_`, names and `var` names."""
+        var kinds: List[Int] = [PK_WILD, PK_BIND, PK_BIND]
+        if place and field < 0:
+            kinds = [PK_WILD]
+        if allow_var and self.cap_of(ty, ctx.bounds) == CAP_IC:
+            kinds.append(PK_VAR)
+        if refutable and ty == self.int_ty:
+            kinds += [PK_LIT, PK_LIT, PK_OR, PK_EQ]
+        if refutable and nested < 1 and self.pattern_ok(ty):
+            kinds.append(PK_STRUCT)
+        var k = kinds[pick(data, len(kinds))]
+        var bad_var = False
+        if (
+            field >= 0
+            and place  # (out of a temporary, it may become a move: #7659)
+            and self.cap_of(ty, ctx.bounds) < CAP_IC
+            and not self.in_const_if(ctx)
+            and self.chance(data, MU_PAT_VAR)
+        ):
+            # (a copy of a field: Mojo moves only out of a tuple)
+            k = PK_VAR
+            bad_var = True
+            self.mutated = True
+        if k == PK_STRUCT:
+            return self.struct_pattern(
+                data, ctx, ty, place, nested + 1, binds, allow_var
+            )
+        if k == PK_LIT:
+            var l = pick(data, len(self.literals))
+            return self.add_pat(PatNode(k, ty, l, -1, False, "", [], []))
+        if k == PK_OR:
+            var l1 = pick(data, len(self.literals))
+            var l2 = pick(data, len(self.literals))
+            return self.add_pat(PatNode(k, ty, l1, l2, False, "", [], []))
+        if k == PK_EQ:
+            # (it runs only if the fields before it matched: no moves)
+            ctx.no_move += 1
+            var e = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
+            ctx.no_move -= 1
+            return self.add_pat(PatNode(k, ty, e, -1, False, "", [], []))
+        if k == PK_WILD:
+            return self.add_pat(PatNode(k, ty, -1, -1, False, "", [], []))
+        var name = String(MARK if bad_var else "", "b", ctx.counter)
+        ctx.counter += 1
+        # (a name in a variable subject's top level: a read-only `ref`
+        # binding to the field, else a local)
+        var push = k == PK_VAR or not place
+        var p = self.add_pat(PatNode(k, ty, -1, field, push, name^, [], []))
+        binds.append(p)
+        return p
+
+    def struct_pattern(
+        mut self,
+        mut data: ConjectureData,
+        mut ctx: Ctx,
+        ty: Int,
+        place: Bool,
+        nested: Int,
+        mut binds: List[Int],
+        allow_var: Bool = True,
+    ) raises -> Int:
+        """`Head(f0=p0, ...)` for some of ty's fields (at least one)."""
+        var fs = self.fields_of(ty)
+        var fields = List[Int]()
+        for f in range(len(fs)):
+            if data.draw(integers(0, 2)) > 0:
+                fields.append(f)
+        if len(fields) == 0:
+            fields.append(pick(data, len(fs)))
+        var kids = List[Int]()
+        for f in fields:
+            kids.append(
+                self.sub_pattern(
+                    data,
+                    ctx,
+                    fs[f],
+                    f if nested == 0 else -1,
+                    place,
+                    nested,
+                    True,
+                    binds,
+                    allow_var,
+                )
+            )
+        var head = self.cty(ty, ctx)
+        var bad = -1
+        if (
+            nested == 0
+            and not self.in_const_if(ctx)
+            and self.chance(data, MU_PAT_FIELD)
+        ):
+            # (its first field is written `z`)
+            bad = -7
+            head = String(MARK, head)
+            self.mutated = True
+        return self.add_pat(
+            PatNode(PK_STRUCT, ty, -1, bad, False, head^, fields^, kids^)
+        )
+
+    def subject_pattern(
+        mut self,
+        mut data: ConjectureData,
+        mut ctx: Ctx,
+        ty: Int,
+        place: Bool,
+        mut binds: List[Int],
+    ) raises -> Int:
+        """A struct pattern for a subject of type ty; for a pat_type mutant,
+        perhaps for another type (its names then bind locals)."""
+        if self.wants(MU_PAT_TYPE) and not self.in_const_if(ctx):
+            var others = List[Int]()
+            for t in ctx.pool:
+                if t != ty and self.pattern_ok(t):
+                    others.append(t)
+            if len(others) > 0 and self.chance(data, MU_PAT_TYPE):
+                var t = others[pick(data, len(others))]
+                var p = self.struct_pattern(data, ctx, t, False, 0, binds)
+                self.pats[p].name = String(MARK, self.pats[p].name)
+                self.mutated = True
+                return p
+        return self.struct_pattern(data, ctx, ty, place, 0, binds)
+
+    def irrefutable(self, p: Int) -> Bool:
+        """Whether pattern p matches every value."""
+        ref node = self.pats[p]
+        if node.kind == PK_WILD or node.kind == PK_BIND or node.kind == PK_VAR:
+            return True
+        if node.kind != PK_STRUCT and node.kind != PK_TUPLE:
+            return False
+        for k in node.kids:
+            if not self.irrefutable(k):
+                return False
+        return True
+
+    def const_clauses(self, cs: Int) -> Bool:
+        """Whether a `case` clause of set cs has a constant subject (`match
+        100:`, `= (1, 2)`), which Mojo folds: its branches are drawn like a
+        constant `if`'s, without raise points or mutants (a dead one isn't
+        checked)."""
+        for c in self.csets[cs]:
+            ref cl = self.clauses[c]
+            if (
+                cl.kind == CL_BOOL
+                and self.is_const(cl.l)
+                and self.is_const(cl.r)
+            ):
+                return True  # (a constant comparison: folded too)
+            if cl.kind != CL_CASE or len(cl.sexprs) == 0:
+                continue
+            var all_const = True
+            for e in cl.sexprs:
+                all_const = all_const and self.is_const(e)
+            if all_const:
+                return True
+        return False
+
+    def dead_else(self, cs: Int) -> Bool:
+        """Whether Mojo takes the `else` of an `if` or `guard` with clause
+        set cs for dead code: when its patterns are irrefutable (it
+        ignores the Boolean clauses: "unreachable code after match that
+        always completes", modular/modular#7829). Such an `else` is drawn like a constant
+        `if`'s dead branch, without raising calls (modular/modular#7813)
+        or mutants."""
+        if self.const_clauses(cs):
+            return True
+        for c in self.csets[cs]:
+            ref cl = self.clauses[c]
+            if cl.kind == CL_CASE and not self.irrefutable(cl.l):
+                return False
+        return True
+
+    def push_binds(
+        mut self,
+        mut ctx: Ctx,
+        binds: List[Int],
+        subj: Int,
+        depth: Int,
+        from_tuple: Bool = False,
+    ):
+        """Brings a pattern's bindings into scope: a local for each one
+        that adds a variable, a read-only `ref` binding to the subject's
+        field for the others."""
+        for p in binds:
+            ref node = self.pats[p]
+            if node.push:
+                var kind = V_OWNED if node.kind == PK_VAR else V_READ
+                ctx.push(node.name.copy(), node.ty, kind)
+                ctx.from_tuple[len(ctx.names) - 1] = from_tuple
+            else:
+                ctx.ref_names.append(node.name.copy())
+                ctx.ref_var.append(subj)
+                ctx.ref_field.append(node.b)
+                ctx.ref_depth.append(depth)
+                ctx.ref_ro.append(True)
+
+    def subject_vars(mut self, ctx: Ctx) -> List[Int]:
+        """Live variables a struct pattern can match (in place)."""
+        var out = List[Int]()
+        for v in range(len(ctx.names)):
+            if (
+                ctx.live[v]
+                and not ctx.excl[v]
+                and self.pattern_ok(ctx.types[v])
+            ):
+                out.append(v)
+        return out^
+
+    def rvalue_subject(
+        mut self, mut data: ConjectureData, mut ctx: Ctx, ty: Int
+    ) raises -> Int:
+        """A temporary of type ty (a place is copied: `v.copy()`, or an
+        Int `Int(v)`)."""
+        var state = self.mutation_state()
+        var e = self.gen_typed(data, ctx, ty, BODY_SIZE - 2, P_OWNED)
+        if self.mutation_state() != state and (
+            self.is_place(e) or self.mutant == MU_IMPLICIT_COPY
+        ):
+            # (an implicit_copy mutant's place: a valid subject, and with
+            # `.copy()` a valid value; gen_stmt undoes it)
+            raise Error("STUCK")
+        if self.is_place(e):
+            var text = String(self.exprs[e].text, ".copy()")
+            if ty == self.int_ty:
+                text = String("Int(", self.exprs[e].text, ")")
+            e = self.add(E_COPY, 0, ty, [e], [], text^)
+        return e
+
+    def case_clause(
+        mut self,
+        mut data: ConjectureData,
+        mut ctx: Ctx,
+        depth: Int,
+        first: Bool,
+        in_guard: Bool = False,
+    ) raises -> Int:
+        """`case <pattern> = <subject>`, its bindings in scope after it (at
+        depth): the subject a variable, a temporary struct, or a tuple of
+        temporaries; moves only in the first clause (the others may not
+        run)."""
+        var tuple_var = not (
+            in_guard
+            and not first
+            and getenv("DECL_FUZZ_NO_GUARD_VAR_WORKAROUND") == ""
+        )
+        ctx.no_move += Int(not first)
+        var vars = self.subject_vars(ctx)
+        var structs = List[Int]()
+        for t in ctx.pool:
+            if self.pattern_ok(t):
+                structs.append(t)
+        var form = data.draw(integers(0, 2))
+        if form == 0 and len(vars) == 0:
+            form = 1
+        if form == 1 and len(structs) == 0:
+            form = 2
+        var binds = List[Int]()
+        var cl: Clause
+        var subj = -1
+        if form == 0:
+            subj = vars[pick(data, len(vars))]
+            ctx.touched[subj] = True
+            var p = self.subject_pattern(
+                data, ctx, ctx.types[subj], True, binds
+            )
+            cl = Clause(CL_CASE, 0, p, -1, subj, [], ctx.names[subj].copy())
+        elif form == 1:
+            var ty = structs[pick(data, len(structs))]
+            var e = self.rvalue_subject(data, ctx, ty)
+            var p = self.subject_pattern(data, ctx, ty, False, binds)
+            cl = Clause(CL_CASE, 0, p, -1, -1, [e], "")
+        else:
+            # a tuple of two or three temporaries, perhaps moved in
+            var n = data.draw(integers(2, 3))
+            var tys = List[Int]()
+            var es = List[Int]()
+            for _ in range(n):
+                var ty = self.draw_type(data, ctx.pool)
+                tys.append(ty)
+                es.append(self.gen(data, ctx, ty, BODY_SIZE - 2, P_OWNED))
+            var kids = List[Int]()
+            # (with the workaround, all `var` names or none)
+            var all_var = (
+                tuple_var
+                and self.tuple_var_workaround()
+                and data.draw(booleans())
+            )
+            for i in range(n):
+                if all_var:
+                    var name = String("b", ctx.counter)
+                    ctx.counter += 1
+                    var k = self.add_pat(
+                        PatNode(PK_VAR, tys[i], -1, -1, True, name^, [], [])
+                    )
+                    binds.append(k)
+                    kids.append(k)
+                    continue
+                kids.append(
+                    self.sub_pattern(
+                        data,
+                        ctx,
+                        tys[i],
+                        -1,
+                        False,
+                        0,
+                        True,
+                        binds,
+                        tuple_var and not self.tuple_var_workaround(),
+                    )
+                )
+            var p = self.add_pat(
+                PatNode(PK_TUPLE, -1, -1, -1, False, "", [], kids^)
+            )
+            cl = Clause(CL_CASE, 0, p, -1, -1, es^, "")
+        ctx.no_move -= Int(not first)
+        self.push_binds(ctx, binds, subj, depth, form == 2)
+        self.clauses.append(cl^)
+        return len(self.clauses) - 1
+
+    def bool_clause(
+        mut self, mut data: ConjectureData, mut ctx: Ctx
+    ) raises -> Int:
+        """`l op r` on Ints (a guard, or a clause of an `if` or `guard`)."""
+        var op = pick(data, comptime (len(CMP_OPS)))
+        var x = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
+        var y = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
+        self.clauses.append(Clause(CL_BOOL, op, x, y, -1, [], ""))
+        return len(self.clauses) - 1
+
+    def clause_set(
+        mut self,
+        mut data: ConjectureData,
+        mut ctx: Ctx,
+        depth: Int,
+        in_guard: Bool = False,
+    ) raises -> Int:
+        """One to three clauses, at least one a `case`, each seeing the
+        bindings of those before it; Boolean ones after the first may
+        not run, so they don't move anything either."""
+        var n = data.draw(integers(1, 3))
+        var at = pick(data, n)  # (a `case` there at least)
+        var set = List[Int]()
+        for i in range(n):
+            if i == at or data.draw(booleans()):
+                set.append(self.case_clause(data, ctx, depth, i == 0, in_guard))
+            else:
+                ctx.no_move += Int(i > 0)
+                set.append(self.bool_clause(data, ctx))
+                ctx.no_move -= Int(i > 0)
+        self.csets.append(set^)
+        return len(self.csets) - 1
+
+    def can_guard(self, ctx: Ctx) -> Bool:
+        """Whether a `guard` can exit here (its `else` returns, or in a
+        loop breaks or continues)."""
+        return (
+            ctx.ret >= 0
+            and ctx.no_exit == 0
+            and ctx.in_finally == 0
+            and not self.in_const_if(ctx)
+        )
+
+    def pattern_statement(
+        mut self, mut data: ConjectureData, mut ctx: Ctx
+    ) raises -> Int:
+        """A `match`, an `if` with `case` clauses, a `guard`, or `var (bA,
+        bB) = (e1, e2)`."""
+        var forms: List[Int] = [S_MATCH, S_IFC, S_DESTR]
+        if self.can_guard(ctx):
+            forms += [S_GUARD, S_GUARD]
+        if self.wants(MU_GUARD_FALL) and self.can_guard(ctx):
+            forms = [S_GUARD]
+        elif self.wants(MU_PAT_SCOPE):
+            forms = [S_IFC, S_GUARD] if self.can_guard(ctx) else [S_IFC]
+        var form = forms[pick(data, len(forms))]
+        ctx.new_statement()
+        if form == S_DESTR:
+            var n = data.draw(integers(2, 3))
+            var es = List[Int]()
+            var kids = List[Int]()
+            var binds = List[Int]()
+            for _ in range(n):
+                var ty = self.draw_type(data, ctx.pool)
+                es.append(self.gen(data, ctx, ty, BODY_SIZE - 2, P_OWNED))
+                var name = String("b", ctx.counter)
+                ctx.counter += 1
+                var p = self.add_pat(
+                    PatNode(PK_VAR, ty, -1, -1, True, name^, [], [])
+                )
+                kids.append(p)
+                binds.append(p)
+            var p = self.add_pat(
+                PatNode(PK_TUPLE, -1, -1, -1, False, "", [], kids^)
+            )
+            self.clauses.append(Clause(CL_CASE, 0, p, -1, -1, es^, ""))
+            self.csets.append([len(self.clauses) - 1])
+            self.push_binds(ctx, binds, -1, ctx.depth, True)
+            return self.add_stmt(
+                Stmt(S_DESTR, -1, -1, -1, len(self.csets) - 1, [], [], "")
+            )
+        if form == S_MATCH:
+            return self.match_statement(data, ctx)
+        var n = len(ctx.names)
+        if form == S_GUARD:
+            var nref = len(ctx.ref_names)
+            var set = self.clause_set(data, ctx, ctx.depth, True)
+            if self.const_clauses(set):
+                # (Mojo folds it: a false one would make the rest of the
+                # block dead, and unchecked)
+                raise Error("STUCK")
+            if (
+                ctx.catching > 0
+                and self.dead_else(set)
+                and getenv("DECL_FUZZ_NO_GUARD_TRY_WORKAROUND") == ""
+            ):
+                # (in a `try` body, a `guard` whose patterns always match
+                # can hide a use of a variable the `try`'s `else` moved:
+                # an accepted try_move mutant; gen_stmt draws another
+                # statement)
+                raise Error("STUCK")
+            # the `else` doesn't see the bindings: out of scope for it
+            var saved = ctx.copy()
+            ctx.truncate(n)
+            while len(ctx.ref_names) > nref:
+                _ = ctx.ref_names.pop()
+                _ = ctx.ref_var.pop()
+                _ = ctx.ref_field.pop()
+                _ = ctx.ref_depth.pop()
+                _ = ctx.ref_ro.pop()
+            var exit = S_RETURN
+            if ctx.in_loop > 0 and data.draw(booleans()):
+                exit = S_BREAK if data.draw(booleans()) else S_CONTINUE
+            var dead = Int(self.dead_else(set))
+            # (Mojo doesn't check a dead `else`: not there)
+            var fall = (
+                dead == 0
+                and not self.in_const_if(ctx)
+                and self.chance(data, MU_GUARD_FALL)
+            )
+            ctx.depth += 1
+            ctx.const_if += dead
+            var orelse = self.gen_block(
+                data, ctx, 1, False, -1, -1, -1 if fall else exit
+            )
+            ctx.const_if -= dead
+            ctx.depth -= 1
+            var scope = self.scope_use(data, ctx, saved, n, nref)
+            if scope >= 0:
+                orelse.insert(0, scope)
+            # back in scope after it (the `else` doesn't fall through)
+            for v in range(n, len(saved.names)):
+                ctx.push(saved.names[v].copy(), saved.types[v], saved.kinds[v])
+                ctx.from_tuple[v] = saved.from_tuple[v]
+            for b in range(nref, len(saved.ref_names)):
+                ctx.ref_names.append(saved.ref_names[b].copy())
+                ctx.ref_var.append(saved.ref_var[b])
+                ctx.ref_field.append(saved.ref_field[b])
+                ctx.ref_depth.append(saved.ref_depth[b])
+                ctx.ref_ro.append(saved.ref_ro[b])
+            var st = self.add_stmt(
+                Stmt(S_GUARD, -1, -1, -1, set, [], orelse^, "")
+            )
+            if fall:
+                self.mutated = True
+                self.marked_stmts.append(st)
+            return st
+        # S_IFC (the clauses run before either branch: drawn at this depth,
+        # their bindings in scope in the first)
+        var nref = len(ctx.ref_names)
+        var set = self.clause_set(data, ctx, ctx.depth + 1)
+        ctx.depth += 1
+        var bound = ctx.copy()
+        var folded = Int(self.const_clauses(set))
+        ctx.const_if += folded
+        var then = self.gen_block(data, ctx, 2)
+        ctx.const_if -= folded
+        ctx.drop_refs(ctx.depth, n)
+        ctx.truncate(n)
+        var orelse = List[Int]()
+        if data.draw(booleans()):
+            var dead = Int(self.dead_else(set))
+            ctx.const_if += dead
+            orelse = self.gen_block(data, ctx, 2)
+            ctx.const_if -= dead
+        var scope = self.scope_use(data, ctx, bound, n, nref)
+        if scope >= 0:
+            orelse.insert(0, scope)
+        ctx.depth -= 1
+        return self.add_stmt(Stmt(S_IFC, -1, -1, -1, set, then^, orelse^, ""))
+
+    def fresh_literals(
+        mut self, mut data: ConjectureData, p: Int, mut used: List[Int]
+    ) raises:
+        """An Int `match` with a negative literal in two cases (`case -1:`
+        twice) is taken for exhaustive: the code after it is compiled as
+        unreachable (a trap), and so are later cases (modular/modular#7828).
+        So the literals of case p are ones no earlier case has (used),
+        unless DECL_FUZZ_NO_DUP_CASE_WORKAROUND=1."""
+        if getenv("DECL_FUZZ_NO_DUP_CASE_WORKAROUND") != "":
+            return
+        var kind = self.pats[p].kind
+        if kind != PK_LIT and kind != PK_OR:
+            return
+        var fresh = List[Int]()
+        for l in range(len(self.literals)):
+            if not has(used, self.literal_values[l]):
+                fresh.append(l)
+        if len(fresh) < 2:  # (then a wildcard)
+            self.pats[p].kind = PK_WILD
+            return
+        if has(used, self.literal_values[self.pats[p].a]):
+            self.pats[p].a = fresh[pick(data, len(fresh))]
+        used.append(self.literal_values[self.pats[p].a])
+        if kind == PK_OR:
+            if has(used, self.literal_values[self.pats[p].b]):
+                var rest = List[Int]()
+                for l in fresh:
+                    if not has(used, self.literal_values[l]):
+                        rest.append(l)
+                self.pats[p].b = (
+                    rest[pick(data, len(rest))] if len(rest)
+                    > 0 else self.pats[p].a
+                )
+            used.append(self.literal_values[self.pats[p].b])
+
+    def scope_use(
+        mut self,
+        mut data: ConjectureData,
+        ctx: Ctx,
+        bound: Ctx,
+        n: Int,
+        nref: Int,
+    ) raises -> Int:
+        """For a pat_scope mutant, perhaps `_use(bN)` of a name that bound
+        (in context bound: its variables from n, its `ref` bindings from
+        nref) but is out of scope in ctx; else -1."""
+        if not self.wants(MU_PAT_SCOPE) or self.in_const_if(ctx):
+            return -1
+        var names = List[String]()
+        for v in range(n, len(bound.names)):
+            names.append(bound.names[v])
+        for b in range(nref, len(bound.ref_names)):
+            names.append(bound.ref_names[b])
+        if len(names) == 0 or not self.chance(data, MU_PAT_SCOPE):
+            return -1
+        var text = String(MARK, names[pick(data, len(names))])
+        var e = self.add(E_LIT, 0, self.int_ty, [], [], text^)
+        self.mutated = True
+        return self.add_stmt(Stmt(S_USE, -1, e, -1, 0, [], [], ""))
+
+    def match_statement(
+        mut self, mut data: ConjectureData, mut ctx: Ctx
+    ) raises -> Int:
+        """`match <subject>:` with one to three cases, perhaps guarded, and
+        perhaps a last `case _:`. The subject is a variable, a temporary
+        struct, or an Int (whose cases are literals, `l1 | l2`, `== e`, or
+        a name with a guard)."""
+        var vars = self.subject_vars(ctx)
+        var structs = List[Int]()
+        for t in ctx.pool:
+            if self.pattern_ok(t):
+                structs.append(t)
+        var form = data.draw(integers(0, 2))
+        if form == 0 and len(vars) == 0:
+            form = 1
+        if form == 1 and len(structs) == 0:
+            form = 2
+        var subj = -1
+        var e = -1
+        var ty = self.int_ty
+        var name = String()
+        if form == 0:
+            subj = vars[pick(data, len(vars))]
+            ctx.touched[subj] = True
+            ty = ctx.types[subj]
+            name = ctx.names[subj].copy()
+        elif form == 1:
+            ty = structs[pick(data, len(structs))]
+            e = self.rvalue_subject(data, ctx, ty)
+        else:
+            e = self.rvalue_subject(data, ctx, self.int_ty)
+        # (a constant subject: Mojo folds the match, see const_clauses)
+        var folded = Int(e >= 0 and self.is_const(e))
+        ctx.const_if += folded
+        var cases = List[Int]()
+        var n = len(ctx.names)
+        var n_cases = data.draw(integers(1, 3))
+        var covered = False  # (no unreachable cases: see dead_else)
+        var used = List[Int]()  # (the literals of an Int's cases)
+        for i in range(n_cases + 1):
+            var last = i == n_cases
+            if covered or (last and data.draw(booleans())):
+                break
+            ctx.new_statement()
+            ctx.depth += 1
+            var binds = List[Int]()
+            var p: Int
+            if last:
+                p = self.add_pat(
+                    PatNode(PK_WILD, ty, -1, -1, False, "", [], [])
+                )
+            elif form == 2:
+                p = self.sub_pattern(data, ctx, ty, -1, False, 0, True, binds)
+                self.fresh_literals(data, p, used)
+            else:
+                p = self.subject_pattern(data, ctx, ty, form == 0, binds)
+            self.clauses.append(Clause(CL_CASE, 0, p, -1, -1, [], ""))
+            var set: List[Int] = [len(self.clauses) - 1]
+            self.push_binds(ctx, binds, subj, ctx.depth)
+            if not last and data.draw(integers(0, 2)) == 0:
+                ctx.no_move += 1  # (a guard runs only if the pattern matched)
+                set.append(self.bool_clause(data, ctx))
+                ctx.no_move -= 1
+            covered = len(set) == 1 and self.irrefutable(p)
+            self.csets.append(set^)
+            var cs = len(self.csets) - 1
+            var cfold = Int(self.const_clauses(cs))  # (a constant guard)
+            ctx.const_if += cfold
+            var body = self.gen_block(data, ctx, 2)
+            ctx.const_if -= cfold
+            ctx.drop_refs(ctx.depth, n)
+            ctx.truncate(n)
+            ctx.depth -= 1
+            cases.append(
+                self.add_stmt(Stmt(S_CASE, -1, -1, -1, cs, body^, [], ""))
+            )
+        ctx.const_if -= folded
+        return self.add_stmt(Stmt(S_MATCH, subj, e, -1, 0, cases^, [], name^))
 
     def can_try(self, ctx: Ctx) -> Bool:
         """Whether a `try` here could call a raising function."""
@@ -7680,7 +8585,13 @@ struct Program(Movable):
         if self.exprs[e].kind == E_VAR:
             var v = frame[self.exprs[e].a]
             if v < 0:
-                raise Error("evaluator: read of a moved variable")
+                raise Error(
+                    String(
+                        "evaluator: read of a moved variable (",
+                        self.exprs[e].text,
+                        ")",
+                    )
+                )
             return v
         var base = self.read_place(self.exprs[e].kids[0], frame)
         return self.vkids[base][self.exprs[e].a]
@@ -7989,6 +8900,75 @@ struct Program(Movable):
             _ = frame.pop()
         return sig
 
+    def match_pat(
+        mut self, p: Int, val: Int, mut frame: List[Int], targs: List[Int]
+    ) raises -> Bool:
+        """Whether the value val matches pattern p; each binding that adds
+        a variable adds its value to the frame."""
+        var node = self.pats[p].copy()
+        if node.kind == PK_WILD:
+            return True
+        if node.kind == PK_BIND or node.kind == PK_VAR:
+            if node.push:
+                frame.append(val)
+            return True
+        if node.kind == PK_LIT:
+            return self.vint[val] == self.literal_values[node.a]
+        if node.kind == PK_OR:
+            var x = self.vint[val]
+            return (
+                x == self.literal_values[node.a]
+                or x == self.literal_values[node.b]
+            )
+        if node.kind == PK_EQ:
+            var y = self.vint[self.eval(node.a, frame, targs)]
+            return self.vint[val] == y
+        # PK_STRUCT (fields) or PK_TUPLE (elements)
+        for i in range(len(node.kids)):
+            var f = node.fields[i] if node.kind == PK_STRUCT else i
+            if not self.match_pat(
+                node.kids[i], self.vkids[val][f], frame, targs
+            ):
+                return False
+        return True
+
+    def run_clauses(
+        mut self,
+        cs: Int,
+        mut frame: List[Int],
+        targs: List[Int],
+        subject: Int = -1,
+    ) raises -> Bool:
+        """Whether the clauses of set cs all hold, left to right (a
+        `match`'s case against its subject's value); the bindings of those
+        that held are on the frame."""
+        for c in self.csets[cs].copy():
+            var cl = self.clauses[c].copy()
+            if cl.kind == CL_BOOL:
+                if not self.condition(cl.op, cl.l, cl.r, frame, targs):
+                    return False
+                continue
+            var val = subject
+            if cl.subj >= 0:
+                val = frame[cl.subj]
+                if val < 0:
+                    raise Error("evaluator: match of a moved variable")
+            elif len(cl.sexprs) > 0:
+                var moved = List[Int]()
+                var vals = List[Int]()
+                for e in cl.sexprs:
+                    vals.append(self.eval_arg(e, frame, targs, moved))
+                for v in moved:
+                    frame[v] = -1
+                if self.pats[cl.l].kind == PK_TUPLE:
+                    val = self.new_value(-5, 0, vals^)
+                else:
+                    val = vals[0]
+            if not self.match_pat(cl.l, val, frame, targs):
+                return False
+            self.stats[STAT_PATTERN] += 1
+        return True
+
     def try_part(
         mut self, s: Int, mut frame: List[Int], targs: List[Int]
     ) raises -> Int:
@@ -8150,6 +9130,56 @@ struct Program(Movable):
             if Self.prop_holds(n, Prop(c, ge, k, 0)):
                 return self.exec_block(self.stmts[s].body.copy(), frame, targs)
             return self.exec_block(self.stmts[s].orelse.copy(), frame, targs)
+        elif kind == S_MATCH:
+            self.stats[STAT_MATCH] += 1
+            var val: Int
+            if self.stmts[s].target >= 0:
+                val = frame[self.stmts[s].target]
+                if val < 0:
+                    raise Error("evaluator: match of a moved variable")
+            else:
+                var moved = List[Int]()
+                val = self.eval_arg(e, frame, targs, moved)
+                for v in moved:
+                    frame[v] = -1
+            for c in self.stmts[s].body.copy():
+                var n = len(frame)
+                if self.run_clauses(self.stmts[c].a, frame, targs, val):
+                    var sig = self.exec_block(
+                        self.stmts[c].body.copy(), frame, targs
+                    )
+                    while len(frame) > n:
+                        _ = frame.pop()
+                    return sig
+                while len(frame) > n:
+                    _ = frame.pop()
+        elif kind == S_IFC:
+            self.stats[STAT_MATCH] += 1
+            var n = len(frame)
+            if self.run_clauses(self.stmts[s].a, frame, targs):
+                var sig = self.exec_block(
+                    self.stmts[s].body.copy(), frame, targs
+                )
+                while len(frame) > n:
+                    _ = frame.pop()
+                return sig
+            while len(frame) > n:
+                _ = frame.pop()
+            return self.exec_block(self.stmts[s].orelse.copy(), frame, targs)
+        elif kind == S_GUARD or kind == S_DESTR:
+            self.stats[STAT_MATCH] += Int(kind == S_GUARD)
+            var n = len(frame)
+            if self.run_clauses(self.stmts[s].a, frame, targs):
+                return SIG_NONE  # (the bindings stay on the frame)
+            if kind == S_DESTR:
+                raise Error("evaluator: a destructuring that didn't match")
+            while len(frame) > n:
+                _ = frame.pop()
+            self.stats[STAT_GUARD] += 1
+            var sig = self.exec_block(self.stmts[s].orelse.copy(), frame, targs)
+            if sig == SIG_NONE:
+                raise Error("evaluator: a guard's else fell through")
+            return sig
         elif kind == S_IF:
             if self.condition(
                 self.stmts[s].a, e, self.stmts[s].e2, frame, targs
@@ -8263,6 +9293,65 @@ struct Program(Movable):
             return text.replace("\n", String(MARK, "\n"))
         return text^
 
+    def pat_text(self, p: Int) -> String:
+        ref node = self.pats[p]
+        if node.kind == PK_WILD:
+            return "_"
+        if node.kind == PK_BIND:
+            return node.name.copy()
+        if node.kind == PK_VAR:
+            return String("var ", node.name)
+        if node.kind == PK_LIT:
+            return self.literals[node.a].copy()
+        if node.kind == PK_OR:
+            return String(self.literals[node.a], " | ", self.literals[node.b])
+        if node.kind == PK_EQ:
+            return String("== ", self.exprs[node.a].text)
+        var parts = List[String]()
+        for i in range(len(node.kids)):
+            var kid = self.pat_text(node.kids[i])
+            if node.kind == PK_STRUCT:
+                # (`f= == e`: `f=== e` doesn't parse)
+                var eq = " " if self.pats[node.kids[i]].kind == PK_EQ else ""
+                var field = self.field_name(node.ty, node.fields[i])
+                if node.b == -7 and i == 0:  # (a pat_field mutant)
+                    field = "z"
+                kid = String(field, "=", eq, kid)
+            parts.append(kid^)
+        var inner = String(", ").join(parts)
+        if node.kind == PK_STRUCT:
+            return String(node.name, "(", inner, ")")
+        return String("(", inner, ")")
+
+    def bool_text(self, c: Int) -> String:
+        var ops = materialize[CMP_OPS]()
+        ref cl = self.clauses[c]
+        return String(
+            self.exprs[cl.l].text, " ", ops[cl.op], " ", self.exprs[cl.r].text
+        )
+
+    def clauses_text(self, cs: Int) -> String:
+        """The clauses of set cs, separated by `; `."""
+        var parts = List[String]()
+        for c in self.csets[cs]:
+            ref cl = self.clauses[c]
+            if cl.kind == CL_BOOL:
+                parts.append(self.bool_text(c))
+                continue
+            var text = String("case ", self.pat_text(cl.l))
+            if cl.subj >= 0:
+                text += String(" = ", cl.text)
+            elif len(cl.sexprs) > 0:
+                var es = List[String]()
+                for e in cl.sexprs:
+                    es.append(self.exprs[e].text)
+                var subject = String(", ").join(es)
+                if self.pats[cl.l].kind == PK_TUPLE:
+                    subject = String("(", subject, ")")
+                text += String(" = ", subject)
+            parts.append(text^)
+        return String("; ").join(parts)
+
     def stmt_lines(self, st: Int, indent: String) -> String:
         ref s = self.stmts[st]
         if s.kind == S_VAR and s.e < 0:
@@ -8319,7 +9408,53 @@ struct Program(Movable):
                 # method's default body can't have)
                 group = String(indent, "_ = 0\n")
             return group^
+        if s.kind == S_DESTR:
+            ref cl = self.clauses[self.csets[s.a][0]]
+            var names = List[String]()
+            for k in self.pats[cl.l].kids:
+                names.append(self.pats[k].name)
+            var es = List[String]()
+            for e in cl.sexprs:
+                es.append(self.exprs[e].text)
+            return String(
+                indent,
+                "var (",
+                String(", ").join(names),
+                ") = (",
+                String(", ").join(es),
+                ")\n",
+            )
         var inner = String(indent, "    ")
+        if s.kind == S_MATCH:
+            var subject = (
+                s.name.copy() if s.target >= 0 else self.exprs[s.e].text.copy()
+            )
+            var text = String(indent, "match ", subject, ":\n")
+            for c in s.body:
+                ref set = self.csets[self.stmts[c].a]
+                var head = String(
+                    "case ", self.pat_text(self.clauses[set[0]].l)
+                )
+                if len(set) > 1:  # (a guard)
+                    head += String(" if ", self.bool_text(set[1]))
+                text += String(inner, head, ":\n")
+                text += self.block_text(
+                    self.stmts[c].body, String(inner, "    ")
+                )
+            return text^
+        if s.kind == S_IFC:
+            var text = String(indent, "if ", self.clauses_text(s.a), ":\n")
+            text += self.block_text(s.body, inner)
+            if len(s.orelse) > 0:
+                text += String(indent, "else:\n")
+                text += self.block_text(s.orelse, inner)
+            return text^
+        if s.kind == S_GUARD:
+            var text = String(
+                indent, "guard ", self.clauses_text(s.a), " else:\n"
+            )
+            text += self.block_text(s.orelse, inner)
+            return text^
         if s.kind == S_TRY:
             var text = String(indent, "try:", MARK if s.a == 1 else "", "\n")
             text += self.block_text(s.body, inner)
