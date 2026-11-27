@@ -103,7 +103,21 @@
 # is a struct. The assoc mutant binds a type that doesn't conform to the
 # bound (and the missing mutant may leave a binding out); the assoc near
 # miss writes one struct's binding as `Self.E0` throughout its
-# declarations.
+# declarations. Methods can also take a value parameter, `def m[k:
+# Int](self, p0: V[k], ...)`.
+#
+# Exceptions: half of the functions raise, `raises` (Error) or `raises
+# Xk` (X0, X1 are counted error types with a `code`), with `if c: raise
+# Xk(e)` in their bodies. A call of a raising function goes only where
+# its error is caught or propagates: a `try` body, or a function raising
+# Error or the same Xk. `try` statements (with `raise` in their bodies
+# too) get handlers for exactly the types their bodies raise: typed
+# `except Xk __as eN:` (reading `eN.code`) and perhaps a last `except:`
+# for the rest (always for Error, which an error leaving a `raises`
+# function becomes). Outer variables are read-only in a `try`. The
+# unhandled mutant leaves a handler out; raise_ctx calls a raising
+# function where nothing catches it; raise_type raises another type than
+# declared; the unreachable near miss adds a handler that can't run.
 #
 # Every program terminates: each method and function has a rank, and a
 # body calls only methods and functions of lower rank; loops have constant
@@ -176,6 +190,12 @@ struct with a value parameter): tid is c (never 0), targ the PARAM n."""
 comptime HOLE = 6
 """A generic method's own type parameter `U` not chosen yet, in its
 signature instantiated for a receiver: a pattern for `match_hole`."""
+comptime ERR = 8
+"""An error type `X<tid>` (a counted struct with one field `code`), the
+type of a typed `except Xk __as e:` handler's binding. Not in any pool:
+its values are only raised and caught."""
+comptime N_ERR = 2
+"""How many error types a program declares (X0, X1)."""
 comptime ASSOC = 7
 """An associated type `X.E<t>` (trait t declares `comptime E<t>: TrU`):
 tid is t, targ the owner X, a type parameter or another ASSOC (with a
@@ -249,6 +269,14 @@ comptime S_CONTINUE = 8
 comptime S_REF = 9
 """`ref rN = <place>`: a binding that is another spelling of the place
 (the evaluator ignores it)."""
+comptime S_RAISE = 10
+"""`raise Xk(e)`: a = k (the error type), e = the code."""
+comptime S_TRY = 11
+"""`try:` body, then handlers (orelse, S_HANDLER statements); a = 1 if
+its line is marked (an unhandled mutant)."""
+comptime S_HANDLER = 12
+"""`except Xk __as eN:` (target k, name eN) or `except:` (target -1); a =
+1 for an unreachable handler (marked: the near miss)."""
 
 # what executing a statement did, for the evaluator
 comptime SIG_NONE = 0
@@ -323,7 +351,11 @@ a `where` clause."""
 comptime STAT_ASSOC = 22
 """Methods, static methods and constants used through an associated type
 (`T.E0.m1()`, `Self.E0.make1(x)`, `T.E0.K1`)."""
-comptime N_STATS = 23
+comptime STAT_RAISE = 23
+"""`raise` statements executed."""
+comptime STAT_CATCH = 24
+"""Handlers run."""
+comptime N_STATS = 25
 comptime STAT_NAMES: List[String] = [
     "own",
     "required",
@@ -348,6 +380,8 @@ comptime STAT_NAMES: List[String] = [
     "generic_method",
     "where",
     "assoc",
+    "raise",
+    "catch",
 ]
 
 # Stage 3: ill-typed mutants (DECL_FUZZ_MUTANTS=1). Each program gets one
@@ -421,7 +455,15 @@ needs, gated by a stricter condition than the conformance's."""
 comptime MU_ASSOC = 25
 """A struct binding an associated type to a type that doesn't conform to
 its bound (`comptime E0 = S2` for `comptime E0: Tr1`)."""
-comptime N_MU = 26
+comptime MU_UNHANDLED = 26
+"""A `try` without a handler for one of the error types its body raises
+(it has typed handlers only): "unhandled error types in try body"."""
+comptime MU_RAISE_CTX = 27
+"""A call of a raising function where nothing catches its error (a
+function that doesn't raise, or raises another typed error)."""
+comptime MU_RAISE_TYPE = 28
+"""In a function that `raises Xk`, `raise Xj(...)` with j != k."""
+comptime N_MU = 29
 comptime MU_NAMES: List[String] = [
     "type",
     "use_moved",
@@ -449,6 +491,9 @@ comptime MU_NAMES: List[String] = [
     "where",
     "where_impl",
     "assoc",
+    "unhandled",
+    "raise_ctx",
+    "raise_type",
 ]
 comptime MU_ODDS = 6
 """Each chance to apply the mutation is taken 1 time in MU_ODDS."""
@@ -514,7 +559,11 @@ comptime NR_WHERE = 17
 comptime NR_ASSOC = 18
 """In a struct's declarations and bodies, a type its associated type is
 bound to written `Self.E<t>`."""
-comptime N_NR = 19
+comptime NR_UNREACHABLE = 19
+"""A handler that can't be reached (a type caught before, or not raised,
+or after `except:`), which Mojo only warns about; its body doesn't use
+its binding (DECL_FUZZ_NO_UNREACHABLE_WORKAROUND=1 lets it)."""
+comptime N_NR = 20
 comptime NR_NAMES: List[String] = [
     "disjoint",
     "read_alias",
@@ -535,6 +584,7 @@ comptime NR_NAMES: List[String] = [
     "rename",
     "where",
     "assoc",
+    "unreachable",
 ]
 comptime MARK_NEAR = "@@N@@"
 """In generated text, marks the line of the near miss."""
@@ -722,6 +772,9 @@ struct MethodDecl(Copyable):
     var mbound: Int
     """For a generic method, the bound of its own type parameter `U`
     (PARAM 1; its first parameter has type U), else -1."""
+    var mvalue: Int
+    """For a method with a value parameter `k` instead (PARAM 1, `[k:
+    Int]`; its first parameter has type `V[k]`), the struct V, else -1."""
 
 
 @fieldwise_init
@@ -783,6 +836,9 @@ struct FnDecl(Copyable):
     var wheres: List[Int]
     """Per type parameter, a trait it must also conform to (`where
     conforms_to(T, TrN)`; its body doesn't use it), or -1."""
+    var raise_ty: Int
+    """What it raises: -1 nothing, -2 Error (`raises`), k for `raises
+    Xk`."""
 
 
 @fieldwise_init
@@ -900,6 +956,23 @@ struct Ctx(Copyable):
     the end of that block)."""
     var self_ty: Int
     """In a struct's body, its type (with `Self.T` or `Self.n`), or -1."""
+    var raise_ty: Int
+    """What the body's function raises (FnDecl.raise_ty), -1 if nothing."""
+    var catching: Int
+    """How many `try` bodies the context is in: in one, a raising call's
+    error is caught (the try's handlers cover every type it raises)..."""
+    var raised: List[Int]
+    """...and the error types raised in the innermost one so far (-2 for
+    Error)."""
+    var exit_catch: Int
+    """While a field is moved out (no_exit), how many `try` bodies the
+    context was in where that began: a raise there is caught in time only
+    by a `try` begun inside the region."""
+    var freeze_base: Int
+    """In a `try` statement, the variables from outside it (before this)
+    are read-only: a raise can come at any point, so a move there would
+    leave them maybe moved. The mutants about read variables skip
+    them."""
 
     def __init__(
         out self,
@@ -940,6 +1013,11 @@ struct Ctx(Copyable):
         self.ref_field = []
         self.ref_depth = []
         self.self_ty = -1
+        self.raise_ty = -1
+        self.catching = 0
+        self.raised = []
+        self.freeze_base = 0
+        self.exit_catch = 0
 
     def push(mut self, var name: String, ty: Int, kind: Int):
         self.names.append(name^)
@@ -1107,6 +1185,14 @@ struct Program(Movable):
     """...the trait..."""
     var pend_ty: List[Int]
     """...and the type `T.E<t>` must be."""
+    var err_value: Int
+    """The error being raised (the evaluator's `raise` is an Error
+    "RAISE")..."""
+    var err_type: Int
+    """...and its type (k for Xk)."""
+    var exceptions: Bool
+    """Whether functions may raise (not for the kinds that move `mut`
+    arguments, which a raise would leave uninitialized)."""
     var facts: List[Int]
     """While a body with a `where` is drawn (a gated method's, or a
     function's), what it gives: PARAM p conforms to trait t (p * 64 +
@@ -1157,6 +1243,9 @@ struct Program(Movable):
         self.mark_impl = -1
         self.bad_where = -1
         self.bad_where_req = -1
+        self.err_value = -1
+        self.err_type = -1
+        self.exceptions = False
         self.facts = []
         self.alias_ty = -1
         self.alias_text = String()
@@ -1244,6 +1333,8 @@ struct Program(Movable):
             return "Res"
         if kind == PARAM:
             return names[self.tid[ty]]
+        if kind == ERR:
+            return String("X", self.tid[ty])
         if kind == ASSOC:
             return String(
                 self.ty_str(self.targ[ty], names, self_print),
@@ -1288,7 +1379,7 @@ struct Program(Movable):
 
     def conforms(self, ty: Int, t: Int, bounds: List[Int]) -> Bool:
         var kind = self.tkind[ty]
-        if kind == INT or kind == RES:
+        if kind == INT or kind == RES or kind == ERR:
             return False
         if kind == ASSOC:
             return self.refines(self.traits[self.tid[ty]].assoc, t)
@@ -1387,7 +1478,7 @@ struct Program(Movable):
         var kind = self.tkind[ty]
         if kind == INT:
             return CAP_IC
-        if kind == RES:
+        if kind == RES or kind == ERR:
             return CAP_C
         if kind == ASSOC:
             return self.traits[self.traits[self.tid[ty]].assoc].cap
@@ -1403,7 +1494,7 @@ struct Program(Movable):
         return self.structs[self.tid[ty]].cap
 
     def fields_of(mut self, ty: Int) -> List[Int]:
-        if self.tkind[ty] == RES:
+        if self.tkind[ty] == RES or self.tkind[ty] == ERR:
             return [self.int_ty]
         if self.tkind[ty] != STRUCT:
             return []
@@ -1416,6 +1507,8 @@ struct Program(Movable):
     def field_name(self, ty: Int, f: Int) -> String:
         if self.tkind[ty] == RES:
             return "val"
+        if self.tkind[ty] == ERR:
+            return "code"
         return String("f", f)
 
     def type_pool(mut self, bounds: List[Int], n_structs: Int) -> List[Int]:
@@ -1542,7 +1635,7 @@ struct Program(Movable):
             ref sd = self.structs[self.methods[m].struct_id]
             if sd.generic or sd.valued:
                 out.append(self.targ[recv])
-        if self.methods[m].mbound >= 0:
+        if self.is_generic_method(m):
             if len(out) == 0:
                 out.append(self.int_ty)  # (PARAM 0 isn't used)
             out.append(u if u >= 0 else self.intern(HOLE, 0, -1))
@@ -1555,16 +1648,24 @@ struct Program(Movable):
         return self.subst(self.methods[m].ret, args)
 
     def is_generic_method(self, m: Int) -> Bool:
-        return self.methods[m].mbound >= 0
+        """Whether m has a parameter of its own: a type or a value."""
+        return self.methods[m].mbound >= 0 or self.methods[m].mvalue >= 0
 
-    def match_hole(self, pat: Int, ty: Int, mut assign: List[Int]) -> Bool:
-        """Whether pat, with HOLE for a generic method's `U`, is ty for
-        some U (assign[0]); everything else in pat is fixed."""
+    def match_hole(mut self, pat: Int, ty: Int, mut assign: List[Int]) -> Bool:
+        """Whether pat, with HOLE for a generic method's `U` (or `k`), is ty
+        for some U (assign[0]); everything else in pat is fixed."""
         if self.tkind[pat] == HOLE:
             if assign[0] < 0:
                 assign[0] = ty
                 return True
             return assign[0] == ty
+        if self.tkind[pat] == OFF and self.tkind[self.targ[pat]] == HOLE:
+            # k + c = ty: k = ty - c
+            var tk = self.tkind[ty]
+            if tk != VAL and tk != PARAM and tk != OFF:
+                return False
+            var solved = self.offset(ty, -self.tid[pat])
+            return self.match_hole(self.targ[pat], solved, assign)
         if pat == ty:
             return True
         if (
@@ -1583,14 +1684,23 @@ struct Program(Movable):
         generic)."""
         var ret = self.method_ret(m, r)
         var b = self.methods[m].mbound
-        if b < 0:
+        if not self.is_generic_method(m):
             return -1 if ret == ty else -2
         var assign: List[Int] = [-1]
         if not self.match_hole(ret, ty, assign):
             return -2
         if assign[0] >= 0:
+            if b < 0:
+                return assign[0]  # (a value)
             return assign[0] if self.conforms(assign[0], b, ctx.bounds) else -2
-        return -1 if len(self.conforming(ctx, b)) > 0 else -2
+        return -1 if len(self.u_choices(m, ctx)) > 0 else -2
+
+    def u_choices(self, m: Int, ctx: Ctx) -> List[Int]:
+        """What generic method m's own parameter can be where nothing
+        fixes it: a conforming type, or V's arguments in the pool."""
+        if self.methods[m].mvalue >= 0:
+            return self.value_args(ctx, self.methods[m].mvalue)
+        return self.conforming(ctx, self.methods[m].mbound)
 
     def method_params(mut self, m: Int, recv: Int, u: Int = -1) -> List[Int]:
         var args = self.method_args(m, recv, u)
@@ -1699,9 +1809,42 @@ struct Program(Movable):
         pool.append(self.self_type(s))
         var out = List[Int]()
         for t in pool:
-            if self.conforms(t, u, bounds) and not has(out, t):
-                out.append(t)
+            if not self.conforms(t, u, bounds) or has(out, t):
+                continue
+            # Mojo overflows its stack on `comptime E0 = B1[B1[Self.T.E0]]`
+            # in a B1 with a field of type `Self.T.E0`
+            # (modular/modular#7814): not the struct
+            # twice around an associated type
+            if (
+                self.nest_count(t, s) >= 2
+                and self.has_any_assoc(t)
+                and getenv("DECL_FUZZ_NO_ASSOC_NEST_WORKAROUND") == ""
+            ):
+                continue
+            out.append(t)
         return out^
+
+    def nest_count(self, ty: Int, s: Int) -> Int:
+        """How many times struct s is in ty's chain of type arguments."""
+        var n = 0
+        var t = ty
+        while t >= 0:
+            if self.tkind[t] == STRUCT and self.tid[t] == s:
+                n += 1
+            if self.tkind[t] != STRUCT and self.tkind[t] != ASSOC:
+                break
+            t = self.targ[t]
+        return n
+
+    def has_any_assoc(self, ty: Int) -> Bool:
+        var t = ty
+        while t >= 0:
+            if self.tkind[t] == ASSOC:
+                return True
+            if self.tkind[t] != STRUCT:
+                return False
+            t = self.targ[t]
+        return False
 
     def has_assoc(self, ty: Int, t: Int) -> Bool:
         """Whether ty has an associated type `X.E<t>` in it."""
@@ -1808,7 +1951,9 @@ struct Program(Movable):
         var kind = self.tkind[ty]
         if kind == PARAM:
             return self.tid[ty] == p
-        if (kind == STRUCT or kind == ASSOC) and self.targ[ty] >= 0:
+        if (kind == STRUCT or kind == ASSOC or kind == OFF) and self.targ[
+            ty
+        ] >= 0:
             return self.mentions(self.targ[ty], p)
         return False
 
@@ -1822,6 +1967,7 @@ struct Program(Movable):
         mut params: List[Int],
         mut convs: List[Int],
         mut mbound: Int,
+        mut mvalue: Int,
     ) raises -> Int:
         """A method's parameters (into params and convs) and result type,
         in a context with these bounds and extra types. A quarter of them
@@ -1829,27 +1975,43 @@ struct Program(Movable):
         mbound): U is PARAM 1, the type of the first parameter (which Mojo
         infers it from), and often of others and the result. Parameters
         whose types mention U aren't `mut`, which calls would need places
-        of each U for."""
-        if data.draw(integers(0, 3)) < (2 if self.near == NR_RENAME else 1):
+        of each U for. Another eighth (more for the value kinds) have a
+        value parameter `[k: Int]` instead (into mvalue, the struct V of
+        their first parameter, `V[k]`), when some struct has one."""
+        var valued = List[Int]()
+        for st in range(len(self.structs)):
+            if self.structs[st].valued:
+                valued.append(st)
+        var choice = data.draw(integers(0, 7))
+        if choice < (4 if self.near == NR_RENAME else 2):
             mbound = pick(data, len(self.traits))
+        elif len(valued) > 0 and choice < (
+            6 if self.mutant == MU_VALUE or self.near == NR_VALUE_EXPR else 3
+        ):
+            mvalue = valued[pick(data, len(valued))]
+        var generic = mbound >= 0 or mvalue >= 0
         var bs = bounds.copy()
         var sig_own = own
-        if mbound >= 0:
+        if generic:
             if len(bs) == 0:
                 bs.append(-1)  # (PARAM 0 is a value or unused)
-            bs.append(mbound)
+            bs.append(mbound)  # (-1 for a value parameter)
         var pool = self.type_pool(bs, len(self.structs))
         pool += extra.copy()
-        if mbound >= 0:
+        if mvalue >= 0:
+            pool += self.value_family(mvalue, 1)
+        if generic:
             var u = self.intern(PARAM, 1, -1)
+            if mvalue >= 0:
+                u = self.intern(STRUCT, mvalue, u)
             params.append(u)
             convs.append(CONV_VAR if data.draw(booleans()) else CONV_READ)
             if data.draw(booleans()):
                 sig_own = u
-        for _ in range(data.draw(integers(0, 1 if mbound >= 0 else 2))):
+        for _ in range(data.draw(integers(0, 1 if generic else 2))):
             var t = self.draw_sig_type(data, pool, sig_own)
             var c = draw_conv(data, mut_often)
-            if mbound >= 0 and c == CONV_MUT and self.mentions(t, 1):
+            if generic and c == CONV_MUT and self.mentions(t, 1):
                 c = CONV_READ
             params.append(t)
             convs.append(c)
@@ -1874,6 +2036,18 @@ struct Program(Movable):
             self.near == NR_DEINIT_DROP or self.near == NR_DEINIT_MOVE
         ) else 1
         var assoc_kind = self.mutant == MU_ASSOC or self.near == NR_ASSOC
+        var exc_kind = (
+            self.mutant == MU_UNHANDLED
+            or self.mutant == MU_RAISE_CTX
+            or self.mutant == MU_RAISE_TYPE
+            or self.near == NR_UNREACHABLE
+        )
+        self.exceptions = not (
+            self.mutant == MU_MUT_UNINIT
+            or self.mutant == MU_RET_UNINIT
+            or self.near == NR_MUT_REINIT
+            or self.near == NR_EARLY_RETURN
+        )
         # trait headers: parents, capability, K, make (FJ: classes in
         # order, so the refinement relation is acyclic)
         var n_traits = data.draw(integers(1, 4))
@@ -1913,6 +2087,7 @@ struct Program(Movable):
                         self.p0_ty,
                         data.draw(integers(0, MAX_RANK)),
                         False,
+                        -1,
                         -1,
                         -1,
                     )
@@ -2081,8 +2256,17 @@ struct Program(Movable):
                 var params = List[Int]()
                 var convs = List[Int]()
                 var mbound = -1
+                var mvalue = -1
                 var ret = self.draw_signature(
-                    data, [t], [], self.p0_ty, mut_often, params, convs, mbound
+                    data,
+                    [t],
+                    [],
+                    self.p0_ty,
+                    mut_often,
+                    params,
+                    convs,
+                    mbound,
+                    mvalue,
                 )
                 self.methods.append(
                     MethodDecl(
@@ -2100,6 +2284,7 @@ struct Program(Movable):
                         data.draw(booleans()) and self_conv != CONV_DEINIT,
                         -1,
                         mbound,
+                        mvalue,
                     )
                 )
                 self.traits[t].methods.append(m)
@@ -2127,6 +2312,7 @@ struct Program(Movable):
                 var params = List[Int]()
                 var convs = List[Int]()
                 var mbound = -1
+                var mvalue = -1
                 var ret = self.draw_signature(
                     data,
                     bounds,
@@ -2136,6 +2322,7 @@ struct Program(Movable):
                     params,
                     convs,
                     mbound,
+                    mvalue,
                 )
                 self.methods.append(
                     MethodDecl(
@@ -2151,6 +2338,7 @@ struct Program(Movable):
                         False,
                         -1,
                         mbound,
+                        mvalue,
                     )
                 )
                 self.structs[s].own.append(m)
@@ -2197,6 +2385,15 @@ struct Program(Movable):
             for _ in range(data.draw(integers(0, 2))):
                 params.append(self.draw_sig_type(data, pool, own_ty))
                 convs.append(draw_conv(data, mut_often))
+            # half raise (3/4 for the exception kinds): `raises` (Error) or
+            # `raises Xk`
+            var raise_ty = -1
+            if self.exceptions and data.draw(integers(0, 3)) < (
+                3 if exc_kind else 2
+            ):
+                raise_ty = -2 if data.draw(integers(0, 2)) == 0 else pick(
+                    data, N_ERR
+                )
             # a quarter of the type parameters also need `where
             # conforms_to(T, TrN)` (half for the where kinds)
             var wheres = List[Int]()
@@ -2223,6 +2420,7 @@ struct Program(Movable):
                     data.draw(integers(0, MAX_RANK)),
                     -1,
                     wheres^,
+                    raise_ty,
                 )
             )
 
@@ -2480,9 +2678,10 @@ struct Program(Movable):
         return out^
 
     def read_places(mut self, ctx: Ctx, ty: Int) -> List[Int]:
-        """Places of type ty in live read variables (MU_MUT_READ)."""
+        """Places of type ty in live read variables (MU_MUT_READ; not ones
+        frozen in a `try`)."""
         var out = List[Int]()
-        for v in range(len(ctx.names)):
+        for v in range(ctx.freeze_base, len(ctx.names)):
             if ctx.kinds[v] != V_READ or not ctx.live[v] or ctx.excl[v]:
                 continue
             if ctx.types[v] == ty:
@@ -2783,8 +2982,10 @@ struct Program(Movable):
         var names: List[String] = ["Self"]
         if self.is_generic_method(m):
             bounds.append(self.methods[m].mbound)
-            names.append("U")
+            names.append("k" if self.methods[m].mvalue >= 0 else "U")
         var pool = self.type_pool(bounds, len(self.structs))
+        if self.methods[m].mvalue >= 0:
+            pool += self.value_family(self.methods[m].mvalue, 1)
         var ctx = Ctx(bounds^, names^, rank, -1, pool^)
         ctx.push("self", self.p0_ty, kind_of_conv(self.methods[m].self_conv))
         self.push_params(
@@ -2818,15 +3019,20 @@ struct Program(Movable):
                 if not valued:
                     names.append("_")
             bounds.append(self.methods[m].mbound)
-            var rename = self.methods[m].trait_id >= 0 and self.near_chance(
-                data, NR_RENAME
-            )
-            names.append("W" if rename else "U")
-            if rename:
-                self.near_made = True
+            if self.methods[m].mvalue >= 0:
+                names.append("k")
+            else:
+                var rename = self.methods[m].trait_id >= 0 and self.near_chance(
+                    data, NR_RENAME
+                )
+                names.append("W" if rename else "U")
+                if rename:
+                    self.near_made = True
         var pool = self.type_pool(bounds, len(self.structs))
         if valued:
             pool += self.value_family(s, 0)
+        if self.methods[m].mvalue >= 0:
+            pool += self.value_family(self.methods[m].mvalue, 1)
         var ctx = Ctx(
             bounds^,
             names^,
@@ -3101,6 +3307,7 @@ struct Program(Movable):
                     self.facts.append(i * 64 + self.fns[f].wheres[i])
             var pool = self.fn_pool(f)
             var ctx = Ctx(bounds^, self.fn_names(f), rank, -1, pool^)
+            ctx.raise_ty = self.fns[f].raise_ty
             self.push_params(ctx, self.fns[f].params, self.fns[f].convs, "p")
             var ret = self.fns[f].ret
             self.fns[f].body = self.gen_body(data, ctx^, ret)
@@ -3253,6 +3460,7 @@ struct Program(Movable):
                 out += self.exit_if(data, ctx, S_RETURN)
             if self.wants_partial(ctx):
                 out += self.partial_stmts(data, ctx)
+            out += self.raise_if(data, ctx)
             if self.wants(MU_USE_MOVED) and not self.in_const_if(ctx):
                 var dead = self.moved_vars(ctx)
                 if len(dead) > 0 and self.chance(data, MU_USE_MOVED):
@@ -3322,7 +3530,8 @@ struct Program(Movable):
         methods with a `mut self` receiver."""
         var out = List[Callee]()
         for f in range(len(self.fns)):
-            if self.fns[f].rank >= ctx.rank:
+            # (not raising ones: a near miss's call isn't in a `try`)
+            if self.fns[f].rank >= ctx.rank or self.fns[f].raise_ty != -1:
                 continue
             var bounds = self.fns[f].bounds.copy()
             if len(bounds) == 0:
@@ -3871,6 +4080,8 @@ struct Program(Movable):
             out.append(self.add_stmt(Stmt(S_USE, -1, use, -1, 0, [], [], "")))
             return out^
         ctx.no_exit += 1
+        var exit_catch = ctx.exit_catch
+        ctx.exit_catch = ctx.catching
         var region_loops = ctx.region_loops
         if getenv("DECL_FUZZ_NO_PARTIAL_LOOP_WORKAROUND") == "":
             # Mojo rejects the move ("cannot be consumed, because 'x' is
@@ -3880,8 +4091,9 @@ struct Program(Movable):
         for _ in range(data.draw(integers(0, 2))):
             out.append(self.gen_stmt(data, ctx))
         ctx.region_loops = region_loops
-        ctx.no_exit -= 1
         ctx.new_statement()
+        # (the reassignment's value is still in the region: a raise there
+        # would leave the variable partly moved)
         if data.draw(integers(0, 2)) == 0:
             var op = pick(data, comptime (len(CMP_OPS)))
             var x = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
@@ -3905,6 +4117,8 @@ struct Program(Movable):
             out.append(
                 self.add_stmt(Stmt(S_ASSIGN, target, e, -1, 0, [], [], ""))
             )
+        ctx.no_exit -= 1
+        ctx.exit_catch = exit_catch
         ctx.live[v] = True
         ctx.move_depth[v] = -1
         ctx.new_statement()
@@ -4317,7 +4531,7 @@ struct Program(Movable):
         value and has no memory origin."""
         var out = List[Int]()
         for v in range(len(ctx.names)):
-            if not ctx.live[v]:
+            if not ctx.live[v] or self.tkind[ctx.types[v]] == ERR:
                 continue
             if ctx.kinds[v] != V_READ or ctx.types[v] != self.int_ty:
                 out.append(v * 64)
@@ -4417,7 +4631,7 @@ struct Program(Movable):
                     t_field.append(f)
         if self.wants(MU_ASSIGN_READ):
             var places = List[Int]()
-            for v in range(len(ctx.names)):
+            for v in range(ctx.freeze_base, len(ctx.names)):
                 if ctx.kinds[v] == V_READ and ctx.live[v]:
                     places.append(v * 64)
                     for f in range(len(self.fields_of(ctx.types[v]))):
@@ -4465,6 +4679,8 @@ struct Program(Movable):
                 )
         var mut_types = self.mut_call_types(ctx)
         var kinds: List[Int] = [S_VAR, S_EXPR]
+        if self.can_try(ctx):
+            kinds += [S_TRY, S_TRY]
         if len(mut_types) > 0:
             kinds += [S_EXPR, S_EXPR]
         if len(t_var) > 0:
@@ -4498,6 +4714,9 @@ struct Program(Movable):
                     others.append(k)
             kinds = others^
         var kind = kinds[pick(data, len(kinds))]
+
+        if kind == S_TRY:
+            return self.try_statement(data, ctx)
 
         if kind == S_VAR:
             # half the time a type with `mut` methods, to call them on
@@ -4993,6 +5212,7 @@ struct Program(Movable):
                 len(self.fns[f].bounds) > 0
                 or self.fns[f].rank >= ctx.rank
                 or not has(self.fns[f].convs, CONV_MUT)
+                or not self.raise_ok(ctx, self.fns[f].raise_ty)
             ):
                 continue
             var needed = List[Int]()
@@ -5185,7 +5405,7 @@ struct Program(Movable):
         if self.wants(MU_MOVE_READ) and pos == P_OWNED and kind != INT:
             # (a read Int is passed by value, so it may be moved)
             var reads = List[Int]()
-            for v in range(len(ctx.names)):
+            for v in range(ctx.freeze_base, len(ctx.names)):
                 if (
                     ctx.kinds[v] == V_READ
                     and ctx.live[v]
@@ -5230,6 +5450,10 @@ struct Program(Movable):
                 var text = String(texts[pick(data, len(texts))], "^")
                 return self.mark(self.add(E_LIT, 0, ty, [], [], text^))
 
+        if size > 0 and self.wants(MU_RAISE_CTX):
+            var rc = self.raise_ctx_call(data, ctx, ty, size)
+            if rc >= 0:
+                return rc
         if size > 0 and (self.wants(MU_WHERE) or self.wants_near(NR_WHERE)):
             var g = self.gated_call(data, ctx, ty, size, pos)
             if g >= 0:
@@ -5323,7 +5547,9 @@ struct Program(Movable):
                             k_recv.append(r)
                             k_trait.append(t)
             for f in range(len(self.fns)):
-                if self.fns[f].rank >= ctx.rank:
+                if self.fns[f].rank >= ctx.rank or not self.raise_ok(
+                    ctx, self.fns[f].raise_ty
+                ):
                     continue
                 if has(self.fns[f].convs, CONV_MUT):
                     if not stmt_root:
@@ -5366,6 +5592,16 @@ struct Program(Movable):
                 rules += [R_K, R_K]
             if len(call_fn) > 0:
                 rules += [R_CALL, R_CALL, R_CALL]
+                # (in a `try` body, raising calls are the point)
+                if ctx.catching > 0:
+                    var raising = List[Int]()
+                    for f in call_fn:
+                        if self.fns[f].raise_ty != -1:
+                            raising.append(f)
+                    if len(raising) > 0:
+                        rules += [R_CALL, R_CALL, R_CALL]
+                        if data.draw(booleans()):
+                            call_fn = raising^
         if prefer_mut:
             var mr = List[Int]()
             var mm = List[Int]()
@@ -5432,6 +5668,243 @@ struct Program(Movable):
                         rest.append(r)
                 rules = rest^
         raise Error("STUCK")
+
+    def raise_ok(self, ctx: Ctx, r: Int) -> Bool:
+        """Whether a call raising r (FnDecl.raise_ty) can go here: in a `try`
+        body (its handlers will cover r), or where the error propagates
+        (`raises`, or `raises Xr`), but not where a field is moved out
+        (ctx.no_exit: an exit would leave the variable partly moved)."""
+        if r == -1:
+            return True
+        if ctx.no_exit > 0 and ctx.catching <= ctx.exit_catch:
+            return False
+        if ctx.catching > 0:
+            # Mojo crashes on a `try` whose raising call is in a dead
+            # branch (`if False:`) and is followed by another statement
+            # (modular/modular#7813): none in a
+            # constant `if`, or a ternary's branch, there
+            if (ctx.const_if > 0 or ctx.no_move > 0) and getenv(
+                "DECL_FUZZ_NO_DEAD_RAISE_WORKAROUND"
+            ) == "":
+                return False
+            return True
+        return ctx.raise_ty == -2 or (r >= 0 and ctx.raise_ty == r)
+
+    def raise_ctx_call(
+        mut self,
+        mut data: ConjectureData,
+        mut ctx: Ctx,
+        ty: Int,
+        size: Int,
+    ) raises -> Int:
+        """For MU_RAISE_CTX, a call of a raising function (not generic,
+        without `mut` arguments) whose error nothing here catches, or
+        -1."""
+        if self.in_branch(ctx) or self.in_const_if(ctx) or ctx.no_exit > 0:
+            # (Mojo drops dead branches before checking; where a field is
+            # moved out, it reports the move instead)
+            return -1
+        var cands = List[Int]()
+        for f in range(len(self.fns)):
+            ref fd = self.fns[f]
+            if (
+                fd.raise_ty != -1
+                and not self.raise_ok(ctx, fd.raise_ty)
+                and len(fd.bounds) == 0
+                and fd.rank < ctx.rank
+                and fd.ret == ty
+                and not has(fd.convs, CONV_MUT)
+            ):
+                cands.append(f)
+        if len(cands) == 0 or not self.chance(data, MU_RAISE_CTX):
+            return -1
+        self.mutated = True
+        var f = cands[pick(data, len(cands))]
+        var params = self.fns[f].params.copy()
+        var convs = self.fns[f].convs.copy()
+        var kids = self.gen_args(data, ctx, params, convs, size // 2, False)
+        var text = String(self.fns[f].name, "(", self.args_text(kids, 0), ")")
+        return self.mark(self.add(E_CALL, f, ty, kids^, [], text^))
+
+    def raise_if(
+        mut self, mut data: ConjectureData, mut ctx: Ctx
+    ) raises -> List[Int]:
+        """Now and then `if c: raise Xk(e)`: in a `try` body (any k, which
+        its handlers will catch), or in a raising function's body where a
+        field isn't moved out (k is the declared type, any for `raises`;
+        another for MU_RAISE_TYPE)."""
+        if ctx.no_exit > 0 and ctx.catching <= ctx.exit_catch:
+            return []
+        var caught = ctx.catching > 0
+        if (
+            caught
+            and (ctx.const_if > 0 or ctx.no_move > 0)
+            and getenv("DECL_FUZZ_NO_DEAD_RAISE_WORKAROUND") == ""
+        ):
+            return []  # (the dead-branch crash, as in `raise_ok`)
+        if not caught and ctx.raise_ty == -1:
+            return []
+        var odds = 2
+        if data.draw(integers(0, odds - 1)) != 0:
+            return []
+        ctx.new_statement()
+        var x = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
+        var y = self.gen_typed(data, ctx, self.int_ty, 1, P_READ)
+        if self.is_const(x) and self.is_const(y):
+            return []
+        var op = pick(data, comptime (len(CMP_OPS)))
+        ctx.depth += 1
+        var k = ctx.raise_ty if (ctx.raise_ty >= 0 and not caught) else pick(
+            data, N_ERR
+        )
+        var e = self.gen_typed(data, ctx, self.int_ty, 2, P_OWNED)
+        if caught and not has(ctx.raised, k):
+            ctx.raised.append(k)
+        if (
+            not caught
+            and ctx.raise_ty >= 0
+            and self.wants(MU_RAISE_TYPE)
+            and not self.in_const_if(ctx)
+            and self.chance(data, MU_RAISE_TYPE)
+        ):
+            k = (ctx.raise_ty + 1) % N_ERR
+            e = self.mark(e)
+            self.mutated = True
+        ctx.depth -= 1
+        var r = self.add_stmt(Stmt(S_RAISE, -1, e, -1, k, [], [], ""))
+        return [self.add_stmt(Stmt(S_IF, -1, x, y, op, [r], [], String()))]
+
+    def can_try(self, ctx: Ctx) -> Bool:
+        """Whether a `try` here could call a raising function."""
+        if ctx.depth >= MAX_DEPTH:
+            return False
+        for f in range(len(self.fns)):
+            if self.fns[f].raise_ty != -1 and self.fns[f].rank < ctx.rank:
+                return True
+        return False
+
+    def try_statement(
+        mut self, mut data: ConjectureData, mut ctx: Ctx
+    ) raises -> Int:
+        """`try:` with handlers for the error types its body raises: typed
+        ones (`except Xk __as eN:`, whose bodies can read `eN.code`) in a
+        random order, then perhaps `except:` for the rest (always for
+        Error). Variables from outside are read-only in the body and the
+        handlers (`freeze_base`). An unhandled mutant leaves out a typed
+        handler; an unreachable near miss adds one that can't run."""
+        var n = len(ctx.names)
+        var kinds = ctx.kinds.copy()
+        var freeze = ctx.freeze_base
+        for v in range(n):
+            ctx.kinds[v] = V_READ
+        ctx.freeze_base = n
+        var outer_raised = ctx.raised.copy()
+        ctx.raised = []
+        ctx.catching += 1
+        ctx.depth += 1
+        var body = self.gen_block(data, ctx, 3, False)
+        ctx.depth -= 1
+        ctx.catching -= 1
+        var raised = ctx.raised.copy()
+        ctx.raised = outer_raised^
+        ctx.truncate(n)
+        if len(raised) == 0:
+            # (nothing to catch: every handler would be unreachable, and
+            # one can't use variables, modular/modular#7812) the statements
+            # as a group
+            for v in range(n):
+                ctx.kinds[v] = kinds[v]
+            ctx.freeze_base = freeze
+            # (target 1: its locals go out of scope after it)
+            return self.add_stmt(Stmt(S_USE, 1, -1, -1, 0, body^, [], ""))
+        # which handlers, in which order
+        var typed = List[Int]()
+        var has_error = False
+        for r in raised:
+            if r == -2:
+                has_error = True
+            else:
+                typed.insert(pick(data, len(typed) + 1), r)
+        var bare = has_error or data.draw(integers(0, 2)) == 0
+        if bare and not has_error:
+            # (the bare handler catches the ones left out: at least one, or
+            # it would be unreachable)
+            typed.resize(pick(data, len(typed)), 0)
+        var mark = 0
+        if (
+            not bare
+            and len(typed) >= 2
+            and self.wants(MU_UNHANDLED)
+            and not self.in_const_if(ctx)
+            and self.chance(data, MU_UNHANDLED)
+        ):
+            _ = typed.pop(pick(data, len(typed)))
+            mark = 1
+            self.mutated = True
+        var hts = typed.copy()
+        if bare:
+            hts.append(-1)
+        var unreachable = -1  # (its index in hts)
+        if self.wants_near(NR_UNREACHABLE) and self.near_chance(
+            data, NR_UNREACHABLE
+        ):
+            # a type caught before, one not raised, or anything after
+            # `except:`
+            var t = pick(data, N_ERR)
+            if bare:
+                hts.append(t)
+            elif len(typed) > 0 and data.draw(booleans()):
+                hts.append(typed[pick(data, len(typed))])
+            else:
+                var unraised = List[Int]()
+                for k in range(N_ERR):
+                    if not has(raised, k):
+                        unraised.append(k)
+                if len(unraised) == 0:
+                    unraised = typed.copy()
+                hts.append(unraised[pick(data, len(unraised))])
+            unreachable = len(hts) - 1
+            self.near_made = True
+        var handlers = List[Int]()
+        for i in range(len(hts)):
+            var t = hts[i]
+            var name = String("e", ctx.counter)
+            ctx.counter += 1
+            ctx.depth += 1
+            # (an unreachable handler that uses its binding, or a local
+            # variable, is rejected with "use of uninitialized value",
+            # modular/modular#7812: its body is `pass`)
+            var dead = (
+                i == unreachable
+                and getenv("DECL_FUZZ_NO_UNREACHABLE_WORKAROUND") == ""
+            )
+            if t >= 0 and not dead:
+                ctx.push(name.copy(), self.intern(ERR, t, -1), V_READ)
+            var hb = List[Int]()
+            if not dead:
+                hb = self.gen_block(data, ctx, 2, False)
+            ctx.depth -= 1
+            ctx.truncate(n)
+            handlers.append(
+                self.add_stmt(
+                    Stmt(
+                        S_HANDLER,
+                        t,
+                        -1,
+                        -1,
+                        Int(i == unreachable),
+                        hb^,
+                        [],
+                        name^,
+                    )
+                )
+            )
+        for v in range(n):
+            ctx.kinds[v] = kinds[v]
+        ctx.freeze_base = freeze
+        return self.add_stmt(
+            Stmt(S_TRY, -1, -1, -1, mark, body^, handlers^, String())
+        )
 
     def gated_call(
         mut self,
@@ -5697,11 +6170,19 @@ struct Program(Movable):
             var u = -1
             var bad_u = -1
             var b = self.methods[m].mbound
-            if b >= 0:
+            var gm = self.is_generic_method(m)
+            if gm:
                 u = self.method_fit(m, r, ty, ctx)
                 if u < 0:
-                    var ok = self.conforming(ctx, b)
+                    var ok = self.u_choices(m, ctx)
                     u = ok[pick(data, len(ok))]
+            if self.methods[m].mvalue >= 0 and self.wants(MU_VALUE):
+                # another value explicitly: `x.m[k + d](...)`
+                if self.chance(data, MU_VALUE):
+                    bad_u = self.offset(u, data.draw(integers(1, 3)))
+                    self.mutated = True
+                    wrong = True
+            if b >= 0:
                 if self.wants(MU_BOUND) or (
                     self.wants(MU_WHERE)
                     and not self.in_branch(ctx)
@@ -5732,16 +6213,18 @@ struct Program(Movable):
             var mut_call = self.has_mut(m)
             kids += self.gen_args(data, ctx, params, convs, half, mut_call)
             var text = String(self.exprs[kids[0]].text, ".", name)
-            if b >= 0:
+            if gm:
                 # explicit half the time, and always when an argument of
                 # another type might change what U is inferred to be
                 var forced = bad_u >= 0 or (self.mutated and not mutated_before)
                 if forced or data.draw(booleans()):
-                    text += String(
-                        "[", self.cty(bad_u if bad_u >= 0 else u, ctx), "]"
+                    var x = bad_u if bad_u >= 0 else u
+                    var xs = self.cty(x, ctx) if b >= 0 else self.val_str(
+                        x, ctx.param_names
                     )
+                    text += String("[", xs, "]")
             text += String("(", self.args_text(kids, 1), ")")
-            var tys = [u] if b >= 0 else List[Int]()
+            var tys = [u] if gm else List[Int]()
             var e = self.add(E_METHOD, m, ty, kids^, tys^, text^)
             return self.mark(e) if wrong else e
 
@@ -5764,6 +6247,9 @@ struct Program(Movable):
         # R_CALL: a free or generic function; T-UCast's counterpart is
         # passing a conforming type for a bounded parameter
         var f = c.call_fn[pick(data, len(c.call_fn))]
+        var r = self.fns[f].raise_ty
+        if r != -1 and ctx.catching > 0 and not has(ctx.raised, r):
+            ctx.raised.append(r)
         var targs = List[Int]()
         var n_tp = len(self.fns[f].bounds)
         if n_tp > 0:
@@ -6035,6 +6521,8 @@ struct Program(Movable):
             var m_targs = self.subst_all(self.exprs[e].tys.copy(), targs)
             if len(m_targs) > 0:
                 self.stats[STAT_GENERIC_METHOD] += 1
+                if self.methods[a].mvalue >= 0:
+                    self.stats[STAT_VALUE_CALL] += 1
             return self.call(a, -1, recv_ty, kids, convs, frame, targs, m_targs)
         if kind == E_STATIC:
             if self.tkind[self.exprs[e].tys[0]] == ASSOC:
@@ -6192,10 +6680,23 @@ struct Program(Movable):
         for v in moved:
             frame[v] = -1
         var result: Int
-        if f >= 0:
-            result = self.run_body(self.fns[f].body, callee, f_targs)
-        else:
-            result = self.call_method(m, recv_ty, callee, f_targs)
+        try:
+            if f >= 0:
+                result = self.run_body(self.fns[f].body, callee, f_targs)
+            else:
+                result = self.call_method(m, recv_ty, callee, f_targs)
+        except err:
+            # (`mut` arguments are references: what the callee did to them
+            # before it raised stays)
+            if String(err) == "RAISE" and has_mut:
+                for i in range(len(args)):
+                    if convs[i] == CONV_MUT:
+                        self.write_place(args[i], callee[i], frame)
+            if String(err) == "RAISE" and f >= 0 and self.fns[f].raise_ty == -2:
+                # (out of a function that `raises`, the error is an Error:
+                # only `except:` catches it)
+                self.err_type = -2
+            raise err^
         if has_mut:
             self.stats[STAT_MUT_CALL] += 1
             for i in range(len(args)):
@@ -6251,16 +6752,53 @@ struct Program(Movable):
                 return SIG_NONE
             _ = self.eval(e, frame, targs)
         elif kind == S_USE:
+            var n = len(frame)
             for st in self.stmts[s].body.copy():
                 var sig = self.exec(st, frame, targs)
                 if sig != SIG_NONE:
                     return sig
+            if self.stmts[s].target == 1:  # (a try body with nothing to catch)
+                while len(frame) > n:
+                    _ = frame.pop()
         elif kind == S_RETURN:
             self.stats[STAT_RETURN] += 1
             self.ret_value = self.eval(e, frame, targs)
             return SIG_RETURN
         elif kind == S_REF:  # (another spelling of a place)
             self.stats[STAT_REF] += 1
+        elif kind == S_RAISE:
+            self.stats[STAT_RAISE] += 1
+            var code = self.eval(e, frame, targs)
+            self.err_type = self.stmts[s].a
+            self.err_value = self.new_value(-3, 0, [code])
+            raise Error("RAISE")
+        elif kind == S_TRY:
+            var n = len(frame)
+            try:
+                return self.exec_block(self.stmts[s].body.copy(), frame, targs)
+            except err:
+                if String(err) != "RAISE":
+                    raise err^
+            # (the try body's locals are gone; the first handler for the
+            # error's type runs, with it bound)
+            while len(frame) > n:
+                _ = frame.pop()
+            var t = self.err_type
+            var v = self.err_value
+            for h in self.stmts[s].orelse.copy():
+                var ht = self.stmts[h].target
+                if ht != t and ht != -1:
+                    continue
+                self.stats[STAT_CATCH] += 1
+                if ht >= 0:
+                    frame.append(v)
+                var sig = self.exec_block(
+                    self.stmts[h].body.copy(), frame, targs
+                )
+                while len(frame) > n:
+                    _ = frame.pop()
+                return sig
+            raise Error("evaluator: an uncaught error type in a try")
         elif kind == S_BREAK:
             self.stats[STAT_BREAK] += 1
             return SIG_BREAK
@@ -6382,6 +6920,10 @@ struct Program(Movable):
             return String(
                 indent, "ref ", s.name, " = ", self.exprs[s.e].text, "\n"
             )
+        if s.kind == S_RAISE:
+            return String(
+                indent, "raise X", s.a, "(", self.exprs[s.e].text, ")\n"
+            )
         if s.kind == S_BREAK:
             return String(indent, "break\n")
         if s.kind == S_CONTINUE:
@@ -6392,8 +6934,33 @@ struct Program(Movable):
             var group = String()
             for st in s.body:
                 group += self.stmt_text(st, indent)
+            if len(s.body) == 0:
+                # (an empty `try` body as a group; not `pass`, which a trait
+                # method's default body can't have)
+                group = String(indent, "_ = 0\n")
             return group^
         var inner = String(indent, "    ")
+        if s.kind == S_TRY:
+            var text = String(indent, "try:", MARK if s.a == 1 else "", "\n")
+            text += self.block_text(s.body, inner)
+            for h in s.orelse:
+                ref hs = self.stmts[h]
+                var mark = MARK_NEAR if hs.a == 1 else ""
+                if hs.target >= 0:
+                    text += String(
+                        indent,
+                        "except X",
+                        hs.target,
+                        " __as ",
+                        hs.name,
+                        ":",
+                        mark,
+                        "\n",
+                    )
+                else:
+                    text += String(indent, "except:", mark, "\n")
+                text += self.block_text(hs.body, inner)
+            return text^
         if s.kind == S_IF:
             var ops = materialize[CMP_OPS]()
             var text = String(
@@ -6454,8 +7021,11 @@ struct Program(Movable):
         var renamed = False
         if self.is_generic_method(m):
             var u = names[1] if len(names) > 1 else String("U")
-            renamed = u != "U"
-            s += String("[", u, ": Tr", self.methods[m].mbound, "]")
+            renamed = u != "U" and self.methods[m].mvalue < 0
+            if self.methods[m].mvalue >= 0:
+                s += String("[", u, ": Int]")
+            else:
+                s += String("[", u, ": Tr", self.methods[m].mbound, "]")
         s += String("(", prefixes[self.methods[m].self_conv], "self")
         for i in range(len(params)):
             s += String(
@@ -6495,7 +7065,20 @@ struct Program(Movable):
 
     def declarations_text(mut self) -> String:
         var s = String()
+        if self.exceptions:
+            for k in range(N_ERR):
+                s += String(
+                    "struct X",
+                    k,
+                    "(Copyable, Writable):\n    var code: Int\n\n",
+                    "    def __init__(out self, code: Int):\n",
+                    "        self.code = code\n        _born()\n\n",
+                    "    def __init__(out self, *, copy: Self):\n",
+                    "        self.code = copy.code\n        _born()\n\n",
+                    "    def __deinit__(deinit self):\n        _died()\n\n\n",
+                )
         var self_names: List[String] = ["Self", "U"]
+        var value_names: List[String] = ["Self", "k"]
         var cap_names = materialize[CAP_NAMES]()
         for t in range(len(self.traits)):
             s += String("trait Tr", t, "(")
@@ -6521,7 +7104,7 @@ struct Program(Movable):
                     m,
                     self.methods[m].params,
                     self.methods[m].ret,
-                    self_names,
+                    self_names if self.methods[m].mvalue < 0 else value_names,
                     -1,
                 )
                 if self.methods[m].body >= 0:
@@ -6667,6 +7250,11 @@ struct Program(Movable):
                         s += String(fn_names[i], ": Tr", fd.bounds[i])
                 s += "]"
             s += "("
+            var raises_text = String()
+            if fd.raise_ty == -2:
+                raises_text = " raises"
+            elif fd.raise_ty >= 0:
+                raises_text = String(" raises X", fd.raise_ty)
             for i in range(len(fd.params)):
                 if i > 0:
                     s += ", "
@@ -6677,7 +7265,9 @@ struct Program(Movable):
                     ": ",
                     self.ty_str(fd.params[i], fn_names, -1),
                 )
-            s += String(") -> ", self.ty_str(fd.ret, fn_names, -1))
+            s += String(
+                ")", raises_text, " -> ", self.ty_str(fd.ret, fn_names, -1)
+            )
             var conds = List[String]()
             for i in range(len(fd.wheres)):
                 if fd.wheres[i] >= 0:

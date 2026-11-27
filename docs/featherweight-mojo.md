@@ -1885,6 +1885,128 @@ missing, 600 assoc-or-missing and 300 missing-or-type mutants, and
 1,000 near misses and 1,000 mutants of all kinds (seeds 7511-7516,
 7521-7523, 7531, 7532). No new compiler bug.
 
+**Found later: a stack overflow on a nested recursive binding** (filed
+as [#7814](https://github.com/modular/modular/issues/7814)). In the exceptions
+step's rounds, 5 maybe_moved near misses (without any `try`) crashed the
+compiler after parsing, with 256 frames cycling through the same
+addresses. Reduced: `struct B1[T: Tr0](ImplicitlyCopyable, Tr0)` with a
+field `var f1: Self.T.E0` and `comptime E0 = B1[B1[Self.T.E0]]` (one
+level, `B1[Self.T.E0]`, compiles), on 1117, 1125 and 1126. The
+workaround: a binding doesn't nest its own struct twice around an
+associated type (DECL_FUZZ_NO_ASSOC_NEST_WORKAROUND=1 disables it).
+
+## Value parameters on methods
+
+Like a generic method's `U`, a method's own value parameter `[k: Int]`
+is PARAM 1 (`k`, so it can't clash with a struct's `n`), and its first
+parameter is `V[k]`, from which Mojo infers it. Signatures and bodies
+also use `V[k + 1]` and `V[k - 1]`; `match_hole` solves `k + c = ty`
+for the result type wanted. A call writes `x.m[k]` half the time, and
+the value mutant also gives one explicitly another value. An eighth of
+the methods take one (more for the value kinds) when some struct has a
+value parameter. Validation on nightly 1.3.0.dev2026112605: 300 stage 2
+programs, 300 value_expr near misses, 300 value mutants and 200 rename
+near misses, all OK (seeds 7601-7604). One generator bug on the way: a
+value method's `k` made `sig_text` mark its signature as a rename near
+miss.
+
+## Exceptions: typed `raises` and multiple `except` clauses
+
+The nightly changelog adds experimental typed errors: `def f() raises
+E1 -> Int`, and `try` blocks with several typed handlers, `except E1
+__as e:`, then perhaps an untyped one. Probes on 2026112605 (1117 doesn't
+parse `__as`):
+- The first handler whose type matches runs; nested `try`s, `else`,
+  `finally`, `continue`/`break` in handlers, re-raising `e^` and moving
+  `e` out all agree at -O0, -O3 and compile time, and error values with
+  destructors are destroyed exactly once.
+- A typed `try` must be exhaustive, even in a function that could let
+  the error propagate (`raises E2`), and even when an outer `try` would
+  catch it: "unhandled error types in try body: 'E2'". A handler for a
+  type the body doesn't raise, a duplicate, or anything after `except:`
+  is "unreachable 'except' clause" (a warning).
+- Error types needn't be Writable, except to become an `Error`: an
+  untyped `raises` function lets an E1 out as an Error (which only an
+  untyped handler catches), and that needs E1 Writable ("cannot
+  implicitly convert 'X0' value to 'Error'").
+- A function that `raises E2` can't raise or propagate an E1: "cannot
+  implicitly convert 'E1' value to 'E2'". A `mut` argument must be
+  initialized at every raise point, and what the callee did to it before
+  raising stays.
+
+In FM, error types X0 and X1 are counted structs (`_born`/`_died`, so the
+ledger checks that every error is destroyed once) with one field `code`.
+A new type kind ERR is the type of a handler's binding; it's in no pool.
+Half of the functions raise (none for the kinds that move `mut`
+arguments, which a raise would leave uninitialized), `raises` or `raises
+Xk`, and their bodies get `if c: raise Xk(e)` statements. A raising call
+goes only where its error goes somewhere (`raise_ok`): a `try` body, or
+a function raising Error or the same Xk, and not where a field is moved
+out (unless a `try` begun inside that region catches it). A `try`
+statement freezes the variables from outside it (read-only: a raise can
+come anywhere, so a move would leave them maybe moved), and its body may
+also `raise` directly. Its handlers cover exactly the types the body
+raised (`Ctx.raised`): typed handlers in a random order, then `except:`
+for the rest (at least one, and always for Error). A `try` whose body
+raises nothing is printed as its statements.
+
+The evaluator raises an Error "RAISE" (with `err_type`, `err_value`):
+`call` writes `mut` arguments back first, and retypes the error as Error
+when it leaves a `raises` function; `S_TRY` runs the first matching
+handler with the error bound.
+
+| Kind | Construct | Mojo's error, or why it's valid |
+|---|---|---|
+| `unhandled` | a `try` with typed handlers only, one left out | unhandled error types in try body |
+| `raise_ctx` | a call of a raising function where nothing catches it | cannot call function that may raise in a context that cannot raise, or cannot implicitly convert |
+| `raise_type` | `raise Xj(...)` in a function that `raises Xk` | cannot implicitly convert 'X1' value to 'X0' |
+| near `unreachable` | a handler for a type caught before, or not raised, or after `except:` (body `pass`) | a warning only |
+
+**Found: an unreachable handler can't use anything** (filed as
+[#7812](https://github.com/modular/modular/issues/7812)). A handler
+Mojo warns is unreachable, whose body uses its binding `e` or a local
+variable from before the `try`, is rejected with "use of uninitialized
+value". The generator hit it with a bare `except:` after handlers for
+every raised type, and with a `try` whose body raised nothing. The
+workaround: a bare handler always catches at least one type, a `try`
+needs a raising body, and the near miss's handler is `pass`
+(DECL_FUZZ_NO_UNREACHABLE_WORKAROUND=1 lets it use its binding).
+
+**Found: a compiler crash on a `try` with a raising call in a dead
+branch** (filed as
+[#7813](https://github.com/modular/modular/issues/7813)). The
+compiler segfaults ("Crash parsing statement" at the `try`, in
+`mlir::Attribute::getContext`) when a `try` body's raising call is in an
+`if False:` (or `if 1 != 1:`, or the `else` of `if True:`) and another
+statement follows. Plain `raises` and `except e:` crash too, on 1125 and
+1126 but not 1117: a regression. Reduced from 9 crashes in the first
+rounds (valid programs and mutants) with a statement-level reducer
+(scratchpad `red/reduce.py`, which also needs the crash to come without
+errors, or it reduces to a broken program). The workaround: no raising
+calls in a constant `if` or a ternary's branch inside a `try`
+(DECL_FUZZ_NO_DEAD_RAISE_WORKAROUND=1 disables it).
+
+In 1,000 stage 2 programs (seed 7771), 184 raise and catch while
+running: 961 `raise` statements executed and 955 handlers run (a raise
+whose code expression raises first counts, but isn't the one caught).
+
+**Validation.** With the final generator on nightly 1.3.0.dev2026112605
+everything was OK: 1,000 stage 2 programs, 2,600 near misses and 1,000
+mutants of all kinds, 300 unreachable and 300 assoc near misses, and 400
+unhandled-raise_ctx-raise_type mutants (seeds 7762, 7771-7776). Without
+the dead-raise workaround, 100 stage 2 programs were OK too (seed 7756,
+an earlier version): the crash needs a raise point in a constant branch
+followed by a statement, which the stage 2 odds rarely make.
+
+Generator bugs found on the way: X0 and X1 weren't Writable; a `try`
+printed as a group kept its locals in the evaluator's frame (variable
+slots shifted: an evaluator crash, and DIFF_EXPECTEDs); an empty group
+printed `pass` (not allowed alone in a block, nor in a trait method
+with a result); the evaluator kept an error's type through a `raises`
+function (a DIFF_EXPECTED: Mojo was right); raising calls between a
+partial move and the field's reassignment, including in the
+reassignment's value.
+
 ## Beyond the paths
 
 Mojo features FM leaves out for now:
