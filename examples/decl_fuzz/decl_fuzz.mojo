@@ -105,7 +105,11 @@
 # miss writes one struct's binding as `Self.E0` throughout its
 # declarations. The bound's own associated types give `T.E0.E1` (and
 # `Self.T.E0.E1`, `Self.E0.E1`), and substitution deeper ones. Methods
-# can also take a value parameter, `def m[k: Int](self, p0: V[k], ...)`.
+# can also take a value parameter, `def m[k: Int](self, p0: V[k], ...)`,
+# or both, `def m[U: TrN, k: Int](self, p0: U, p1: V[k], ...)`, which
+# calls write positionally, U alone, `k=` alone or both by keyword; the
+# own2 mutant writes them in the wrong order, `x.m[3, S1]`, the near
+# miss by keyword with k first, `x.m[k=3, U=S1]`.
 #
 # Half of the functions with a value parameter constrain it, `where n + 1
 # > 2 and n <= 4` (with perhaps a `comptime assert n - 1 >= 0` the
@@ -119,7 +123,14 @@
 # evidence); the near miss is a call only an assert gives evidence for.
 # A quarter of the value parameters can't be inferred, `def g0[n:
 # Int](p0: V[n + 1])`: calls write the value, `g0[2](V[3](...))`, and the
-# infer mutant leaves it out.
+# infer mutant leaves it out. A sixth of the functions also take a type
+# parameter no parameter mentions, `def g0[T: Tr0, W: Tr1](p0: T) -> W`
+# (its values come from W's make), which calls write, all of them or
+# `g0[W=S1](x)`; the infer mutant leaves it out too. The body of a
+# function over n can test a proposition, `comptime if n + 1 >= 3:`
+# (outer variables are read-only in its branches), which the first
+# branch knows; and a quarter of a valued struct's own methods have a
+# `where` on `Self.n` too, which its receivers have to meet.
 #
 # Exceptions: half of the functions raise, `raises` (Error) or `raises
 # Xk` (X0, X1 are counted error types with a `code`), with `if c: raise
@@ -296,6 +307,10 @@ its line is marked (an unhandled mutant)."""
 comptime S_HANDLER = 12
 """`except Xk __as eN:` (target k, name eN) or `except:` (target -1); a =
 1 for an unreachable handler (marked: the near miss)."""
+comptime S_CIF = 13
+"""`comptime if <prop>:` over the function's value parameter (a = its
+prop_key, name = its text), with body and orelse; outer variables are
+read-only in both."""
 
 # what executing a statement did, for the evaluator
 comptime SIG_NONE = 0
@@ -378,7 +393,11 @@ comptime STAT_VWHERE = 25
 """Calls of functions with a `where` on their value parameter."""
 comptime STAT_NESTED = 26
 """Values of nested associated types (`T.E0.E1`) made or read."""
-comptime N_STATS = 27
+comptime STAT_OWN2 = 27
+"""Calls of methods with two parameters of their own."""
+comptime STAT_CIF = 28
+"""`comptime if` statements executed."""
+comptime N_STATS = 29
 comptime STAT_NAMES: List[String] = [
     "own",
     "required",
@@ -407,6 +426,8 @@ comptime STAT_NAMES: List[String] = [
     "catch",
     "vwhere",
     "nested",
+    "own2",
+    "cif",
 ]
 
 # Stage 3: ill-typed mutants (DECL_FUZZ_MUTANTS=1). Each program gets one
@@ -497,8 +518,13 @@ knows no equal proposition ("lacking evidence"), even one implying it
 comptime MU_INFER = 30
 """A call that leaves out the value of a parameter Mojo can't infer
 (`g0(x)` for `def g0[n: Int](p0: V[n + 1])`): "it depends on an
-unresolved parameter"."""
-comptime N_MU = 31
+unresolved parameter"; or the type of one no parameter mentions (`def
+g0[T: Tr0, W: Tr1](p0: T) -> W`): "failed to infer parameter 'W'"."""
+comptime MU_OWN2 = 31
+"""A call of a method with two parameters of its own, `[U: TrN, k: Int]`,
+that writes them in the wrong order, `x.m[3, S1](...)`: "parameter 'U'
+has 'TrN' type, but value has type 'IntLiteral[3]'"."""
+comptime N_MU = 32
 comptime MU_NAMES: List[String] = [
     "type",
     "use_moved",
@@ -531,6 +557,7 @@ comptime MU_NAMES: List[String] = [
     "raise_type",
     "vwhere",
     "infer",
+    "own2",
 ]
 comptime MU_ODDS = 6
 """Each chance to apply the mutation is taken 1 time in MU_ODDS."""
@@ -605,7 +632,9 @@ comptime NR_VWHERE = 20
 gives evidence for: the assert, at the start of the caller's body, is
 implied by the caller's own `where` but isn't equal to any of it (`where
 n >= 3` and `comptime assert n - 1 >= 0`)."""
-comptime N_NR = 21
+comptime NR_OWN2 = 21
+"""The same call with both by keyword, k first: `x.m[k=3, U=S1](...)`."""
+comptime N_NR = 22
 comptime NR_NAMES: List[String] = [
     "disjoint",
     "read_alias",
@@ -628,6 +657,7 @@ comptime NR_NAMES: List[String] = [
     "assoc",
     "unreachable",
     "vwhere",
+    "own2",
 ]
 comptime MARK_NEAR = "@@N@@"
 """In generated text, marks the line of the near miss."""
@@ -795,6 +825,20 @@ struct TraitDecl(Copyable):
 
 
 @fieldwise_init
+struct Prop(Copyable):
+    """A proposition about a value parameter n: `n + c >= k` (ge) or `n + c
+    <= k`. Mojo compares them symbolically, as this canonical form: `n >
+    k - 1` is `n >= k`, and `1 + n` is `n + 1`, but `n - 1 >= 0` isn't
+    `n >= 1`."""
+
+    var c: Int
+    var ge: Bool
+    var k: Int
+    var form: Int
+    """How it's written (prop_text)."""
+
+
+@fieldwise_init
 struct MethodDecl(Copyable):
     var name: String
     var trait_id: Int
@@ -817,7 +861,13 @@ struct MethodDecl(Copyable):
     (PARAM 1; its first parameter has type U), else -1."""
     var mvalue: Int
     """For a method with a value parameter `k` instead (PARAM 1, `[k:
-    Int]`; its first parameter has type `V[k]`), the struct V, else -1."""
+    Int]`; its first parameter has type `V[k]`), the struct V, else -1.
+    With both, the method has two parameters of its own, `[U: TrN, k:
+    Int]` (PARAM 1 and 2), and its first two parameters are U and
+    `V[k]`."""
+    var vwhere: List[Prop]
+    """For an own method of a struct with a value parameter, the
+    propositions about `Self.n` (PARAM 0) in its `where`."""
 
 
 @fieldwise_init
@@ -866,20 +916,6 @@ struct StructDecl(Copyable):
 
 
 @fieldwise_init
-struct Prop(Copyable):
-    """A proposition about a value parameter n: `n + c >= k` (ge) or `n + c
-    <= k`. Mojo compares them symbolically, as this canonical form: `n >
-    k - 1` is `n >= k`, and `1 + n` is `n + 1`, but `n - 1 >= 0` isn't
-    `n >= 1`."""
-
-    var c: Int
-    var ge: Bool
-    var k: Int
-    var form: Int
-    """How it's written (prop_text)."""
-
-
-@fieldwise_init
 struct FnDecl(Copyable):
     var name: String
     var bounds: List[Int]
@@ -902,6 +938,9 @@ struct FnDecl(Copyable):
     var asserts: List[Prop]
     """...and in `comptime assert`s at the start of its body (implied by
     them)."""
+    var wparam: Int
+    """Its type parameter that no parameter's type mentions (the last one,
+    which calls write), or -1."""
 
 
 @fieldwise_init
@@ -1267,7 +1306,11 @@ struct Program(Movable):
     """While a function's body is drawn, the propositions about its value
     parameter it knows (prop_key): its `where`'s..."""
     var vfacts_assert: List[Int]
-    """...and those only its `comptime assert`s give."""
+    """...and those only its `comptime assert`s (or the `comptime if`s it's
+    in) give."""
+    var cif_fn: Int
+    """While a function with a value parameter has its body drawn, the
+    function (for `comptime if`), else -1."""
     var bad_where: Int
     """For MU_WHERE_IMPL, the implementation (struct * 64 + index) gated
     by a stricter condition, or -1..."""
@@ -1320,6 +1363,7 @@ struct Program(Movable):
         self.facts = []
         self.vfacts = []
         self.vfacts_assert = []
+        self.cif_fn = -1
         self.alias_ty = -1
         self.alias_text = String()
         self.alias_struct = -1
@@ -1700,7 +1744,8 @@ struct Program(Movable):
             if bounds[i] < 0:
                 out.append("n")
             else:
-                out.append("T" if types == 0 else "U")
+                var tnames: List[String] = ["T", "U", "W"]
+                out.append(tnames[types])
                 types += 1
         return out^
 
@@ -1771,11 +1816,15 @@ struct Program(Movable):
         meets its `where`: a value must make it true; `n + d` (n a value
         parameter in scope) needs each proposition, with n + d for n, among
         the known ones (vfacts), as Mojo needs evidence for it."""
-        if len(self.fns[f].vwhere) == 0:
+        return self.props_hold(self.fns[f].vwhere, arg)
+
+    def props_hold(self, props: List[Prop], arg: Int) -> Bool:
+        """vw_holds for these propositions."""
+        if len(props) == 0:
             return True
         var kind = self.tkind[arg]
         if kind == VAL:
-            for pr in self.fns[f].vwhere:
+            for pr in props:
                 if not Self.prop_holds(self.tid[arg], pr):
                     return False
             return True
@@ -1786,7 +1835,7 @@ struct Program(Movable):
             d = self.tid[arg]
         if self.tkind[base] != PARAM:
             return False
-        for pr in self.fns[f].vwhere:
+        for pr in props:
             var key = Self.prop_key(self.tid[base], d + pr.c, pr.ge, pr.k)
             if not has(self.vfacts, key) and not has(self.vfacts_assert, key):
                 return False
@@ -1795,6 +1844,11 @@ struct Program(Movable):
     def vw_by_assert(self, f: Int, arg: Int) -> Bool:
         """Whether a call meeting f's `where` (vw_holds) with a symbolic
         arg needs evidence only a `comptime assert` gives."""
+        return self.props_by_assert(self.fns[f].vwhere, arg)
+
+    def props_by_assert(self, props: List[Prop], arg: Int) -> Bool:
+        if len(props) == 0 or arg < 0:
+            return False
         var kind = self.tkind[arg]
         if kind != PARAM and kind != OFF:
             return False
@@ -1802,11 +1856,18 @@ struct Program(Movable):
         var d = 0 if kind == PARAM else self.tid[arg]
         if self.tkind[base] != PARAM:
             return False
-        for pr in self.fns[f].vwhere:
+        for pr in props:
             var key = Self.prop_key(self.tid[base], d + pr.c, pr.ge, pr.k)
             if not has(self.vfacts, key) and has(self.vfacts_assert, key):
                 return True
         return False
+
+    def mw_holds(self, m: Int, recv: Int) -> Bool:
+        """Whether own method m's `where` holds for a receiver of type recv
+        (V[x]: for x)."""
+        if len(self.methods[m].vwhere) == 0:
+            return True
+        return self.props_hold(self.methods[m].vwhere, self.targ[recv])
 
     def reqs_on(self, s: Int, skip: Int) -> List[Prop]:
         """What a function with a value parameter of struct s (V[n]) would
@@ -1910,7 +1971,9 @@ struct Program(Movable):
         """Non-static methods callable on a value of type ty."""
         var out = List[Int]()
         if self.tkind[ty] == STRUCT:
-            out += self.structs[self.tid[ty]].own.copy()
+            for m in self.structs[self.tid[ty]].own:
+                if self.mw_holds(m, ty):
+                    out.append(m)
         for t in range(len(self.traits)):
             if self.conforms(ty, t, bounds):
                 for m in self.traits[t].methods:
@@ -1918,9 +1981,12 @@ struct Program(Movable):
                         out.append(m)
         return out^
 
-    def method_args(mut self, m: Int, recv: Int, u: Int = -1) -> List[Int]:
+    def method_args(
+        mut self, m: Int, recv: Int, us: List[Int] = []
+    ) -> List[Int]:
         """What to substitute into m's signature for receiver type recv;
-        for a generic method, with u for its `U` (-1: a HOLE)."""
+        for a generic method, with us for its own parameters (HOLE i for
+        each one missing)."""
         var out = List[Int]()
         if self.methods[m].trait_id >= 0:
             out.append(recv)
@@ -1931,11 +1997,15 @@ struct Program(Movable):
         if self.is_generic_method(m):
             if len(out) == 0:
                 out.append(self.int_ty)  # (PARAM 0 isn't used)
-            out.append(u if u >= 0 else self.intern(HOLE, 0, -1))
+            for i in range(self.n_own(m)):
+                out.append(
+                    us[i] if i < len(us)
+                    and us[i] >= 0 else self.intern(HOLE, i, -1)
+                )
         return out^
 
-    def method_ret(mut self, m: Int, recv: Int, u: Int = -1) -> Int:
-        var args = self.method_args(m, recv, u)
+    def method_ret(mut self, m: Int, recv: Int, us: List[Int] = []) -> Int:
+        var args = self.method_args(m, recv, us)
         if len(args) == 0:
             return self.methods[m].ret
         return self.subst(self.methods[m].ret, args)
@@ -1944,14 +2014,54 @@ struct Program(Movable):
         """Whether m has a parameter of its own: a type or a value."""
         return self.methods[m].mbound >= 0 or self.methods[m].mvalue >= 0
 
+    def is_both(self, m: Int) -> Bool:
+        """Whether m has two parameters of its own, `[U: TrN, k: Int]`."""
+        return self.methods[m].mbound >= 0 and self.methods[m].mvalue >= 0
+
+    def n_own(self, m: Int) -> Int:
+        if self.is_both(m):
+            return 2
+        return 1 if self.is_generic_method(m) else 0
+
+    def own_bounds(self, m: Int) -> List[Int]:
+        """The bounds of m's own parameters (-1 for a value)."""
+        if self.is_both(m):
+            return [self.methods[m].mbound, -1]
+        if self.methods[m].mbound >= 0:
+            return [self.methods[m].mbound]
+        return [-1] if self.methods[m].mvalue >= 0 else List[Int]()
+
+    def own_names(self, m: Int, u: String = "U") -> List[String]:
+        """The names of m's own parameters: U (or u) for a type, k for a
+        value."""
+        if self.is_both(m):
+            return [u, "k"]
+        if self.methods[m].mbound >= 0:
+            return [u]
+        return ["k"] if self.methods[m].mvalue >= 0 else List[String]()
+
+    def trait_names(self, m: Int) -> List[String]:
+        """The names in trait method m's signature: Self, then its own."""
+        var out: List[String] = ["Self"]
+        out += self.own_names(m)
+        return out^
+
+    def k_index(self, m: Int) -> Int:
+        """The PARAM index of m's own value parameter k, or -1."""
+        if self.methods[m].mvalue < 0:
+            return -1
+        return 2 if self.is_both(m) else 1
+
     def match_hole(mut self, pat: Int, ty: Int, mut assign: List[Int]) -> Bool:
-        """Whether pat, with HOLE for a generic method's `U` (or `k`), is ty
-        for some U (assign[0]); everything else in pat is fixed."""
+        """Whether pat, with HOLE i for a generic method's own parameter i
+        (`U` or `k`), is ty for some assignment (assign[i]); everything else
+        in pat is fixed."""
         if self.tkind[pat] == HOLE:
-            if assign[0] < 0:
-                assign[0] = ty
+            var i = self.tid[pat]
+            if assign[i] < 0:
+                assign[i] = ty
                 return True
-            return assign[0] == ty
+            return assign[i] == ty
         if self.tkind[pat] == OFF and self.tkind[self.targ[pat]] == HOLE:
             # k + c = ty: k = ty - c
             var tk = self.tkind[ty]
@@ -1972,31 +2082,43 @@ struct Program(Movable):
         return False
 
     def method_fit(mut self, m: Int, r: Int, ty: Int, ctx: Ctx) -> Int:
-        """Whether m on a receiver of type r can return ty: -2 if not; else
-        the `U` that makes it (-1 for any conforming one, or if m isn't
-        generic)."""
-        var ret = self.method_ret(m, r)
-        var b = self.methods[m].mbound
-        if not self.is_generic_method(m):
-            return -1 if ret == ty else -2
-        var assign: List[Int] = [-1]
-        if not self.match_hole(ret, ty, assign):
+        """Whether m on a receiver of type r can return ty: -2 if not."""
+        if len(self.method_assign(m, r, ty, ctx)) == 0:
             return -2
-        if assign[0] >= 0:
-            if b < 0:
-                return assign[0]  # (a value)
-            return assign[0] if self.conforms(assign[0], b, ctx.bounds) else -2
-        return -1 if len(self.u_choices(m, ctx)) > 0 else -2
+        return 0
 
-    def u_choices(self, m: Int, ctx: Ctx) -> List[Int]:
-        """What generic method m's own parameter can be where nothing
+    def method_assign(mut self, m: Int, r: Int, ty: Int, ctx: Ctx) -> List[Int]:
+        """What m's own parameters must be for m on a receiver of type r
+        to return ty (-1 where any allowed one does; [-1] if m isn't
+        generic), or [] if nothing makes it."""
+        var ret = self.method_ret(m, r)
+        if not self.is_generic_method(m):
+            return [-1] if ret == ty else List[Int]()
+        var bounds = self.own_bounds(m)
+        var assign = List[Int](length=len(bounds), fill=-1)
+        if not self.match_hole(ret, ty, assign):
+            return []
+        for i in range(len(bounds)):
+            if assign[i] >= 0:
+                if bounds[i] >= 0 and not self.conforms(
+                    assign[i], bounds[i], ctx.bounds
+                ):
+                    return []
+            elif len(self.own_choices(m, i, ctx)) == 0:
+                return []
+        return assign^
+
+    def own_choices(self, m: Int, i: Int, ctx: Ctx) -> List[Int]:
+        """What generic method m's own parameter i can be where nothing
         fixes it: a conforming type, or V's arguments in the pool."""
-        if self.methods[m].mvalue >= 0:
+        if self.own_bounds(m)[i] < 0:
             return self.value_args(ctx, self.methods[m].mvalue)
         return self.conforming(ctx, self.methods[m].mbound)
 
-    def method_params(mut self, m: Int, recv: Int, u: Int = -1) -> List[Int]:
-        var args = self.method_args(m, recv, u)
+    def method_params(
+        mut self, m: Int, recv: Int, us: List[Int] = []
+    ) -> List[Int]:
+        var args = self.method_args(m, recv, us)
         var params = self.methods[m].params.copy()
         if len(args) == 0:
             return params^
@@ -2293,41 +2415,62 @@ struct Program(Movable):
         whose types mention U aren't `mut`, which calls would need places
         of each U for. Another eighth (more for the value kinds) have a
         value parameter `[k: Int]` instead (into mvalue, the struct V of
-        their first parameter, `V[k]`), when some struct has one."""
+        their first parameter, `V[k]`), when some struct has one. A third
+        of the generic ones (2/3 for the own2 kinds) have both, `[U: TrN,
+        k: Int]` (PARAM 1 and 2; their first parameters are U and
+        `V[k]`)."""
         var valued = List[Int]()
         for st in range(len(self.structs)):
             if self.structs[st].valued:
                 valued.append(st)
+        var own2_kind = self.mutant == MU_OWN2 or self.near == NR_OWN2
         var choice = data.draw(integers(0, 7))
-        if choice < (4 if self.near == NR_RENAME else 2):
+        if choice < (4 if self.near == NR_RENAME or own2_kind else 2):
             mbound = pick(data, len(self.traits))
+            if len(valued) > 0 and data.draw(integers(0, 2)) < (
+                2 if own2_kind else 1
+            ):
+                mvalue = valued[pick(data, len(valued))]
         elif len(valued) > 0 and choice < (
             6 if self.mutant == MU_VALUE or self.near == NR_VALUE_EXPR else 3
         ):
             mvalue = valued[pick(data, len(valued))]
         var generic = mbound >= 0 or mvalue >= 0
+        var both = mbound >= 0 and mvalue >= 0
+        var kp = 2 if both else 1
         var bs = bounds.copy()
         var sig_own = own
         if generic:
             if len(bs) == 0:
                 bs.append(-1)  # (PARAM 0 is a value or unused)
             bs.append(mbound)  # (-1 for a value parameter)
+            if both:
+                bs.append(-1)
         var pool = self.type_pool(bs, len(self.structs))
         pool += extra.copy()
         if mvalue >= 0:
-            pool += self.value_family(mvalue, 1)
+            pool += self.value_family(mvalue, kp)
         if generic:
-            var u = self.intern(PARAM, 1, -1)
+            var firsts = List[Int]()
+            if mbound >= 0:
+                firsts.append(self.intern(PARAM, 1, -1))
             if mvalue >= 0:
-                u = self.intern(STRUCT, mvalue, u)
-            params.append(u)
-            convs.append(CONV_VAR if data.draw(booleans()) else CONV_READ)
+                firsts.append(
+                    self.intern(STRUCT, mvalue, self.intern(PARAM, kp, -1))
+                )
+            for u in firsts:
+                params.append(u)
+                convs.append(CONV_VAR if data.draw(booleans()) else CONV_READ)
             if data.draw(booleans()):
-                sig_own = u
+                sig_own = firsts[pick(data, len(firsts))]
         for _ in range(data.draw(integers(0, 1 if generic else 2))):
             var t = self.draw_sig_type(data, pool, sig_own)
             var c = draw_conv(data, mut_often)
-            if generic and c == CONV_MUT and self.mentions(t, 1):
+            if (
+                generic
+                and c == CONV_MUT
+                and (self.mentions(t, 1) or self.mentions(t, 2))
+            ):
                 c = CONV_READ
             params.append(t)
             convs.append(c)
@@ -2406,6 +2549,7 @@ struct Program(Movable):
                         -1,
                         -1,
                         -1,
+                        [],
                     )
                 )
             var methods = List[Int]()
@@ -2604,6 +2748,7 @@ struct Program(Movable):
                         -1,
                         mbound,
                         mvalue,
+                        [],
                     )
                 )
                 self.traits[t].methods.append(m)
@@ -2643,6 +2788,13 @@ struct Program(Movable):
                     mbound,
                     mvalue,
                 )
+                # a quarter of a valued struct's own methods (half for the
+                # vwhere kinds) need `where Self.n + c >= k` (or `<=`)
+                var mwhere = List[Prop]()
+                if self.structs[s].valued and data.draw(integers(0, 3)) < (
+                    2 if vwhere_kind else 1
+                ):
+                    mwhere.append(self.draw_prop(data, s, -1))
                 self.methods.append(
                     MethodDecl(
                         String("m", m),
@@ -2658,6 +2810,7 @@ struct Program(Movable):
                         -1,
                         mbound,
                         mvalue,
+                        mwhere^,
                     )
                 )
                 self.structs[s].own.append(m)
@@ -2718,6 +2871,31 @@ struct Program(Movable):
             for _ in range(data.draw(integers(0, 2))):
                 params.append(self.draw_sig_type(data, pool, own_ty))
                 convs.append(draw_conv(data, mut_often))
+            # (rising for the vwhere kinds: a function's `where` is drawn for
+            # calling the earlier ones)
+            var rank = min(f + 1, MAX_RANK) if vwhere_kind else data.draw(
+                integers(0, MAX_RANK)
+            )
+            # a sixth (half for the infer mutant) take one more type
+            # parameter, W, that no parameter mentions, so calls write it:
+            # its bound has a make the body can build W values with
+            var wparam = -1
+            if len(bounds) < 3 and data.draw(integers(0, 5)) < (
+                3 if self.mutant == MU_INFER else 1
+            ):
+                var ws = List[Int]()
+                for u in range(n_traits):
+                    for x in self.closure([u]):
+                        var mk = self.traits[x].make
+                        if mk >= 0 and self.methods[mk].rank < rank:
+                            ws.append(u)
+                            break
+                if len(ws) > 0:
+                    wparam = len(bounds)
+                    bounds.append(ws[pick(data, len(ws))])
+                    pool = self.type_pool(bounds, n_structs)
+                    if vi >= 0:
+                        pool += self.value_family(vs, vi)
             # half raise (3/4 for the exception kinds): `raises` (Error) or
             # `raises Xk`
             var raise_ty = -1
@@ -2776,16 +2954,13 @@ struct Program(Movable):
                     params^,
                     convs^,
                     self.draw_sig_type(data, pool, own_ty),
-                    # (rising for the vwhere kinds: a function's `where`
-                    # is drawn for calling the earlier ones)
-                    min(f + 1, MAX_RANK) if vwhere_kind else data.draw(
-                        integers(0, MAX_RANK)
-                    ),
+                    rank,
                     -1,
                     wheres^,
                     raise_ty,
                     vwhere^,
                     asserts^,
+                    wparam,
                 )
             )
 
@@ -3345,12 +3520,11 @@ struct Program(Movable):
         var rank = self.methods[m].rank
         var bounds: List[Int] = [t]
         var names: List[String] = ["Self"]
-        if self.is_generic_method(m):
-            bounds.append(self.methods[m].mbound)
-            names.append("k" if self.methods[m].mvalue >= 0 else "U")
+        bounds += self.own_bounds(m)
+        names += self.own_names(m)
         var pool = self.type_pool(bounds, len(self.structs))
         if self.methods[m].mvalue >= 0:
-            pool += self.value_family(self.methods[m].mvalue, 1)
+            pool += self.value_family(self.methods[m].mvalue, self.k_index(m))
         var ctx = Ctx(bounds^, names^, rank, -1, pool^)
         ctx.push("self", self.p0_ty, kind_of_conv(self.methods[m].self_conv))
         self.push_params(
@@ -3383,21 +3557,20 @@ struct Program(Movable):
                 bounds.append(-1)
                 if not valued:
                     names.append("_")
-            bounds.append(self.methods[m].mbound)
-            if self.methods[m].mvalue >= 0:
-                names.append("k")
-            else:
-                var rename = self.methods[m].trait_id >= 0 and self.near_chance(
-                    data, NR_RENAME
-                )
-                names.append("W" if rename else "U")
-                if rename:
-                    self.near_made = True
+            bounds += self.own_bounds(m)
+            var rename = (
+                self.methods[m].mbound >= 0
+                and self.methods[m].trait_id >= 0
+                and self.near_chance(data, NR_RENAME)
+            )
+            names += self.own_names(m, "W" if rename else "U")
+            if rename:
+                self.near_made = True
         var pool = self.type_pool(bounds, len(self.structs))
         if valued:
             pool += self.value_family(s, 0)
         if self.methods[m].mvalue >= 0:
-            pool += self.value_family(self.methods[m].mvalue, 1)
+            pool += self.value_family(self.methods[m].mvalue, self.k_index(m))
         var ctx = Ctx(
             bounds^,
             names^,
@@ -3432,8 +3605,8 @@ struct Program(Movable):
         """What to substitute into trait method m's signature in struct s's
         implementation: Self, and U (PARAM 1) for itself."""
         var out: List[Int] = [self.self_type(s)]
-        if self.is_generic_method(m):
-            out.append(self.intern(PARAM, 1, -1))
+        for i in range(self.n_own(m)):
+            out.append(self.intern(PARAM, i + 1, -1))
         return out^
 
     def gen_body(
@@ -3659,7 +3832,11 @@ struct Program(Movable):
                 var ctx = self.struct_ctx(data, s, m)
                 var ret = self.methods[m].ret
                 self.start_body(s, m)
+                # (its `where` is known in its body)
+                for pr in self.methods[m].vwhere:
+                    self.vfacts.append(Self.prop_key(0, pr.c, pr.ge, pr.k))
                 self.methods[m].body = self.gen_body(data, ctx^, ret)
+                self.vfacts = []
             self.alias_ty = -1
         self.deinit_body = False
         self.died = False
@@ -3677,6 +3854,8 @@ struct Program(Movable):
                 var key = Self.prop_key(vi, pr.c, pr.ge, pr.k)
                 if not has(self.vfacts, key):
                     self.vfacts_assert.append(key)
+            if vi >= 0:
+                self.cif_fn = f
             var pool = self.fn_pool(f)
             var ctx = Ctx(bounds^, self.fn_names(f), rank, -1, pool^)
             ctx.raise_ty = self.fns[f].raise_ty
@@ -3686,6 +3865,7 @@ struct Program(Movable):
             self.facts = []
             self.vfacts = []
             self.vfacts_assert = []
+            self.cif_fn = -1
         # entry points
         for _ in range(data.draw(integers(1, 4))):
             var pool = self.type_pool([], len(self.structs))
@@ -5055,6 +5235,10 @@ struct Program(Movable):
         var kinds: List[Int] = [S_VAR, S_EXPR]
         if self.can_try(ctx):
             kinds += [S_TRY, S_TRY]
+        if self.cif_fn >= 0 and ctx.depth < MAX_DEPTH:
+            kinds.append(S_CIF)
+            if self.mutant == MU_VWHERE or self.near == NR_VWHERE:
+                kinds += [S_CIF, S_CIF]
         if len(mut_types) > 0:
             kinds += [S_EXPR, S_EXPR]
         if len(t_var) > 0:
@@ -5091,6 +5275,8 @@ struct Program(Movable):
 
         if kind == S_TRY:
             return self.try_statement(data, ctx)
+        if kind == S_CIF:
+            return self.cif_statement(data, ctx)
 
         if kind == S_VAR:
             # half the time a type with `mut` methods, to call them on
@@ -5912,7 +6098,18 @@ struct Program(Movable):
                             field_idx.append(f)
                 if rk == RES:
                     continue
-                for m in self.methods_on(r, ctx.bounds):
+                var ms = self.methods_on(r, ctx.bounds)
+                if (
+                    self.wants(MU_VWHERE)
+                    and rk == STRUCT
+                    and not self.in_branch(ctx)
+                ):
+                    # (gated methods whose `where` fails for r: choosing
+                    # one is the vwhere mutant's chance)
+                    for m in self.structs[self.tid[r]].own:
+                        if not self.mw_holds(m, r):
+                            ms.append(m)
+                for m in ms:
                     if (
                         self.methods[m].rank < ctx.rank
                         and self.method_fit(m, r, ty, ctx) > -2
@@ -6154,6 +6351,60 @@ struct Program(Movable):
         ctx.depth -= 1
         var r = self.add_stmt(Stmt(S_RAISE, -1, e, -1, k, [], [], ""))
         return [self.add_stmt(Stmt(S_IF, -1, x, y, op, [r], [], String()))]
+
+    def cif_statement(
+        mut self, mut data: ConjectureData, mut ctx: Ctx
+    ) raises -> Int:
+        """`comptime if <prop>:` about the function's value parameter n,
+        with an `else` half the time: the body knows prop (Mojo's evidence
+        for a `where`), so it's mostly one another function on V needs with
+        n + d for n and isn't known yet; else one true of a value of V's.
+        Outer variables are read-only in both branches (Mojo checks moves
+        per instantiation, after dropping a branch), which are drawn as a
+        constant `if`'s."""
+        var f = self.cif_fn
+        var vi = self.vw_fn_index(f)
+        var vs = self.tid[self.fns[f].params[vi]]
+        var cands = List[Prop]()
+        for r in self.reqs_on(vs, f):
+            var key = Self.prop_key(vi, r.c, r.ge, r.k)
+            if not has(self.vfacts, key) and not has(self.vfacts_assert, key):
+                cands.append(r.copy())
+        var pr: Prop
+        if len(cands) > 0 and data.draw(integers(0, 3)) > 0:
+            pr = cands[pick(data, len(cands))].copy()
+            pr.form = data.draw(integers(0, 3))
+        else:
+            pr = self.draw_prop(data, vs, f)
+        var key = Self.prop_key(vi, pr.c, pr.ge, pr.k)
+        var added = not has(self.vfacts, key) and not has(
+            self.vfacts_assert, key
+        )
+        var n = len(ctx.names)
+        var kinds = ctx.kinds.copy()
+        var freeze = ctx.freeze_base
+        for v in range(n):
+            ctx.kinds[v] = V_READ
+        ctx.freeze_base = n
+        ctx.const_if += 1
+        ctx.depth += 1
+        if added:
+            self.vfacts_assert.append(key)
+        var body = self.gen_block(data, ctx, 3, False)
+        if added:
+            _ = self.vfacts_assert.pop()
+        ctx.truncate(n)
+        var orelse = List[Int]()
+        if data.draw(booleans()):
+            orelse = self.gen_block(data, ctx, 3, False)
+            ctx.truncate(n)
+        ctx.depth -= 1
+        ctx.const_if -= 1
+        for v in range(n):
+            ctx.kinds[v] = kinds[v]
+        ctx.freeze_base = freeze
+        var text = self.prop_text(pr, vi, ctx.param_names)
+        return self.add_stmt(Stmt(S_CIF, -1, -1, -1, key, body^, orelse^, text))
 
     def can_try(self, ctx: Ctx) -> Bool:
         """Whether a `try` here could call a raising function."""
@@ -6535,6 +6786,18 @@ struct Program(Movable):
             var m = c.meth_id[i]
             var name = self.methods[m].name
             var wrong = False
+            if not self.mw_holds(m, r):
+                # (the vwhere mutant's candidate: a gated method whose
+                # `where` fails for r)
+                if not self.chance(data, MU_VWHERE):
+                    raise Error("STUCK")
+                self.mutated = True
+                wrong = True
+            elif self.props_by_assert(
+                self.methods[m].vwhere, self.targ[r]
+            ) and self.near_chance(data, NR_VWHERE):
+                name = String(MARK_NEAR, name)
+                self.near_made = True
             if self.wants(MU_NO_METHOD):
                 # the name of a method r doesn't have
                 var avail = self.methods_on(r, ctx.bounds)
@@ -6546,21 +6809,25 @@ struct Program(Movable):
                     name = self.methods[others[pick(data, len(others))]].name
                     self.mutated = True
                     wrong = True
-            # a generic method's `U`: what the result type fixes, or any
-            # conforming type; MU_BOUND: one that doesn't conform
-            var u = -1
-            var bad_u = -1
+            # a generic method's own parameters (`U`, `k`): what the result
+            # type fixes, or any allowed one; MU_BOUND: a U that doesn't
+            # conform (bad_us holds what's written, if it isn't us)
+            var us = List[Int]()
+            var bad_us = List[Int]()
             var b = self.methods[m].mbound
             var gm = self.is_generic_method(m)
+            var ki = self.k_index(m) - 1  # (k's index in us)
             if gm:
-                u = self.method_fit(m, r, ty, ctx)
-                if u < 0:
-                    var ok = self.u_choices(m, ctx)
-                    u = ok[pick(data, len(ok))]
-            if self.methods[m].mvalue >= 0 and self.wants(MU_VALUE):
+                us = self.method_assign(m, r, ty, ctx)
+                for i in range(len(us)):
+                    if us[i] < 0:
+                        var ok = self.own_choices(m, i, ctx)
+                        us[i] = ok[pick(data, len(ok))]
+            if ki >= 0 and self.wants(MU_VALUE):
                 # another value explicitly: `x.m[k + d](...)`
                 if self.chance(data, MU_VALUE):
-                    bad_u = self.offset(u, data.draw(integers(1, 3)))
+                    bad_us = us.copy()
+                    bad_us[ki] = self.offset(us[ki], data.draw(integers(1, 3)))
                     self.mutated = True
                     wrong = True
             if b >= 0:
@@ -6577,7 +6844,8 @@ struct Program(Movable):
                         ) or self.cond_only(t, b, ctx.bounds):
                             bad.append(t)
                     if len(bad) > 0 and self.chance(data, self.mutant):
-                        bad_u = bad[pick(data, len(bad))]
+                        bad_us = us.copy()
+                        bad_us[0] = bad[pick(data, len(bad))]
                         self.mutated = True
                         wrong = True
             var mutated_before = self.mutated
@@ -6589,24 +6857,69 @@ struct Program(Movable):
                 kids.append(self.gen(data, ctx, r, sub, P_OWNED))
             else:
                 kids.append(self.gen(data, ctx, r, sub, P_READ))
-            var params = self.method_params(m, r, u)
+            var params = self.method_params(m, r, us)
             var convs = self.methods[m].convs.copy()
             var mut_call = self.has_mut(m)
             kids += self.gen_args(data, ctx, params, convs, half, mut_call)
             var text = String(self.exprs[kids[0]].text, ".", name)
             if gm:
                 # explicit half the time, and always when an argument of
-                # another type might change what U is inferred to be
-                var forced = bad_u >= 0 or (self.mutated and not mutated_before)
-                if forced or data.draw(booleans()):
-                    var x = bad_u if bad_u >= 0 else u
-                    var xs = self.cty(x, ctx) if b >= 0 else self.val_str(
-                        x, ctx.param_names
-                    )
-                    text += String("[", xs, "]")
+                # another type might change what U is inferred to be; for
+                # two, perhaps only U (k is inferred), or k by keyword
+                var forced = len(bad_us) > 0 or (
+                    self.mutated and not mutated_before
+                )
+                # MU_OWN2: both, positionally, in the wrong order;
+                # NR_OWN2: both by keyword, k first
+                var swapped = (
+                    len(us) == 2 and not forced and self.chance(data, MU_OWN2)
+                )
+                var reversed = (
+                    len(us) == 2
+                    and not forced
+                    and not swapped
+                    and self.near_chance(data, NR_OWN2)
+                )
+                if swapped:
+                    self.mutated = True
+                    wrong = True
+                if forced or swapped or reversed or data.draw(booleans()):
+                    var xs = bad_us.copy() if len(bad_us) > 0 else us.copy()
+                    var written = List[String]()
+                    for i in range(len(xs)):
+                        if i == ki:
+                            written.append(self.val_str(xs[i], ctx.param_names))
+                        else:
+                            written.append(self.cty(xs[i], ctx))
+                    # (with two: both, U alone (k is inferred), `k=` alone,
+                    # or both by keyword)
+                    var form = 0
+                    if len(xs) == 2 and not forced:
+                        form = data.draw(integers(0, 3))
+                    if swapped:
+                        text += String("[", written[1], ", ", written[0], "]")
+                    elif reversed:
+                        text += String(
+                            MARK_NEAR,
+                            "[k=",
+                            written[1],
+                            ", U=",
+                            written[0],
+                            "]",
+                        )
+                        self.near_made = True
+                    elif form == 1:
+                        text += String("[", written[0], "]")
+                    elif form == 2:
+                        text += String("[k=", written[1], "]")
+                    elif form == 3:
+                        text += String(
+                            "[U=", written[0], ", k=", written[1], "]"
+                        )
+                    else:
+                        text += String("[", ", ".join(written), "]")
             text += String("(", self.args_text(kids, 1), ")")
-            var tys = [u] if gm else List[Int]()
-            var e = self.add(E_METHOD, m, ty, kids^, tys^, text^)
+            var e = self.add(E_METHOD, m, ty, kids^, us^, text^)
             return self.mark(e) if wrong else e
 
         if rule == R_VALN:  # a value parameter
@@ -6709,7 +7022,14 @@ struct Program(Movable):
         var vnear = False
         var vi = self.vw_fn_index(f)
         if vi >= 0 and len(self.fns[f].vwhere) > 0:
-            if self.wants(MU_VWHERE) and not self.mentions(self.fns[f].ret, vi):
+            # (not in a ternary's branch: Mojo doesn't check a `where` in
+            # the dead branch of one with a constant condition, like the
+            # implicit copies of modular/modular#7770)
+            if (
+                self.wants(MU_VWHERE)
+                and not self.in_branch(ctx)
+                and not self.mentions(self.fns[f].ret, vi)
+            ):
                 var cands = List[Int]()
                 var vs = self.tid[self.fns[f].params[vi]]
                 for v in self.value_args(ctx, vs):
@@ -6735,32 +7055,48 @@ struct Program(Movable):
         # an argument of another type might change what the type
         # arguments are inferred to be, so they're explicit then
         var forced = bad_i >= 0 or (self.mutated and not mutated_before)
-        # MU_INFER: a value that can't be inferred left out
+        # MU_INFER: a value or type that can't be inferred left out
         var no_infer = False
+        var wp = self.fns[f].wparam
         # (only for a value: Mojo matches `V[k + 1]` with `V[n + 1]`, n =
         # k, though not `V[1 + k]`, modular/modular#7816)
         if (
-            self.noninfer(f)
+            ((self.noninfer(f) and self.tkind[targs[vi]] == VAL) or wp >= 0)
             and not forced
-            and self.tkind[targs[vi]] == VAL
             and self.chance(data, MU_INFER)
         ):
             no_infer = True
             self.mutated = True
         var text = self.fns[f].name
+        var explicit = self.noninfer(f) or wp >= 0
         if (
             n_tp > 0
-            and (data.draw(booleans()) or forced or self.noninfer(f))
+            and (data.draw(booleans()) or forced or explicit)
             and not no_infer
         ):
-            text += "["
-            for i in range(n_tp):
-                if i > 0:
-                    text += ", "
-                text += self.targ_str(
-                    f, i, bad_t if i == bad_i else targs[i], ctx
+            if (
+                wp >= 0
+                and not forced
+                and not self.noninfer(f)
+                and data.draw(booleans())
+            ):
+                # only W, by keyword (the others are inferred)
+                text += String(
+                    "[",
+                    self.fn_names(f)[wp],
+                    "=",
+                    self.cty(targs[wp], ctx),
+                    "]",
                 )
-            text += "]"
+            else:
+                text += "["
+                for i in range(n_tp):
+                    if i > 0:
+                        text += ", "
+                    text += self.targ_str(
+                        f, i, bad_t if i == bad_i else targs[i], ctx
+                    )
+                text += "]"
         text += String("(", self.args_text(kids, 0), ")")
         var e = self.add(E_CALL, f, ty, kids^, targs^, text^)
         if vnear:
@@ -6959,6 +7295,8 @@ struct Program(Movable):
                 self.stats[STAT_GENERIC_METHOD] += 1
                 if self.methods[a].mvalue >= 0:
                     self.stats[STAT_VALUE_CALL] += 1
+                if self.is_both(a):
+                    self.stats[STAT_OWN2] += 1
             return self.call(a, -1, recv_ty, kids, convs, frame, targs, m_targs)
         if kind == E_STATIC:
             if self.tkind[self.exprs[e].tys[0]] == ASSOC:
@@ -7247,6 +7585,18 @@ struct Program(Movable):
         elif kind == S_CONTINUE:
             self.stats[STAT_BREAK] += 1
             return SIG_CONTINUE
+        elif kind == S_CIF:
+            self.stats[STAT_CIF] += 1
+            var key = self.stmts[s].a
+            var k = key % 4096 - 2048
+            var rest = key // 4096
+            var c = rest % 4096 - 2048
+            var p = rest // 4096 // 2
+            var ge = (rest // 4096) % 2 == 1
+            var n = self.tid[targs[p]]
+            if Self.prop_holds(n, Prop(c, ge, k, 0)):
+                return self.exec_block(self.stmts[s].body.copy(), frame, targs)
+            return self.exec_block(self.stmts[s].orelse.copy(), frame, targs)
         elif kind == S_IF:
             if self.condition(
                 self.stmts[s].a, e, self.stmts[s].e2, frame, targs
@@ -7403,6 +7753,13 @@ struct Program(Movable):
                     text += String(indent, "except:", mark, "\n")
                 text += self.block_text(hs.body, inner)
             return text^
+        if s.kind == S_CIF:
+            var text = String(indent, "comptime if ", s.name, ":\n")
+            text += self.block_text(s.body, inner)
+            if len(s.orelse) > 0:
+                text += String(indent, "else:\n")
+                text += self.block_text(s.orelse, inner)
+            return text^
         if s.kind == S_IF:
             var ops = materialize[CMP_OPS]()
             var text = String(
@@ -7463,8 +7820,18 @@ struct Program(Movable):
         var renamed = False
         if self.is_generic_method(m):
             var u = names[1] if len(names) > 1 else String("U")
-            renamed = u != "U" and self.methods[m].mvalue < 0
-            if self.methods[m].mvalue >= 0:
+            renamed = u != "U" and self.methods[m].mbound >= 0
+            if self.is_both(m):
+                s += String(
+                    "[",
+                    u,
+                    ": Tr",
+                    self.methods[m].mbound,
+                    ", ",
+                    names[2],
+                    ": Int]",
+                )
+            elif self.methods[m].mvalue >= 0:
                 s += String("[", u, ": Int]")
             else:
                 s += String("[", u, ": Tr", self.methods[m].mbound, "]")
@@ -7519,8 +7886,6 @@ struct Program(Movable):
                     "        self.code = copy.code\n        _born()\n\n",
                     "    def __deinit__(deinit self):\n        _died()\n\n\n",
                 )
-        var self_names: List[String] = ["Self", "U"]
-        var value_names: List[String] = ["Self", "k"]
         var cap_names = materialize[CAP_NAMES]()
         for t in range(len(self.traits)):
             s += String("trait Tr", t, "(")
@@ -7546,7 +7911,7 @@ struct Program(Movable):
                     m,
                     self.methods[m].params,
                     self.methods[m].ret,
-                    self_names if self.methods[m].mvalue < 0 else value_names,
+                    self.trait_names(m),
                     -1,
                 )
                 if self.methods[m].body >= 0:
@@ -7663,15 +8028,23 @@ struct Program(Movable):
                     sig = sig.replace("\n", String(MARK, "\n"))
                 s += sig
                 s += self.body_text(b, "        ")
-            for m in self.structs[st].own:
+            for m in self.structs[st].own.copy():
                 var b = self.methods[m].body
                 s += "\n"
+                var conds = List[String]()
+                var names = self.bodies[b].names.copy()
+                for pr in self.methods[m].vwhere.copy():
+                    conds.append(self.prop_text(pr, 0, names))
+                var where_clause = String()
+                if len(conds) > 0:
+                    where_clause = " where " + " and ".join(conds)
                 s += self.sig_text(
                     m,
                     self.methods[m].params,
                     self.methods[m].ret,
                     self.bodies[b].names,
                     self.bodies[b].self_print,
+                    where_clause,
                 )
                 s += self.body_text(b, "        ")
             s += "\n\n"

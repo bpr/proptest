@@ -2028,8 +2028,9 @@ known propositions count as evidence:
   1`; `n == 3` doesn't give `n > 0`), and negation isn't normalized
   (`-n < 0`, `not (n <= 0)`). The error is "lacking evidence to prove
   correctness", noting the proposition needed (`((n - Int(1)) > Int(0))`).
-- Constraints are checked in dead code too (`if False:`, a ternary's
-  branch).
+- Constraints are checked in dead code too (`if False:`, a branch of a
+  ternary), except in the dead branch of a ternary with a constant
+  condition (found later, below).
 
 So in FM a proposition about a value parameter n is `n + c >= k` or `n
 + c <= k` (`Prop`), which is its canonical form: `c` stays on the left.
@@ -2142,6 +2143,85 @@ Generator bugs found on the way:
   the overruns of their bigger programs no longer fail the
   `data_too_large` health check.
 
+## Two own parameters, `comptime if`, gated methods, and W
+
+**Two parameters of their own.** A third of the generic methods (two
+thirds for the own2 kinds) have both a type and a value parameter, `def
+m[U: TrN, k: Int](self, p0: U, p1: V[k], ...)`, in traits and structs:
+U is PARAM 1 and k PARAM 2, and HOLE i stands for own parameter i, so
+`match_hole` solves both from the result type (`method_assign`). Probes
+on the nightly: a call can write both (`x.m[S1, 3]`), U alone (k is
+inferred), `k=` alone, or both by keyword in either order, on concrete
+and generic receivers; both swapped, `x.m[3, S1]`, is "parameter 'U' has
+'Tr0' type, but value has type 'IntLiteral[3]'". Calls draw one of the
+forms; the own2 mutant writes them swapped, the own2 near miss by
+keyword with k first (`x.m[k=3, U=S1]`).
+
+**`comptime if` as evidence.** In a function over n, a statement
+`comptime if <prop>:` (an `else` half the time) gives its first branch
+the proposition, so calls there can need it. It's mostly what another
+function on V needs with n + d for n and isn't known yet, and goes into
+`vfacts_assert`, so the vwhere near miss covers it too. Mojo
+instantiates one branch per n and checks moves per instantiation, so
+the outer variables are read-only in both branches (as in a `try`),
+which are drawn as a constant `if`'s (no use_moved, loop_move or where
+mutants there, no raises in a `try`). The evaluator tests the
+proposition with n's value.
+
+**Gated methods.** Trait methods can't have a `where` ("'where' clauses
+on trait methods are not supported"), but a struct's own methods can,
+on the struct's value: a quarter of a valued struct's own methods (half
+for the vwhere kinds) get `where Self.n + c >= k` (or `<=`). The model
+is the functions': PARAM 0 is `Self.n` in the method's body, which knows
+its `where`; `methods_on` leaves out a method whose `where` fails for the
+receiver (`V[3]`, or `V[n + 1]` without evidence), so no call, near-miss
+callee or `mut` call sees it. For the vwhere mutant, failing (receiver,
+method) pairs are candidates too, and choosing one is a chance (if it
+isn't taken, the rule is stuck and another one is tried).
+
+**Non-inferable type parameters.** A sixth of the functions (half for
+the infer mutant) get one more type parameter, W, that no parameter's
+type mentions (`def g0[T: Tr0, W: Tr1](p0: T) -> W`), with a bound whose
+closure has a make of lower rank than the function, so that its body can
+build W values (`W.make1(...)`) and its result can be W. Calls write
+all the type arguments, or just `g0[W=S1](x)` by keyword; the infer
+mutant leaves them out ("failed to infer parameter 'W'"). Functions'
+third type parameter is named W (`fn_names`).
+
+In 1,000 stage 2 programs (seed 7911), 119 declare a method with two
+own parameters, 66 have a `comptime if`, 62 a gated method, and 106 a
+non-inferable type parameter; while running, 31 call a two-parameter
+method (277 calls), 17 run a `comptime if` (1,739 times), and 11 call a
+function with a value `where` (752 calls; gated methods' calls
+aren't counted).
+
+**Validation.** On nightly 1.3.0.dev2026112605, everything was OK but
+2 accepted vwhere mutants (the same program twice): 500 stage 2
+programs, 296 infer, 298 vwhere, 200 own2 and 200 no_method-bound-where
+mutants, 78 vwhere and 200 own2 near misses, and 400 near misses and 400
+mutants of all kinds (seeds 81-89); before that, the two-parameter
+methods alone: 400 stage 2 programs, 300 own2 mutants and near misses,
+300 bound-sig-value mutants and 200 rename-value_expr near misses (seeds
+41-45). After the fix below, 500 vwhere mutants, 300 stage 2 programs and
+65 vwhere near misses were OK (seeds 91-93).
+
+**Found: constraints aren't checked in a constant ternary's dead
+branch.** The accepted mutant called a gated method without evidence in
+`(... if V1[3].n < V1[(2 * 1)].n else ...)`, a ternary whose condition
+is constant (false). Probes: in the dead branch of `x if 3 < 2 else y`,
+neither a call lacking evidence (`g0(p0)` for `where n > 0`) nor one
+violating the constraint (`g0(V[0](1))`, `V[0](1).m()`) is rejected,
+for functions and gated methods alike, while ordinary type errors there
+are (a wrong type, an unexpected argument, a missing attribute), and the
+same calls in an `if 3 < 2:` statement or in the live branch are
+rejected. It's the same mechanism as
+[#7770](https://github.com/modular/modular/issues/7770) (implicit copies
+in that branch), where the maintainers explain that the dead branch is
+checked under the assumption `not True`, which proves every constraint.
+We added it there as a
+[comment](https://github.com/modular/modular/issues/7770#issuecomment-7209558100). The generator makes no vwhere mutants in ternary
+branches (`in_branch`), as for the other dead-branch kinds.
+
 ## Beyond the paths
 
 Mojo features FM leaves out for now:
@@ -2153,9 +2233,7 @@ Mojo features FM leaves out for now:
   to unambiguous overload sets.
 - **More of the type system:** retroactive conformance with
   `__extension` (e.g. `Int` to a trait), constraints on associated types
-  (`where T.E0 == A`), `where` on methods, value methods and structs
+  (`where T.E0 == A`), `where` on value methods' `k` and on structs
   (`struct V[n: Int] where n > 0`, which every `V[n - 1]` would need
-  evidence for), `comptime if` as evidence, methods with two parameters
-  of their own, non-inferable type parameters, and keyword and default
-  arguments.
+  evidence for, in signatures too), and keyword and default arguments.
 - **`Variant` and `isa`:** the counterpart of FJ's downcasts.
