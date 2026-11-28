@@ -2520,16 +2520,18 @@ or mutants (`dead_else`). Constant subjects and comparisons (`match
 with one isn't drawn (a false one would leave the rest of its block
 dead).
 
-**Not reduced yet: a `guard` that always matches, at the end of a `try`
-body, can hide a use after a move in the `try`'s `else`.** A try_move
-mutant (`else: var v = p0^`, then `p0` used in the `finally`, or after
-the `try`) was accepted; replacing the `guard` (`guard case (var b13,
-var b14, var b15) = (..., x.m2(...), ...) else: return ...`, with raising
-calls in its subject) by `_ = 0` gives the expected "use of
-uninitialized value 'p0'". Reduced to a 40-line generated program (a
-trait's default method with nested `try`s), but my small versions are
-rejected as they should be. The workaround: no such `guard` in a `try`
-body (DECL_FUZZ_NO_GUARD_TRY_WORKAROUND=1 allows it).
+**A generator bug that looked like an accepted invalid program.** A
+try_move mutant (`else: var v = p0^`, then `p0` used after the `try`)
+was accepted when the `try` body ended in a `guard case (...) = (...);
+7 < (-3) else: return ...`. The constant clause is false, so the
+`guard` always returns, the `try`'s `else` never runs, and the program
+is valid: Mojo folds the constant, as it does `if` (`guard 7 < (-3)
+else:` alone gives the same result, `guard a < 9 else:` the expected
+"use of uninitialized value 'p0'"). Constant clauses (`const_clauses`,
+above) now keep such a `guard` out. A stopgap that kept every `guard`
+with a dead `else` out of `try` bodies is gone: 600 try_move mutants,
+400 mutants of all kinds and 300 stage 2 programs were OK without it
+(seeds 2901-2903).
 
 **Found: #7818 in a `comptime if`** ([comment](https://github.com/modular/modular/issues/7818#issuecomment-7229730998)): a reference in a
 branch of a `comptime if` in a `finally` is "use of uninitialized
@@ -2573,17 +2575,8 @@ binding) uses, which Mojo reports there first (WRONG_LINE, 1 in 40 assoc
 mutants on some seeds, on 2026112605 too); it now rebinds only unused
 ones.
 
-Probed, not generated yet:
-- **Conditional types** `A if c else B` (in parameters, results, fields
-  and `comptime` aliases) refine to the arm inside `comptime if c:`, its
-  `else`, and after `comptime assert c`, and convert from the selected
-  arm; an unrefined value works where both arms conform to the bound.
-  Mojo recognizes `2 < k`, `k >= 3`, `(k + 0) > 2` and `not not (k > 2)`
-  as `k > 2`, but not `k + 1 > 3`, `k - 2 > 0`, or `k <= 2` as `not (k >
-  2)`.
-- **Mixed packs:** `f(A(1), *args, B(2))` and `f(*args, *args)` work, also
-  with an empty pack and `mut` packs; `bump(*args, *args)` on a `mut`
-  pack is "aliasing values passed mutably".
+Conditional types and mixed packs, probed here too, are generated in
+the next section.
 
 In 1,000 stage 2 programs (seed 7911), 485 execute a pattern statement
 (11,538 times), 466 have a pattern match (10,438 times), and 273 run a
@@ -2607,6 +2600,146 @@ in none of the 40 after, even under CPU load: not reduced or filed. A baseline o
 the generator before this step was all OK on 2026112705.
 
 
+## Conditional types and variadic packs
+
+The 2026112705 nightly refines a conditional type `A if c else B` to
+the selected arm inside `comptime if c:`, in its `else`, and after
+`comptime assert c`, and converts a value of the selected arm to it. A
+call to a function over a pack (`*args: *Ts`) can mix arguments and
+unpacked packs (`show("[", *args, "]")`, `show(*args, *args)`).
+
+Probes on 2026112705, with `p1: V[m] if m > 2 else W`:
+- **Calls** with a value pick the arm (`g(V[3](1), V[3](5))`, `g(V[1](1),
+  W(2))`); the other arm is "cannot be converted from 'W' to 'V[3]'".
+  A function over m passes its own `p1` on to one over n, also shifted:
+  `p1: V[m + 1] if m + 1 > 2 else W` to `g(V[m + 1](...), p1)`. The
+  conditions are compared in the canonical form of `where`'s
+  propositions: `m >= 3`, `2 < m` and `(m + 2) + (-2) > (1 + 1)` are `m >
+  2`, but `m >= 2` isn't `m + 1 > 2` ("cannot be converted from 'V[(m +
+  Int(1))] if (m >= Int(2)) else W' to 'V[(m + Int(1))] if ((m + Int(1))
+  > Int(2)) else W'").
+- **Refinement:** in `comptime if m > 2:` (or `2 < m`, `m >= 3`, a
+  conjunct `m > 2 and m < 9`, a nested `comptime if`), with `where m >
+  2` or after `comptime assert m > 2`, `p1` is a `V[m]`: `p1.x`, `var t:
+  V[m] = p1`, `g(p0, p0)` for the conditional parameter; in the `else`,
+  a W. Elsewhere it's neither: `p1.x` is "'V[m] if (m > Int(2)) else W'
+  value has no attribute 'x'", `q = p1` with q a `V[m]` "cannot
+  implicitly convert", `g(p0, p0)` "cannot be converted from 'V[m]'".
+  Code after `comptime if m > 2: return ...` isn't refined to W.
+- **Values** of a conditional type copy (`.copy()`, implicitly when both
+  arms are ImplicitlyCopyable), move (`p1^`), go `mut` (assigned an arm
+  in a refined branch), take Int as an arm, and are written in
+  parentheses. Unrefined, they work through a trait both arms conform
+  to (`id(p1).get()`, `p1.get()`).
+- **Packs:** `total(A(1), *args, B(2))`, `total(*args, *args)` and
+  `count(*args, A(0), *args)` work, with an empty pack too, and so do
+  `mut` packs, except one unpacked twice into a `mut` pack argument
+  ("aliasing values passed mutably", as documented).
+
+In FM:
+- **A conditional type** is a type kind COND, `(A if n + c >= k else
+  B)` (or `<=`), with its parts in `Program.conds`: the proposition is a
+  Prop (as for `where`), A is `V[n + d]` (d in -1 to 1) and B a concrete
+  type. Substituting a value for n gives the arm it selects;
+  substituting `m + d` shifts the proposition. A third of the functions
+  with a value parameter (2/3 for the cond kinds) take one more
+  parameter of a conditional type, its proposition drawn as for a
+  `where` (half the time one another function on V needs). It
+  conforms to no trait, has no fields or methods, and is as capable as
+  its weaker arm.
+- **Refinement** (`refine`): a body knows propositions (`vfacts`, its
+  `where`, asserts and the `comptime if`s it's in) and their negations
+  (`vnot`, the `else`s); a conditional type whose proposition (or
+  negation) it knows is that arm. A wanted type is refined, and so are
+  the variables of the context, at the start of a body and of each
+  `comptime if` branch (`refine_ctx`, undone after). Two thirds of a
+  function's `comptime if`s (when it has a conditional-type variable)
+  are on that type's proposition, written in any of the four forms.
+  Elsewhere, only a variable of the same conditional type (or a
+  ternary of them) makes one, so a call that needs one may get stuck
+  and another rule is drawn.
+- **Packs:** 3/4 of the programs have one or two pack functions
+  (`PackDecl`), `def pk0[*Ts: TrN](*args: *Ts) -> Int`: one combines
+  `t = t * 7 + args[i].mK(...)` over the pack in a `comptime for` (mK
+  a method of TrN or a parent called on a read receiver, returning Int,
+  raising nothing, with arguments of concrete types drawn once; when
+  there's none, `t * 7 + 1`), another forwards its pack to an earlier
+  one, `return pk0(S1(...), *args, *args)`, with a bound refining that
+  one's. Calls (rule R_PACK, for Int positions) pass zero to three
+  values of types in the pool that conform to the bound, type
+  parameters too; the evaluator folds the method over the values
+  (`pack_eval`).
+
+| Kind | What | Mojo's error |
+|---|---|---|
+| cond_arm | a call's argument for a conditional-type parameter of the arm the value (or what the caller knows) doesn't pick | cannot be converted |
+| cond_use | a variable of an undecided conditional type passed for a parameter (not of a type parameter's type, which Mojo would infer as the conditional type), or returned, where an arm's type is expected | cannot be converted, cannot implicitly convert |
+| near cond_refine | a refined variable used as its arm under a `comptime if` written in another form than the type's condition, or with a `where` or assert equal to it | refined |
+| pack_bound | a pack call with an argument whose type doesn't conform to the pack's bound | does not conform to trait |
+
+cond_use first went into any position wanting an arm's type, and was
+accepted at `_ = p2`, in a tuple subject `case (var b1, var b2) = (...,
+p1.copy())` and reported late at `var v2 = p3` (WRONG_LINE): there the
+type is inferred, not checked.
+
+**Found: in a constant ternary's dead branch, a conditional type is
+refined to its first arm** (commented on
+[#7770](https://github.com/modular/modular/issues/7770)). With `p: V[n]
+if n > 2 else W`, `var q = p if 3 > 2 else p` is "value of type 'V[n] if
+(n > Int(2)) else W' is not compatible with value of type 'V[n]'": the
+dead branch is checked assuming `not True`, which proves `n > 2`, so
+there `p` is a `V[n]`, while the live one is unrefined. In that branch
+`p.x` compiles and `p.y` is "'V[n]' value has no attribute 'y'", and the
+`else` of `comptime if 3 > 2:` rejects `var q: W = p`. It overrides a refinement too: in the `else` of `comptime if n > 2:`, where `p` is a W, `1 if 3 > 2 else p.y` is "'V[n]' value has no attribute 'y'". A runtime
+condition (`p if c else p`) compiles. On 2026112605 too. The workaround
+(`assume_dead`): no values or positions of a conditional type in a
+constant ternary's branches (`Ctx.const_tern`;
+DECL_FUZZ_NO_COND_DEAD_WORKAROUND=1 lifts it), and no `comptime if`
+branch the body knows to be dead (on a proposition it knows true, or in
+the `else` of one on it), where both arms would be provable.
+
+**Found: an owned value of a conditional type that a body reads as its
+arm is never destroyed**
+([#7830](https://github.com/modular/modular/issues/7830)). In 4 of 300
+cond_refine near misses the runtime check reported two `Res` values
+live after a call (UNBALANCED). Reduced (by statements, then by hand):
+with `def g[n: Int](var p: V[n] if n > 0 else R) -> Int`, a body that
+reads `p.x` under `comptime if n > 0:` (or after `comptime assert n >
+0`) never destroys `p` in that instantiation; one that doesn't read it,
+or reads it in the other branch only, does, as does one that moves it
+out there (`var t = p^`). A local of the type (`var q = p^`) leaks the
+same way; a read parameter doesn't (its caller destroys the value).
+`-O0` and `-O3` alike, 2026112605 too. The workaround: parameters of a
+conditional type are never `var` (DECL_FUZZ_NO_COND_VAR_WORKAROUND=1
+lets them be), and no local has one (locals' types come from the pool).
+The first reduction, with a predicate that only looked for
+"UNBALANCED", deleted the check's condition; the second kept the prelude
+and the count of `_born()`/`_died()` calls fixed.
+
+A generator bug from before: a type mutant inside a `match`'s Int
+subject (a ternary branch made a Res) is reported at a `case` (Mojo
+infers the subject's type), WRONG_LINE in 6 of 600 mutants; subjects now
+have no type mutants.
+
+In 1,000 stage 2 programs (seed 7911), 81 declare a function with a
+conditional-type parameter, and 10 call one while running (212 calls;
+calls of functions over a value are rare at run time, 95 programs);
+713 declare a pack function, 260 a forwarding one, and 694 call one
+(10,427 calls).
+
+**Validation**, on nightly 1.3.0.dev2026112705, with the final
+generator: everything OK, 600 stage 2 programs, 600 near misses and 600
+mutants of all kinds, 300 cond_arm, 238 cond_use and 300 pack_bound
+mutants and 216 cond_refine near misses (seeds 3501-3507; kinds with
+fewer than 300 lacked a chance in the others). With the dead-branch
+workaround lifted, 14 of 269 cond_refine near misses failed to build
+(seed 3511: "'V2[...]' value has no attribute 'f0_ref'", "no matching
+function in initialization", an aliasing error), as above. The rounds
+before (about 6,000 programs, seeds 3001-3404) found the bugs and
+generator bugs above; the packs alone found nothing (2,100 programs,
+seeds 3301-3304).
+
+
 ## Beyond the paths
 
 Mojo features FM leaves out for now:
@@ -2622,9 +2755,11 @@ Mojo features FM leaves out for now:
   (`struct V[n: Int] where n > 0`, which every `V[n - 1]` would need
   evidence for, in signatures too), and keyword and default arguments.
 - **`Variant` and `isa`:** the counterpart of FJ's downcasts.
-- **Conditional types and variadic packs** (probed, see "Patterns"):
-  `V[n] if <prop> else W` in signatures of functions over n, refined by
-  `comptime if`; functions over `*args: *Ts` that combine their elements
-  with `comptime for`, called with arguments and unpacked packs mixed.
+- **More conditional types and packs:** conditional result types
+  (`-> V[n] if n > 2 else W`, whose body must return each arm under a
+  `comptime if`), fields and aliases of conditional types, unrefined
+  values used through a trait both arms conform to (`id(p).get()`),
+  conditions on Bool parameters, and `mut` packs (`bump(*args, *args)`,
+  "aliasing values passed mutably").
 - **More patterns:** enum cases (`Optional`, `__enum`), list patterns,
   `ref` names, `while case`, `comptime match`, clauses in `comptime if`.

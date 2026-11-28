@@ -175,6 +175,24 @@
 # (guard_fall), or bind a field that isn't ImplicitlyCopyable with `var`
 # (pat_var).
 #
+# Conditional types: a third of the functions with a value parameter n
+# (2/3 for the cond kinds) take a parameter of type `(V[n + d] if <prop>
+# else B)`, B a concrete type. Mojo picks the arm by the proposition: for
+# a value of n, at the call; in a body that knows the proposition (from
+# its `where`, a `comptime assert`, a `comptime if` on it) or its negation
+# (that `comptime if`'s `else`), the parameter is of that arm's type;
+# elsewhere it's of the conditional type, which nothing converts to or
+# from. The mutants pass the other arm's type (cond_arm), or use a value
+# of the conditional type as an arm's (cond_use); the near miss uses one
+# as an arm under a `comptime if` written in another form (cond_refine).
+#
+# Variadic packs: 3/4 of the programs have one or two functions over a
+# pack, `def pk0[*Ts: TrN](*args: *Ts) -> Int`, that combine an Int method
+# of TrN over the elements with `comptime for` (or count them), or forward
+# their pack to another, mixed with other arguments (`pk0(S1(...), *args,
+# *args)`). Calls pass zero to three values of types conforming to TrN
+# (pack_bound: one that doesn't).
+#
 # Every program terminates: each method and function has a rank, and a
 # body calls only methods and functions of lower rank; loops have constant
 # bounds. The generator also evaluates the program itself (`Program.eval`,
@@ -262,6 +280,11 @@ comptime ASSOC = 7
 """An associated type `X.E<t>` (trait t declares `comptime E<t>: TrU`):
 tid is t, targ the owner X, a type parameter or another ASSOC (with a
 struct owner it's normalized to the struct's binding, `assoc`)."""
+comptime COND = 9
+"""A conditional type `(A if n + c >= k else B)` (or `<=`) about a value
+parameter n: tid indexes Program.conds. With a value for n it's the arm
+the proposition selects (`cond`); in a body that knows the proposition or
+its negation, that arm (`refine`)."""
 
 # capabilities, weakest first
 comptime CAP_M = 0
@@ -313,6 +336,8 @@ comptime E_FMOVE = 12
 """`x.f^`, a field moved out (kids: the place)."""
 comptime E_VALN = 13
 """`V[k].n` or `Self.n`: a value parameter (tys[0] is the struct type)."""
+comptime E_PACK = 14
+"""A call of the variadic pack function a (Program.packs) on kids."""
 
 # statement kinds
 comptime S_VAR = 0
@@ -404,6 +429,7 @@ comptime R_METHOD = 6
 comptime R_K = 7
 comptime R_CALL = 8
 comptime R_VALN = 9
+comptime R_PACK = 10
 
 # what an `if` does to one variable, for the path-dependent mutants and
 # near misses: its branches move it (it was live), or reinitialize it (it
@@ -488,7 +514,11 @@ comptime STAT_PATTERN = 35
 """Patterns that matched (a `case` run, a clause that held)."""
 comptime STAT_GUARD = 36
 """`guard` statements whose `else` ran."""
-comptime N_STATS = 37
+comptime STAT_COND = 37
+"""Calls of functions with a parameter of a conditional type."""
+comptime STAT_PACK = 38
+"""Calls of variadic pack functions (forwarded ones too)."""
+comptime N_STATS = 39
 comptime STAT_NAMES: List[String] = [
     "own",
     "required",
@@ -527,6 +557,8 @@ comptime STAT_NAMES: List[String] = [
     "match",
     "pattern",
     "guard_exit",
+    "cond",
+    "pack",
 ]
 
 # Stage 3: ill-typed mutants (DECL_FUZZ_MUTANTS=1). Each program gets one
@@ -649,7 +681,18 @@ fall through"."""
 comptime MU_PAT_VAR = 39
 """A `var` binding of a struct's field that isn't `ImplicitlyCopyable`
 (it would be a copy): "cannot be implicitly copied"."""
-comptime N_MU = 40
+comptime MU_COND_ARM = 40
+"""An argument of the other arm's type for a parameter of a conditional
+type, where the call's value (or what the caller knows) picks one arm:
+"cannot be converted from 'W' to 'V[3]'"."""
+comptime MU_COND_USE = 41
+"""A value of a conditional type, where nothing picks its arm, used as a
+value of one arm's type: "cannot be converted from 'V[n] if (n > 2) else
+W' to 'V[n]'"."""
+comptime MU_PACK_BOUND = 42
+"""A call of a variadic pack function with an argument whose type doesn't
+conform to the pack's bound: "does not conform to trait"."""
+comptime N_MU = 43
 comptime MU_NAMES: List[String] = [
     "type",
     "use_moved",
@@ -691,6 +734,9 @@ comptime MU_NAMES: List[String] = [
     "pat_scope",
     "guard_fall",
     "pat_var",
+    "cond_arm",
+    "cond_use",
+    "pack_bound",
 ]
 comptime MU_ODDS = 6
 """Each chance to apply the mutation is taken 1 time in MU_ODDS."""
@@ -770,7 +816,11 @@ comptime NR_OWN2 = 21
 comptime NR_TRY_MOVE = 22
 """The try_move mutant's `else` reinitializes the variable after moving
 it, so that the `finally` can use it."""
-comptime N_NR = 23
+comptime NR_COND = 23
+"""A value of a conditional type used as its arm's, under a `comptime if`
+on the proposition written in another form than the type's (`2 < n` for
+`n > 2`), or in a function whose `where` (or `comptime assert`) is it."""
+comptime N_NR = 24
 comptime NR_NAMES: List[String] = [
     "disjoint",
     "read_alias",
@@ -795,6 +845,7 @@ comptime NR_NAMES: List[String] = [
     "vwhere",
     "own2",
     "try_move",
+    "cond_refine",
 ]
 comptime MARK_NEAR = "@@N@@"
 """In generated text, marks the line of the near miss."""
@@ -988,6 +1039,39 @@ struct Prop(Copyable):
     var k: Int
     var form: Int
     """How it's written (prop_text)."""
+
+
+@fieldwise_init
+struct CondT(Copyable):
+    """A conditional type's parts: `(a if x + c >= k else b)` (`<=` unless
+    ge), x the PARAM of a value parameter, the proposition written in form
+    (as a Prop's)."""
+
+    var x: Int
+    var c: Int
+    var ge: Bool
+    var k: Int
+    var a: Int
+    var b: Int
+    var form: Int
+
+
+@fieldwise_init
+struct PackDecl(Copyable):
+    """`def pk<j>[*Ts: Tr<bound>](*args: *Ts) -> Int`: either it combines
+    `args[i].<method>(<margs>)` over the pack with `comptime for` (margs:
+    expressions of concrete types, drawn with the bodies; method -1 if
+    that got stuck, adding 1 per element), or it returns a call of pack
+    function callee on items (`*args`, -1, or an expression of a type
+    conforming to the callee's bound)."""
+
+    var bound: Int
+    var method: Int
+    var margs: List[Int]
+    var callee: Int
+    var items: List[Int]
+    var item_tys: List[Int]
+    var rank: Int
 
 
 @fieldwise_init
@@ -1216,6 +1300,10 @@ struct Ctx(Copyable):
     """Inside a ternary branch, where moves would be conditional."""
     var const_if: Int
     """Inside a branch of an `if` whose condition is a constant."""
+    var const_tern: Int
+    """Inside a branch of a ternary whose condition is a constant, which
+    Mojo checks under the assumption `not True` (modular/modular#7770): it
+    proves a conditional type's proposition there (`assume_dead`)."""
     var discard: Bool
     """The next expression drawn is the root of `_ = e`, which Mojo
     evaluates without copying (`_ = x.f` of a `Copyable` field is fine)."""
@@ -1312,6 +1400,7 @@ struct Ctx(Copyable):
         self.loop_base = 0
         self.no_move = 0
         self.const_if = 0
+        self.const_tern = 0
         self.discard = False
         self.counter = 0
         self.ret = -1
@@ -1532,6 +1621,15 @@ struct Program(Movable):
     var cif_fn: Int
     """While a function with a value parameter has its body drawn, the
     function (for `comptime if`), else -1."""
+    var vnot: List[Int]
+    """...and the propositions it knows are false, in the `else` of a
+    `comptime if` on one."""
+    var conds: List[CondT]
+    """The parts of each conditional type (COND's tid)."""
+    var refined: List[Int]
+    """The variables of the body being drawn whose conditional type is an
+    arm's there (`refine_ctx`)."""
+    var packs: List[PackDecl]
     var bad_where: Int
     """For MU_WHERE_IMPL, the implementation (struct * 64 + index) gated
     by a stricter condition, or -1..."""
@@ -1595,6 +1693,10 @@ struct Program(Movable):
         self.vfacts = []
         self.vfacts_assert = []
         self.cif_fn = -1
+        self.vnot = []
+        self.conds = []
+        self.refined = []
+        self.packs = []
         self.alias_ty = -1
         self.alias_text = String()
         self.alias_struct = -1
@@ -1682,7 +1784,128 @@ struct Program(Movable):
         if kind == STRUCT and self.targ[ty] >= 0:
             var arg = self.subst(self.targ[ty], args)
             return self.intern(STRUCT, self.tid[ty], arg)
+        if kind == COND:
+            var d = self.conds[self.tid[ty]].copy()
+            var x = self.subst(d.x, args)
+            var xk = self.tkind[x]
+            if xk != PARAM and xk != OFF and xk != VAL:
+                return ty  # (subst_one's filler for another parameter)
+            return self.cond(
+                x,
+                d.c,
+                d.ge,
+                d.k,
+                self.subst(d.a, args),
+                self.subst(d.b, args),
+                d.form,
+            )
         return ty
+
+    def cond(
+        mut self, x: Int, c: Int, ge: Bool, k: Int, a: Int, b: Int, form: Int
+    ) -> Int:
+        """The conditional type `(a if x + c >= k else b)` (`<=` unless
+        ge), x a value argument: the arm it selects when x is a value (`m
+        + d` folds d into c)."""
+        var base = x
+        var cc = c
+        if self.tkind[base] == OFF:
+            cc += self.tid[base]
+            base = self.targ[base]
+        if self.tkind[base] == VAL:
+            var v = self.tid[base] + cc
+            return a if (v >= k if ge else v <= k) else b
+        for i in range(len(self.conds)):
+            ref d = self.conds[i]
+            if (
+                d.x == base
+                and d.c == cc
+                and d.ge == ge
+                and d.k == k
+                and d.a == a
+                and d.b == b
+            ):
+                return self.intern(COND, i, -1)
+        self.conds.append(CondT(base, cc, ge, k, a, b, form))
+        return self.intern(COND, len(self.conds) - 1, -1)
+
+    def cond_key(self, ty: Int) -> Int:
+        """Conditional type ty's proposition (prop_key)."""
+        ref d = self.conds[self.tid[ty]]
+        return Self.prop_key(self.tid[d.x], d.c, d.ge, d.k)
+
+    def refine(self, ty: Int) -> Int:
+        """ty, or for a conditional type, the arm what the body knows
+        selects: a where it knows the proposition (`where`, `comptime
+        assert`, `comptime if`), b where it knows its negation (that
+        `comptime if`'s `else`)."""
+        if self.tkind[ty] != COND:
+            return ty
+        var key = self.cond_key(ty)
+        if has(self.vfacts, key) or has(self.vfacts_assert, key):
+            return self.conds[self.tid[ty]].a
+        if has(self.vnot, key):
+            return self.conds[self.tid[ty]].b
+        return ty
+
+    def refine_ctx(mut self, mut ctx: Ctx) -> List[Int]:
+        """Gives the variables of a conditional type that the body now
+        knows the arm of that arm's type (into refined); returns what to
+        undo, (slot, type) pairs."""
+        var saved = List[Int]()
+        for v in range(len(ctx.types)):
+            var t = self.refine(ctx.types[v])
+            if t != ctx.types[v]:
+                saved.append(v)
+                saved.append(ctx.types[v])
+                ctx.types[v] = t
+                self.refined.append(v)
+        return saved^
+
+    def unrefine_ctx(mut self, mut ctx: Ctx, saved: List[Int]):
+        var i = 0
+        while i < len(saved):
+            if saved[i] < len(ctx.types):
+                ctx.types[saved[i]] = saved[i + 1]
+            _ = self.refined.pop()
+            i += 2
+
+    def cond_use_var(
+        mut self, mut data: ConjectureData, ctx: Ctx, ty: Int, conv: Int
+    ) raises -> Int:
+        """For MU_COND_USE, perhaps a variable of a conditional type whose
+        arm nothing picks, with ty as an arm, for a position of type ty
+        passed as conv; else -1."""
+        if not self.wants(MU_COND_USE) or self.assume_dead(ctx):
+            return -1
+        var vs = List[Int]()
+        for v in range(len(ctx.types)):
+            var vt = ctx.types[v]
+            if (
+                not ctx.live[v]
+                or ctx.excl[v]
+                or self.tkind[vt] != COND
+                or (conv == CONV_VAR and self.cap_of(vt, ctx.bounds) < CAP_C)
+            ):
+                continue
+            ref d = self.conds[self.tid[vt]]
+            if d.a != d.b and (d.a == ty or d.b == ty):
+                vs.append(v)
+        if len(vs) > 0 and self.chance(data, MU_COND_USE):
+            return vs[pick(data, len(vs))]
+        return -1
+
+    def assume_dead(self, ctx: Ctx) -> Bool:
+        """Whether ctx is in a branch of a ternary with a constant
+        condition, which Mojo checks assuming `not True`: that proves a
+        conditional type's proposition, so its values there are the first
+        arm's, though not in the other branch (`p if 3 > 2 else p` is
+        "not compatible", modular/modular#7770). So there are none there,
+        unless DECL_FUZZ_NO_COND_DEAD_WORKAROUND=1."""
+        return (
+            ctx.const_tern > 0
+            and getenv("DECL_FUZZ_NO_COND_DEAD_WORKAROUND") == ""
+        )
 
     def subst_one(mut self, ty: Int, p: Int, arg: Int) -> Int:
         """Replaces PARAM p (the only one in ty) by arg."""
@@ -1722,6 +1945,20 @@ struct Program(Movable):
                 ".E",
                 self.tid[ty],
             )
+        if kind == COND:
+            ref d = self.conds[self.tid[ty]]
+            var lhs = names[self.tid[d.x]]
+            if d.c != 0 or self.near == NR_VALUE_EXPR:
+                lhs = String("@@=", lhs, ";", d.c, "@@")
+            return String(
+                "(",
+                self.ty_str(d.a, names, self_print),
+                " if ",
+                Self.prop_str(lhs, d.ge, d.k, d.form),
+                " else ",
+                self.ty_str(d.b, names, self_print),
+                ")",
+            )
         var s = self.structs[self.tid[ty]].name
         if self.targ[ty] >= 0 and self.structs[self.tid[ty]].valued:
             return String(s, "[", self.val_str(self.targ[ty], names), "]")
@@ -1760,7 +1997,7 @@ struct Program(Movable):
 
     def conforms(self, ty: Int, t: Int, bounds: List[Int]) -> Bool:
         var kind = self.tkind[ty]
-        if kind == INT or kind == RES or kind == ERR:
+        if kind == INT or kind == RES or kind == ERR or kind == COND:
             return False
         if kind == ASSOC:
             return self.refines(self.traits[self.tid[ty]].assoc, t)
@@ -1796,7 +2033,7 @@ struct Program(Movable):
 
     def mentions_param(self, ty: Int) -> Bool:
         var kind = self.tkind[ty]
-        if kind == PARAM:
+        if kind == PARAM or kind == COND:
             return True
         if (kind == STRUCT or kind == ASSOC) and self.targ[ty] >= 0:
             return self.mentions_param(self.targ[ty])
@@ -1808,6 +2045,9 @@ struct Program(Movable):
         var kind = self.tkind[ty]
         if kind == PARAM or kind == ASSOC:
             return CAP_C
+        if kind == COND:
+            ref d = self.conds[self.tid[ty]]
+            return min(self.cap_of_any(d.a), self.cap_of_any(d.b))
         if kind == STRUCT:
             return self.structs[self.tid[ty]].cap
         return CAP_IC if kind == INT else CAP_C
@@ -1863,6 +2103,9 @@ struct Program(Movable):
             return CAP_C
         if kind == ASSOC:
             return self.traits[self.traits[self.tid[ty]].assoc].cap
+        if kind == COND:
+            ref d = self.conds[self.tid[ty]]
+            return min(self.cap_of(d.a, bounds), self.cap_of(d.b, bounds))
         if kind == PARAM:
             # (a `where` may give more: `ImplicitlyCopyable` for a
             # `Copyable` bound)
@@ -2188,21 +2431,26 @@ struct Program(Movable):
         var lhs = self.val_str(
             self.offset(self.intern(PARAM, vi, -1), pr.c), names
         )
-        var k = pr.k
-        if pr.form == 1 or pr.form == 3:
-            k += -1 if pr.ge else 1
+        return Self.prop_str(lhs, pr.ge, pr.k, pr.form)
+
+    @staticmethod
+    def prop_str(lhs: String, ge: Bool, k0: Int, form: Int) -> String:
+        """`lhs >= k` (or `<=`) in one of four forms (prop_text)."""
+        var k = k0
+        if form == 1 or form == 3:
+            k += -1 if ge else 1
         var rhs = String("@@=", k, "@@")
         var op: String
-        if pr.form < 2:
-            if pr.ge:
-                op = " >= " if pr.form == 0 else " > "
+        if form < 2:
+            if ge:
+                op = " >= " if form == 0 else " > "
             else:
-                op = " <= " if pr.form == 0 else " < "
+                op = " <= " if form == 0 else " < "
             return String(lhs, op, rhs)
-        if pr.ge:
-            op = " <= " if pr.form == 2 else " < "
+        if ge:
+            op = " <= " if form == 2 else " < "
         else:
-            op = " >= " if pr.form == 2 else " > "
+            op = " >= " if form == 2 else " > "
         return String(rhs, op, lhs)
 
     def methods_on(self, ty: Int, bounds: List[Int]) -> List[Int]:
@@ -2636,6 +2884,13 @@ struct Program(Movable):
         var kind = self.tkind[ty]
         if kind == PARAM:
             return self.tid[ty] == p
+        if kind == COND:
+            ref d = self.conds[self.tid[ty]]
+            return (
+                self.tid[d.x] == p
+                or self.mentions(d.a, p)
+                or self.mentions(d.b, p)
+            )
         if (kind == STRUCT or kind == ASSOC or kind == OFF) and self.targ[
             ty
         ] >= 0:
@@ -2722,6 +2977,47 @@ struct Program(Movable):
             params.append(t)
             convs.append(c)
         return self.draw_sig_type(data, pool, sig_own)
+
+    def cond_kind(self) -> Bool:
+        return (
+            self.mutant == MU_COND_ARM
+            or self.mutant == MU_COND_USE
+            or self.near == NR_COND
+        )
+
+    def draw_cond(
+        mut self,
+        mut data: ConjectureData,
+        s: Int,
+        vi: Int,
+        f: Int,
+        vwhere: List[Prop],
+        asserts: List[Prop],
+        n_structs: Int,
+    ) raises -> Int:
+        """A conditional type for function f's parameter, over its value
+        parameter n (PARAM vi) of struct s: `(V[n + d] if <prop> else B)`,
+        prop drawn as for a `where` (draw_prop), or half the time for the
+        cond_refine near miss one its `where` or assert gives (in another
+        form), and B a concrete type."""
+        var pr = self.draw_prop(data, s, f)
+        if self.near == NR_COND and data.draw(booleans()):
+            var known = vwhere.copy()
+            known += asserts.copy()
+            if len(known) > 0:
+                pr = known[pick(data, len(known))].copy()
+                pr.form = (pr.form + data.draw(integers(1, 3))) % 4
+        var ds: List[Int] = [0, 0, 1, -1]
+        var a = self.intern(
+            STRUCT,
+            s,
+            self.offset(self.intern(PARAM, vi, -1), ds[pick(data, len(ds))]),
+        )
+        var pool = self.type_pool([], n_structs)
+        var b = pool[pick(data, len(pool))]
+        return self.cond(
+            self.intern(PARAM, vi, -1), pr.c, pr.ge, pr.k, a, b, pr.form
+        )
 
     def exc_kind(self) -> Bool:
         """Whether the kind drawn is about exceptions (they raise more)."""
@@ -2836,8 +3132,12 @@ struct Program(Movable):
         # conformances, associated constants
         var n_structs = data.draw(integers(1, 5))
         var vwhere_kind = self.mutant == MU_VWHERE or self.near == NR_VWHERE
+        var cond_kind = self.cond_kind()
         var value_kind = (
-            self.mutant == MU_VALUE or self.near == NR_VALUE_EXPR or vwhere_kind
+            self.mutant == MU_VALUE
+            or self.near == NR_VALUE_EXPR
+            or vwhere_kind
+            or cond_kind
         )
         var where_kind = (
             self.mutant == MU_WHERE
@@ -3238,6 +3538,22 @@ struct Program(Movable):
                     asserts.append(r^)
                 elif data.draw(integers(0, 2)) < (2 if vwhere_kind else 1):
                     asserts.append(self.draw_assert(data, vwhere, vs, f))
+            # a third of them (2/3 for the cond kinds) take a value of a
+            # conditional type
+            if vi >= 0 and data.draw(integers(0, 2)) < (2 if cond_kind else 1):
+                params.append(
+                    self.draw_cond(data, vs, vi, f, vwhere, asserts, n_structs)
+                )
+                # (not owned: Mojo never destroys an owned value of a
+                # conditional type that a body reads as an arm, refined:
+                # modular/modular#7830)
+                var conv = draw_conv(data, mut_often)
+                if (
+                    conv == CONV_VAR
+                    and getenv("DECL_FUZZ_NO_COND_VAR_WORKAROUND") == ""
+                ):
+                    conv = CONV_READ
+                convs.append(conv)
             self.fns.append(
                 FnDecl(
                     String("g", f),
@@ -3254,6 +3570,119 @@ struct Program(Movable):
                     wparam,
                 )
             )
+        # variadic pack functions, in 3/4 of the programs (all for
+        # pack_bound)
+        if self.mutant == MU_PACK_BOUND or data.draw(integers(0, 3)) > 0:
+            for _ in range(data.draw(integers(1, 2))):
+                self.draw_pack(data)
+
+    def int_method(self, m: Int) -> Bool:
+        """Whether trait method m can combine a pack's elements: called on
+        a read receiver, with parameters of concrete types (not `mut`),
+        returning Int, raising nothing."""
+        ref md = self.methods[m]
+        if (
+            md.trait_id < 0
+            or md.is_static
+            or md.self_conv != CONV_READ
+            or md.ret != self.int_ty
+            or md.raise_ty != -1
+            or self.is_generic_method(m)
+        ):
+            return False
+        for i in range(len(md.params)):
+            if self.mentions_param(md.params[i]) or md.convs[i] == CONV_MUT:
+                return False
+        return True
+
+    def draw_pack(mut self, mut data: ConjectureData) raises:
+        """A variadic pack function (PackDecl): half the time, when there's
+        one to call, one forwarding its pack to it, with a bound refining
+        that one's; else one combining an Int method of its bound."""
+        var n_traits = len(self.traits)
+        if len(self.packs) > 0 and data.draw(booleans()):
+            var callee = pick(data, len(self.packs))
+            var cb = self.packs[callee].bound
+            var rank = self.packs[callee].rank + 1
+            if rank > MAX_RANK:
+                return
+            var us = List[Int]()
+            for u in range(n_traits):
+                if self.refines(u, cb):
+                    us.append(u)
+            var bound = us[pick(data, len(us))]
+            var fit = List[Int]()
+            for t in self.type_pool([], len(self.structs)):
+                if self.conforms(t, cb, []):
+                    fit.append(t)
+            var items = List[Int]()
+            var item_tys = List[Int]()
+            var n = data.draw(integers(1, 3))
+            var forwards = False
+            for i in range(n):
+                if (
+                    len(fit) == 0
+                    or (i == n - 1 and not forwards)
+                    or data.draw(booleans())
+                ):
+                    items.append(-1)
+                    item_tys.append(-1)
+                    forwards = True
+                else:
+                    items.append(-2)  # (drawn with the bodies)
+                    item_tys.append(fit[pick(data, len(fit))])
+            self.packs.append(
+                PackDecl(bound, -1, [], callee, items^, item_tys^, rank)
+            )
+            return
+        var cands = List[Int]()
+        for t in range(n_traits):
+            for x in self.closure([t]):
+                for m in self.traits[x].methods:
+                    if self.int_method(m) and self.methods[m].rank < MAX_RANK:
+                        cands.append(t * 1024 + m)
+        if len(cands) == 0:
+            # (counting the elements, `t * 7 + 1` each)
+            var bound = pick(data, n_traits)
+            var rank = data.draw(integers(1, MAX_RANK))
+            self.packs.append(PackDecl(bound, -1, [], -1, [], [], rank))
+            return
+        var c = cands[pick(data, len(cands))]
+        var m = c % 1024
+        var rank = data.draw(integers(self.methods[m].rank + 1, MAX_RANK))
+        self.packs.append(PackDecl(c // 1024, m, [], -1, [], [], rank))
+
+    def pack_eval(
+        mut self, j: Int, vals: List[Int], tys: List[Int]
+    ) raises -> Int:
+        """The result of pack function j on these values (of these types,
+        resolved)."""
+        self.stats[STAT_PACK] += 1
+        var pd = self.packs[j].copy()
+        if pd.callee < 0:
+            var t = 0
+            for i in range(len(vals)):
+                if pd.method < 0:
+                    t = t * 7 + 1
+                    continue
+                var frame: List[Int] = [vals[i]]
+                for x in pd.margs:
+                    var empty = List[Int]()
+                    frame.append(self.eval(x, empty, []))
+                var r = self.call_method(pd.method, tys[i], frame)
+                t = t * 7 + self.vint[r]
+            return self.new_int(t)
+        var vs = List[Int]()
+        var ts = List[Int]()
+        for i in range(len(pd.items)):
+            if pd.items[i] == -1:
+                vs += vals.copy()
+                ts += tys.copy()
+            else:
+                var empty = List[Int]()
+                vs.append(self.eval(pd.items[i], empty, []))
+                ts.append(self.exprs[pd.items[i]].ty)
+        return self.pack_eval(pd.callee, vs, ts)
 
     # ---- mutants (stage 3)
 
@@ -3548,14 +3977,18 @@ struct Program(Movable):
         mut self,
         mut data: ConjectureData,
         mut ctx: Ctx,
-        ty: Int,
+        var ty: Int,
         size: Int,
         pos: Int,
         stmt_root: Bool = False,
     ) raises -> Int:
         """An expression for a position that expects type ty: for
         MU_TYPE, perhaps one of another type (no two types in the pool
-        convert to each other)."""
+        convert to each other). A conditional type is its arm where the
+        body knows which."""
+        if self.tkind[ty] == COND and self.assume_dead(ctx):
+            raise Error("STUCK")
+        ty = self.refine(ty)
         if (
             self.is_valued(ty)
             and self.wants(MU_VALUE)
@@ -3935,7 +4368,15 @@ struct Program(Movable):
             stmts += self.deinit_end(data, ctx)
         ctx.new_statement()
         var r: Int
-        if root:
+        var use = self.cond_use_var(data, ctx, ret, CONV_VAR)
+        if use >= 0:
+            # (MU_COND_USE: returned as the result's type, an arm's)
+            r = self.spell(data, ctx, use, -1)
+            if self.cap_of(ctx.types[use], ctx.bounds) == CAP_C:
+                var text = String(self.exprs[r].text, ".copy()")
+                r = self.add(E_COPY, 0, ctx.types[use], [r], [], text^)
+            r = self.mark(r)
+        elif root:
             r = self.gen(data, ctx, ret, size, P_OWNED, True, True)
         else:
             r = self.gen_typed(data, ctx, ret, size, P_OWNED, True)
@@ -4206,6 +4647,51 @@ struct Program(Movable):
             self.alias_ty = -1
         self.deinit_body = False
         self.died = False
+        # the values forwarding pack functions pass, and the arguments of
+        # the others' method (declarations: no mutations there)
+        for j in range(len(self.packs)):
+            var m = self.packs[j].method
+            if self.packs[j].callee >= 0 or m < 0:
+                continue
+            var mutant = self.mutant
+            var near = self.near
+            self.mutant = -1
+            self.near = -1
+            var pool = self.type_pool([], len(self.structs))
+            var ctx = Ctx([], [], self.packs[j].rank, -1, pool^)
+            var margs = List[Int]()
+            try:
+                var mparams = self.methods[m].params.copy()
+                for t in mparams:
+                    margs.append(self.gen(data, ctx, t, 3, P_OWNED))
+            except err:
+                if String(err) != "STUCK":
+                    raise err^
+                self.packs[j].method = -1
+            self.mutant = mutant
+            self.near = near
+            self.packs[j].margs = margs^
+        for j in range(len(self.packs)):
+            for i in range(len(self.packs[j].items)):
+                if self.packs[j].items[i] != -2:
+                    continue
+                var mutant = self.mutant
+                var near = self.near
+                self.mutant = -1
+                self.near = -1
+                var pool = self.type_pool([], len(self.structs))
+                var ctx = Ctx([], [], self.packs[j].rank, -1, pool^)
+                var e = -1
+                try:
+                    e = self.gen(
+                        data, ctx, self.packs[j].item_tys[i], 3, P_READ
+                    )
+                except err:
+                    if String(err) != "STUCK":
+                        raise err^
+                self.mutant = mutant
+                self.near = near
+                self.packs[j].items[i] = e  # (-1, `*args`, if stuck)
         # functions
         for f in range(len(self.fns)):
             var bounds = self.fns[f].bounds.copy()
@@ -4226,11 +4712,16 @@ struct Program(Movable):
             var ctx = Ctx(bounds^, self.fn_names(f), rank, -1, pool^)
             ctx.raise_ty = self.fns[f].raise_ty
             self.push_params(ctx, self.fns[f].params, self.fns[f].convs, "p")
+            # (a parameter of a conditional type its `where` or asserts
+            # decide is of that arm's type in the whole body)
+            _ = self.refine_ctx(ctx)
             var ret = self.fns[f].ret
             self.fns[f].body = self.gen_body(data, ctx^, ret)
             self.facts = []
             self.vfacts = []
             self.vfacts_assert = []
+            self.vnot = []
+            self.refined = []
             self.cif_fn = -1
         # entry points
         for _ in range(data.draw(integers(1, 4))):
@@ -6358,7 +6849,7 @@ struct Program(Movable):
         mut self,
         mut data: ConjectureData,
         mut ctx: Ctx,
-        ty: Int,
+        var ty: Int,
         size: Int,
         pos: Int,
         root: Bool = False,
@@ -6369,10 +6860,35 @@ struct Program(Movable):
         At the root of an entry point, only calls and associated constants,
         if there are any. Calls with `mut` arguments only at the root of a
         statement; with prefer_mut, only those if there are any."""
+        if self.tkind[ty] == COND and self.assume_dead(ctx):
+            raise Error("STUCK")
+        ty = self.refine(ty)
         var kind = self.tkind[ty]
         var cap = self.cap_of(ty, ctx.bounds)
         var discard = ctx.discard
         ctx.discard = False
+
+        # a value of a conditional type whose arm a `comptime if` (in
+        # another form), a `where` or an assert picks, used as the arm's
+        # (cond_refine)
+        if self.wants_near(NR_COND) and not self.assume_dead(ctx):
+            var cands = List[Int]()
+            for v in self.refined:
+                if (
+                    v < len(ctx.types)
+                    and ctx.live[v]
+                    and not ctx.excl[v]
+                    and ctx.types[v] == ty
+                    and (pos == P_READ or cap >= CAP_C)
+                ):
+                    cands.append(v)
+            if len(cands) > 0 and self.near_chance(data, NR_COND):
+                var v = cands[pick(data, len(cands))]
+                var e = self.spell(data, ctx, v, -1)
+                if pos == P_OWNED and cap == CAP_C:
+                    var text = String(self.exprs[e].text, ".copy()")
+                    e = self.add(E_COPY, 0, ty, [e], [], text^)
+                return self.mark_near(e)
 
         if self.wants(MU_USE_MOVED):
             var dead = List[Int]()
@@ -6459,6 +6975,10 @@ struct Program(Movable):
         var atom_modes = List[Int]()
         for v in range(len(ctx.types)):
             if not ctx.live[v] or ctx.excl[v]:
+                continue
+            if self.assume_dead(ctx) and (
+                self.tkind[ctx.types[v]] == COND or has(self.refined, v)
+            ):
                 continue
             if ctx.types[v] == ty:
                 if pos == P_READ or cap == CAP_IC:
@@ -6589,6 +7109,11 @@ struct Program(Movable):
             rules.append(R_ATOM)
         if len(valn) > 0:
             rules.append(R_VALN)
+        if kind == INT and size > 0:
+            for pd in self.packs:
+                if pd.rank < ctx.rank:
+                    rules += [R_PACK, R_PACK]
+                    break
         if kind == STRUCT or kind == RES:
             rules.append(R_NEW)
         if len(makes) > 0:
@@ -6639,7 +7164,7 @@ struct Program(Movable):
         if root:
             var calls = List[Int]()
             for r in rules:
-                if r == R_METHOD or r == R_CALL or r == R_K:
+                if r == R_METHOD or r == R_CALL or r == R_K or r == R_PACK:
                     calls.append(r)
             if len(calls) > 0:
                 rules = calls^
@@ -6846,8 +7371,22 @@ struct Program(Movable):
             var key = Self.prop_key(vi, r.c, r.ge, r.k)
             if not has(self.vfacts, key) and not has(self.vfacts_assert, key):
                 cands.append(r.copy())
+        # (and the propositions of the conditional types it can decide,
+        # in another form for the cond_refine near miss)
+        var conds = List[Int]()
+        for v in range(len(ctx.types)):
+            var t = ctx.types[v]
+            if self.tkind[t] == COND and not has(conds, t):
+                conds.append(t)
         var pr: Prop
-        if len(cands) > 0 and data.draw(integers(0, 3)) > 0:
+        if len(conds) > 0 and (
+            self.near == NR_COND or data.draw(integers(0, 2)) > 0
+        ):
+            ref d = self.conds[self.tid[conds[pick(data, len(conds))]]]
+            pr = Prop(d.c, d.ge, d.k, (d.form + data.draw(integers(0, 3))) % 4)
+            if self.near == NR_COND and pr.form == d.form:
+                pr.form = (pr.form + 1) % 4
+        elif len(cands) > 0 and data.draw(integers(0, 3)) > 0:
             pr = cands[pick(data, len(cands))].copy()
             pr.form = data.draw(integers(0, 3))
         else:
@@ -6856,6 +7395,11 @@ struct Program(Movable):
         var added = not has(self.vfacts, key) and not has(
             self.vfacts_assert, key
         )
+        if has(self.vnot, key):
+            # (in the `else` of a `comptime if` on it: the branch is dead,
+            # checked assuming both, which decides conditional types
+            # either way)
+            raise Error("STUCK")
         var n = len(ctx.names)
         var kinds = ctx.kinds.copy()
         var freeze = ctx.freeze_base
@@ -6866,13 +7410,23 @@ struct Program(Movable):
         ctx.depth += 1
         if added:
             self.vfacts_assert.append(key)
+        var undo = self.refine_ctx(ctx)
         var body = self.gen_block(data, ctx, 3, False)
+        self.unrefine_ctx(ctx, undo)
         if added:
             _ = self.vfacts_assert.pop()
         ctx.truncate(n)
         var orelse = List[Int]()
-        if data.draw(booleans()):
+        # (no `else` on a known proposition, where conditional types are:
+        # it's dead, checked assuming the negation too)
+        if data.draw(booleans()) and (
+            added or (len(conds) == 0 and len(self.refined) == 0)
+        ):
+            self.vnot.append(key)
+            undo = self.refine_ctx(ctx)
             orelse = self.gen_block(data, ctx, 3, False)
+            self.unrefine_ctx(ctx, undo)
+            _ = self.vnot.pop()
             ctx.truncate(n)
         ctx.depth -= 1
         ctx.const_if -= 1
@@ -7142,10 +7696,13 @@ struct Program(Movable):
         var state = self.mutation_state()
         var e = self.gen_typed(data, ctx, ty, BODY_SIZE - 2, P_OWNED)
         if self.mutation_state() != state and (
-            self.is_place(e) or self.mutant == MU_IMPLICIT_COPY
+            self.is_place(e)
+            or self.mutant == MU_IMPLICIT_COPY
+            or self.mutant == MU_TYPE
         ):
             # (an implicit_copy mutant's place: a valid subject, and with
-            # `.copy()` a valid value; gen_stmt undoes it)
+            # `.copy()` a valid value; a type mutant in the subject, whose
+            # type Mojo infers, is reported at a case; gen_stmt undoes it)
             raise Error("STUCK")
         if self.is_place(e):
             var text = String(self.exprs[e].text, ".copy()")
@@ -7335,16 +7892,6 @@ struct Program(Movable):
             if self.const_clauses(set):
                 # (Mojo folds it: a false one would make the rest of the
                 # block dead, and unchecked)
-                raise Error("STUCK")
-            if (
-                ctx.catching > 0
-                and self.dead_else(set)
-                and getenv("DECL_FUZZ_NO_GUARD_TRY_WORKAROUND") == ""
-            ):
-                # (in a `try` body, a `guard` whose patterns always match
-                # can hide a use of a variable the `try`'s `else` moved:
-                # an accepted try_move mutant; gen_stmt draws another
-                # statement)
                 raise Error("STUCK")
             # the `else` doesn't see the bindings: out of scope for it
             var saved = ctx.copy()
@@ -8090,9 +8637,12 @@ struct Program(Movable):
                 # value": one value instead)
                 self.restore_mutation(state)
                 return self.gen_typed(data, ctx, ty, half, P_OWNED)
+            var const_c = Int(self.is_const(x) and self.is_const(y))
             ctx.no_move += 1
+            ctx.const_tern += const_c
             var t = self.gen_typed(data, ctx, ty, half, P_OWNED)
             var e = self.gen_typed(data, ctx, ty, half, P_OWNED)
+            ctx.const_tern -= const_c
             ctx.no_move -= 1
             if (
                 self.is_place(t)
@@ -8324,6 +8874,44 @@ struct Program(Movable):
             var text = String(self.cty(c.k_recv[i], ctx), ".K", c.k_trait[i])
             return self.add(E_K, c.k_trait[i], ty, [], [c.k_recv[i]], text^)
 
+        if rule == R_PACK:
+            # a pack function on zero to three values conforming to its
+            # bound (pack_bound: one that doesn't)
+            var js = List[Int]()
+            for j in range(len(self.packs)):
+                if self.packs[j].rank < ctx.rank:
+                    js.append(j)
+            var j = js[pick(data, len(js))]
+            var bound = self.packs[j].bound
+            var fit = List[Int]()
+            var unfit = List[Int]()
+            for t in ctx.pool:
+                if self.conforms(t, bound, ctx.bounds):
+                    fit.append(t)
+                else:
+                    unfit.append(t)
+            var tys = List[Int]()
+            if len(fit) > 0:
+                for _ in range(data.draw(integers(0, 3))):
+                    tys.append(fit[pick(data, len(fit))])
+            var bad = False
+            if (
+                len(unfit) > 0
+                and self.wants(MU_PACK_BOUND)
+                and not self.in_branch(ctx)
+                and self.chance(data, MU_PACK_BOUND)
+            ):
+                tys.insert(
+                    pick(data, len(tys) + 1), unfit[pick(data, len(unfit))]
+                )
+                bad = True
+            var kids = List[Int]()
+            for t in tys:
+                kids.append(self.gen_typed(data, ctx, t, half, P_READ))
+            var text = String("pk", j, "(", self.args_text(kids, 0), ")")
+            var e = self.add(E_PACK, j, ty, kids^, [], text^)
+            return self.mark(e) if bad else e
+
         # R_CALL: a free or generic function; T-UCast's counterpart is
         # passing a conforming type for a bounded parameter
         var f = c.call_fn[pick(data, len(c.call_fn))]
@@ -8434,10 +9022,80 @@ struct Program(Movable):
         var params = self.fns[f].params.copy()
         if n_tp > 0:
             params = self.subst_all(params, targs)
+        # MU_COND_ARM: the other arm for a parameter of a conditional type
+        # whose arm the value (or what the caller knows) picks
+        var cond_bad = False
+        if self.wants(MU_COND_ARM) and not self.in_branch(ctx):
+            var js = List[Int]()
+            var others = List[Int]()
+            for j in range(len(params)):
+                var p = self.fns[f].params[j]
+                var got = self.refine(params[j])
+                if self.tkind[p] != COND or self.tkind[got] == COND:
+                    continue
+                var d = self.conds[self.tid[p]].copy()
+                var a = self.subst(d.a, targs)
+                var b = self.subst(d.b, targs)
+                if a != b:
+                    js.append(j)
+                    others.append(b if got == a else a)
+            if len(js) > 0 and self.chance(data, MU_COND_ARM):
+                var i = pick(data, len(js))
+                params[js[i]] = others[i]
+                cond_bad = True
+                self.mutated = True
         var convs = self.fns[f].convs.copy()
+        # MU_COND_USE: for a parameter of an arm's type (not a type
+        # parameter's, which Mojo would infer as the conditional type), a
+        # value of a conditional type whose arm nothing picks
+        var use_j = -1
+        var use_v = -1
+        if self.wants(MU_COND_USE) and not self.assume_dead(ctx):
+            var js = List[Int]()
+            var vs = List[Int]()
+            for j in range(len(params)):
+                var typed = False
+                for i in range(n_tp):
+                    if self.fns[f].bounds[i] >= 0 and self.mentions(
+                        self.fns[f].params[j], i
+                    ):
+                        typed = True
+                if typed or convs[j] == CONV_MUT:
+                    continue
+                for v in range(len(ctx.types)):
+                    var vt = ctx.types[v]
+                    if (
+                        not ctx.live[v]
+                        or ctx.excl[v]
+                        or self.tkind[vt] != COND
+                        or (
+                            convs[j] == CONV_VAR
+                            and self.cap_of(vt, ctx.bounds) < CAP_C
+                        )
+                    ):
+                        continue
+                    ref d = self.conds[self.tid[vt]]
+                    if d.a != d.b and (d.a == params[j] or d.b == params[j]):
+                        js.append(j)
+                        vs.append(v)
+            if len(js) > 0 and self.chance(data, MU_COND_USE):
+                var i = pick(data, len(js))
+                use_j = js[i]
+                use_v = vs[i]
+                self.mutated = True
         var mut_call = has(convs, CONV_MUT)
         var mutated_before = self.mutated
         var kids = self.gen_args(data, ctx, params, convs, half, mut_call)
+        if use_j >= 0:
+            var e = self.spell(data, ctx, use_v, -1)
+            var vt = ctx.types[use_v]
+            if (
+                convs[use_j] == CONV_VAR
+                and self.cap_of(vt, ctx.bounds) == CAP_C
+            ):
+                var text = String(self.exprs[e].text, ".copy()")
+                e = self.add(E_COPY, 0, vt, [e], [], text^)
+            kids[use_j] = e
         # an argument of another type might change what the type
         # arguments are inferred to be, so they're explicit then
         var forced = bad_i >= 0 or (self.mutated and not mutated_before)
@@ -8487,7 +9145,9 @@ struct Program(Movable):
         var e = self.add(E_CALL, f, ty, kids^, targs^, text^)
         if vnear:
             return self.mark_near(e)
-        return self.mark(e) if bad_i >= 0 or vbad or no_infer else e
+        return self.mark(e) if (
+            bad_i >= 0 or vbad or no_infer or cond_bad or use_j >= 0
+        ) else e
 
     def targ_str(self, f: Int, i: Int, t: Int, ctx: Ctx) -> String:
         """Type argument i of a call of function f: a type, or a value."""
@@ -8709,6 +9369,13 @@ struct Program(Movable):
                     self.stats[STAT_NESTED] += 1
             var ty = self.subst(self.exprs[e].tys[0], targs)
             return self.new_int(self.k_value(ty, a))
+        if kind == E_PACK:
+            var vals = List[Int]()
+            var tys = List[Int]()
+            for k in kids:
+                vals.append(self.eval(k, frame, targs))
+                tys.append(self.subst(self.exprs[k].ty, targs))
+            return self.pack_eval(a, vals, tys)
         # E_CALL
         if len(self.fns[a].bounds) > 0:
             self.stats[STAT_GENERIC] += 1
@@ -8851,6 +9518,11 @@ struct Program(Movable):
                 callee.append(self.eval_arg(args[i], frame, targs, moved))
         for v in moved:
             frame[v] = -1
+        if f >= 0:
+            for p in self.fns[f].params:
+                if self.tkind[p] == COND:
+                    self.stats[STAT_COND] += 1
+                    break
         var result: Int
         try:
             if f >= 0:
@@ -9872,6 +10544,35 @@ struct Program(Movable):
                 )
             s += self.body_text(body, "    ")
             s += "\n\n"
+        for j in range(len(self.packs)):
+            ref pd = self.packs[j]
+            s += String(
+                "def pk", j, "[*Ts: Tr", pd.bound, "](*args: *Ts) -> Int:\n"
+            )
+            if pd.callee < 0:
+                s += "    var t = 0\n"
+                s += "    comptime for i in range(args.__len__()):\n"
+                if pd.method < 0:
+                    s += "        t = t * 7 + 1\n"
+                else:
+                    s += String(
+                        "        t = t * 7 + args[i].",
+                        self.methods[pd.method].name,
+                        "(",
+                        self.args_text(pd.margs, 0),
+                        ")\n",
+                    )
+                s += "    return t\n\n\n"
+            else:
+                s += String("    return pk", pd.callee, "(")
+                for i in range(len(pd.items)):
+                    if i > 0:
+                        s += ", "
+                    if pd.items[i] < 0:
+                        s += "*args"
+                    else:
+                        s += self.exprs[pd.items[i]].text
+                s += ")\n\n\n"
         for i in range(len(self.entries)):
             s += String("def run_f", i, "(a: Int, b: Int, c: Int) -> Int:\n")
             s += self.body_text(self.entries[i], "    ")
