@@ -132,6 +132,45 @@
 # branch knows; and a quarter of a valued struct's own methods have a
 # `where` on `Self.n` too, which its receivers have to meet.
 #
+# More constraints: a quarter of the valued structs have a `where` of their
+# own, `struct V[n: Int] where n + 1 <= 3`, true of each value they're
+# used with. Every `V[x]` then needs evidence for it, in signatures too, so
+# a function over V[n] gets it in its `where` for each `V[n + d]` it uses
+# (shifted: `n + 1 + 1 <= 3` for `V[n + 1]`), and an own method of V for
+# each `V[Self.n + d]` (d != 0; V's bodies know it for Self.n); trait
+# methods, which can't have a `where`, don't take a `V[k]`. A third of a
+# struct's own methods with a value parameter k constrain it, `where k >=
+# 2`, which calls have to meet as a function's. A quarter of the type
+# parameters whose bound has associated types need a type equality,
+# `where T.E0 == S2` (or `S2 == T.E0`): Mojo checks it like a proposition
+# (a type argument's binding must be S2; a type parameter needs an equal
+# one known), and it gives the body nothing. The swhere mutant leaves out
+# a proposition a type in a signature needs; teq breaks a type equality;
+# the near misses use `V[n + 1]` in a signature (swhere), or rely on a
+# type equality written the other way round (teq).
+#
+# Extensions: half the structs declare some conformances in `__extension
+# S0(Tr1):` blocks instead, which hold the implementations only those
+# traits need, and a quarter put their own methods in a bare `__extension
+# S0:` block. Only traits with no constants or associated types (an
+# extension can't give them) qualify, and the struct implements every
+# default of a trait it gets only through an extension (an extension
+# doesn't inherit them, modular/modular#5607). The existing kinds cover
+# them (missing, sig, cap and raise_impl report at the struct).
+#
+# Keyword and default arguments: a third of the functions give their last
+# parameters (not `mut` ones, nor ones of types with parameters) defaults,
+# literals or constructors of structs without counted values (Mojo
+# evaluates a default once, at compile time, and materializes it at each
+# call without running a constructor), a third of those after `*,`
+# (keyword-only). Half the calls leave out half the defaulted parameters,
+# and a quarter write the arguments after a positional prefix by keyword
+# (`p2=`), half the time shuffled; the evaluator evaluates them as
+# written, as Mojo does. The kwarg mutant gets them wrong (an unknown
+# keyword, a duplicate, a required one left out, a positional one after a
+# keyword one); the near miss writes them out of order or skips a
+# default.
+#
 # Exceptions: half of the functions raise, `raises` (Error) or `raises
 # Xk` (X0, X1 are counted error types with a `code`), with `if c: raise
 # Xk(e)` in their bodies. A call of a raising function goes only where
@@ -230,6 +269,7 @@
 # check_rejected.sh (for example with a script that just echoes OK, to
 # check the generator alone).
 
+from std.collections import Dict
 from std.ffi import external_call
 from std.os import getenv
 from std.subprocess import run
@@ -518,7 +558,20 @@ comptime STAT_COND = 37
 """Calls of functions with a parameter of a conditional type."""
 comptime STAT_PACK = 38
 """Calls of variadic pack functions (forwarded ones too)."""
-comptime N_STATS = 39
+comptime STAT_TEQ = 39
+"""Calls of functions with a type equality in their `where` (`where
+T.E0 == S2`)."""
+comptime STAT_SWHERE = 40
+"""Calls of functions over a struct with a `where` of its own (`struct
+V[n: Int] where n > 0`)."""
+comptime STAT_KWHERE = 41
+"""Calls of methods with a `where` on their own value parameter (`def
+m[k: Int](self, p0: V[k]) where k >= 2`)."""
+comptime STAT_EXT = 42
+"""Calls of methods implemented in an `__extension` block."""
+comptime STAT_KWARG = 43
+"""Calls with a keyword argument, or using a default."""
+comptime N_STATS = 44
 comptime STAT_NAMES: List[String] = [
     "own",
     "required",
@@ -559,6 +612,11 @@ comptime STAT_NAMES: List[String] = [
     "guard_exit",
     "cond",
     "pack",
+    "teq",
+    "swhere",
+    "kwhere",
+    "ext",
+    "kwarg",
 ]
 
 # Stage 3: ill-typed mutants (DECL_FUZZ_MUTANTS=1). Each program gets one
@@ -692,7 +750,24 @@ W' to 'V[n]'"."""
 comptime MU_PACK_BOUND = 42
 """A call of a variadic pack function with an argument whose type doesn't
 conform to the pack's bound: "does not conform to trait"."""
-comptime N_MU = 43
+comptime MU_SWHERE = 43
+"""A type `V[x]` of a struct with a `where` of its own (`struct V[n: Int]
+where n > 0`) whose x fails it: a function whose signature uses `V[n +
+1]` without the `where` that gives evidence for it ("invalid bindings in
+signature: lacking evidence"), or an own method of V using `V[Self.n +
+1]` without one."""
+comptime MU_TEQ = 44
+"""A call of a function with a type equality in its `where` (`where T.E0
+== S2`) that breaks it: a type argument whose binding is another type
+("violated constraint"), or a type parameter without an equal known one
+("lacking evidence")."""
+comptime MU_KWARG = 45
+"""A call that gets its arguments wrong by keyword: an unknown one
+(`p7=`), one already given positionally, a required one left out, a
+keyword-only one given positionally ("unexpected keyword argument",
+"missing required argument"), or a positional one after a keyword one
+(a syntax error)."""
+comptime N_MU = 46
 comptime MU_NAMES: List[String] = [
     "type",
     "use_moved",
@@ -737,6 +812,9 @@ comptime MU_NAMES: List[String] = [
     "cond_arm",
     "cond_use",
     "pack_bound",
+    "swhere",
+    "teq",
+    "kwarg",
 ]
 comptime MU_ODDS = 6
 """Each chance to apply the mutation is taken 1 time in MU_ODDS."""
@@ -820,7 +898,20 @@ comptime NR_COND = 23
 """A value of a conditional type used as its arm's, under a `comptime if`
 on the proposition written in another form than the type's (`2 < n` for
 `n > 2`), or in a function whose `where` (or `comptime assert`) is it."""
-comptime N_NR = 24
+comptime NR_SWHERE = 24
+"""A signature using `V[n + 1]` (or `V[n - 1]`, `V[k + 1]`) of a struct
+with a `where` of its own, with the evidence that needs: the struct's
+proposition shifted, `where n + 1 > 0` for `where n > 0` (which isn't
+evidence for it)."""
+comptime NR_TEQ = 25
+"""A call of a function with a type equality in its `where` on a type
+parameter, whose evidence is the caller's `where` written the other way
+round (`S2 == T.E0` for `T.E0 == S2`)."""
+comptime NR_KWARG = 26
+"""A call whose keyword arguments are written in another order than the
+parameters', or skip a parameter with a default (`g0(x, p3=y)`): Mojo
+evaluates them as written."""
+comptime N_NR = 27
 comptime NR_NAMES: List[String] = [
     "disjoint",
     "read_alias",
@@ -846,6 +937,9 @@ comptime NR_NAMES: List[String] = [
     "own2",
     "try_move",
     "cond_refine",
+    "swhere",
+    "teq",
+    "kwarg",
 ]
 comptime MARK_NEAR = "@@N@@"
 """In generated text, marks the line of the near miss."""
@@ -983,6 +1077,14 @@ def has(lst: List[Int], x: Int) -> Bool:
     return False
 
 
+def has_later(order: List[Int], j: Int) -> Bool:
+    """Whether order has a parameter after j."""
+    for k in order:
+        if k > j:
+            return True
+    return False
+
+
 def index_of(lst: List[Int], x: Int) -> Int:
     for i in range(len(lst)):
         if lst[i] == x:
@@ -1104,6 +1206,9 @@ struct MethodDecl(Copyable):
     var vwhere: List[Prop]
     """For an own method of a struct with a value parameter, the
     propositions about `Self.n` (PARAM 0) in its `where`."""
+    var kwhere: List[Prop]
+    """For an own method with a value parameter k, the propositions about
+    k (PARAM k_index) in its `where`."""
     var raise_ty: Int
     """What it raises (as FnDecl.raise_ty). A struct's implementation of a
     trait's may raise nothing instead (StructDecl.impl_raises)."""
@@ -1157,6 +1262,16 @@ struct StructDecl(Copyable):
     that calls know what each raises)..."""
     var impl_raises: List[Int]
     """...and what each implementation raises: the trait's, or nothing."""
+    var swhere: List[Prop]
+    """For a valued struct, the propositions about n in its own `where`
+    (`struct V[n: Int] where n > 0`): every `V[x]` needs evidence for
+    them, with x for n, except in V's bodies (for `Self.n`)."""
+    var ext: List[Int]
+    """Declared conformances written in `__extension` blocks instead, one
+    each (`__extension S0(Tr1):`), with the implementations of the
+    methods only they give."""
+    var own_ext: Bool
+    """Whether its own methods are in a bare `__extension S0:` block."""
 
 
 @fieldwise_init
@@ -1185,6 +1300,18 @@ struct FnDecl(Copyable):
     var wparam: Int
     """Its type parameter that no parameter's type mentions (the last one,
     which calls write), or -1."""
+    var teq_x: List[Int]
+    """Per type parameter T, the trait x of a type equality in its `where`,
+    `T.E<x> == A` (opaque: it gives the body nothing), or -1..."""
+    var teq_a: List[Int]
+    """...A, a concrete type..."""
+    var teq_form: List[Int]
+    """...and how it's written: 0 `T.E<x> == A`, 1 `A == T.E<x>`."""
+    var defaults: List[Int]
+    """Per parameter, its default value (an expression of no variables,
+    default_expr), or -1; the ones with one are the last."""
+    var kwonly: Int
+    """The first keyword-only parameter (`*,` before it), or -1."""
 
 
 @fieldwise_init
@@ -1618,6 +1745,26 @@ struct Program(Movable):
     var vfacts_assert: List[Int]
     """...and those only its `comptime assert`s (or the `comptime if`s it's
     in) give."""
+    var tfacts: List[Int]
+    """While a function's body is drawn, the type equalities it knows
+    (teq_key), from its `where`."""
+    var tfacts_form: List[Int]
+    """...and how each is written (FnDecl.teq_form)."""
+    var sw_fn: Int
+    """For MU_SWHERE, the function (or own method, sw_meth) whose `where`
+    leaves out proposition sw_prop, which a type in its signature
+    needs..."""
+    var sw_meth: Int
+    var sw_prop: Int
+    var sw_near_fn: Int
+    """For NR_SWHERE, the function whose signature is the near miss."""
+    var ext_conforms_ok: Bool
+    """DECL_FUZZ_NO_EXT_CONFORMS_WORKAROUND: conforms_to sees a struct's
+    extensions."""
+    var kw_order: Dict[Int, List[Int]]
+    """For a call of a function written with keywords or leaving out
+    parameters with defaults, the parameter of each argument, as written
+    (the order Mojo evaluates them in)."""
     var cif_fn: Int
     """While a function with a value parameter has its body drawn, the
     function (for `comptime if`), else -1."""
@@ -1692,6 +1839,16 @@ struct Program(Movable):
         self.facts = []
         self.vfacts = []
         self.vfacts_assert = []
+        self.tfacts = []
+        self.tfacts_form = []
+        self.sw_fn = -1
+        self.sw_meth = -1
+        self.sw_prop = -1
+        self.sw_near_fn = -1
+        self.kw_order = Dict[Int, List[Int]]()
+        self.ext_conforms_ok = (
+            getenv("DECL_FUZZ_NO_EXT_CONFORMS_WORKAROUND") != ""
+        )
         self.cif_fn = -1
         self.vnot = []
         self.conds = []
@@ -2016,7 +2173,27 @@ struct Program(Movable):
         return (
             sd.cond >= 0
             and self.refines(sd.cond, t)
-            and self.conforms(self.targ[ty], sd.cond_req, bounds)
+            and self.cond_conforms(self.targ[ty], sd.cond_req, bounds)
+        )
+
+    def cond_conforms(self, ty: Int, t: Int, bounds: List[Int]) -> Bool:
+        """Whether `conforms_to(ty, t)` holds, in a `where` or a conditional
+        conformance: as conforms, but for a struct not through its
+        extensions (Mojo ignores those there, while a bound `T: Tr1`
+        accepts them, modular/modular#7833), unless
+        DECL_FUZZ_NO_EXT_CONFORMS_WORKAROUND=1."""
+        if self.tkind[ty] != STRUCT or not self.conforms(ty, t, bounds):
+            return self.conforms(ty, t, bounds)
+        ref sd = self.structs[self.tid[ty]]
+        if len(sd.ext) == 0 or self.ext_conforms_ok:
+            return True
+        for x in sd.traits:
+            if not has(sd.ext, x) and self.refines(x, t):
+                return True
+        return (
+            sd.cond >= 0
+            and self.refines(sd.cond, t)
+            and self.cond_conforms(self.targ[ty], sd.cond_req, bounds)
         )
 
     def sig_needs_where(mut self, s: Int, m: Int) -> Bool:
@@ -2037,6 +2214,15 @@ struct Program(Movable):
             return True
         if (kind == STRUCT or kind == ASSOC) and self.targ[ty] >= 0:
             return self.mentions_param(self.targ[ty])
+        return False
+
+    def symbolic(self, ty: Int) -> Bool:
+        """Whether ty mentions a parameter (`V[n + 1]` too)."""
+        var kind = self.tkind[ty]
+        if kind == PARAM or kind == COND or kind == OFF or kind == HOLE:
+            return True
+        if (kind == STRUCT or kind == ASSOC) and self.targ[ty] >= 0:
+            return self.symbolic(self.targ[ty])
         return False
 
     def cap_of_any(self, ty: Int) -> Int:
@@ -2212,7 +2398,11 @@ struct Program(Movable):
         var pool = self.type_pool(bounds, len(self.structs))
         for i in range(len(bounds)):
             if bounds[i] < 0:
-                pool += self.value_family(self.tid[self.fns[f].params[i]], i)
+                # (the parameter is V[n + c]: its struct is V)
+                pool += self.types_ok(
+                    self.value_family(self.tid[self.fns[f].params[i]], i),
+                    Self.keys_of(self.fns[f].vwhere, i),
+                )
         return pool^
 
     def fn_names(self, f: Int) -> List[String]:
@@ -2240,7 +2430,7 @@ struct Program(Movable):
                     out.append(self.targ[t])
         return out^
 
-    def targ_choices(self, ctx: Ctx, f: Int, i: Int) -> List[Int]:
+    def targ_choices(mut self, ctx: Ctx, f: Int, i: Int) -> List[Int]:
         """What parameter i of function f can be, where nothing fixes it."""
         var b = self.fns[f].bounds[i]
         if b < 0:
@@ -2258,7 +2448,9 @@ struct Program(Movable):
         var w = self.fns[f].wheres[i]
         var out = List[Int]()
         for t in self.conforming(ctx, b):
-            if w < 0 or self.conforms(t, w, ctx.bounds):
+            if (
+                w < 0 or self.cond_conforms(t, w, ctx.bounds)
+            ) and self.teq_holds(f, i, t):
                 out.append(t)
         return out^
 
@@ -2349,6 +2541,205 @@ struct Program(Movable):
         if len(self.methods[m].vwhere) == 0:
             return True
         return self.props_hold(self.methods[m].vwhere, self.targ[recv])
+
+    def kw_holds(self, m: Int, k: Int) -> Bool:
+        """Whether own method m's `where` on its value parameter holds for
+        k (as props_hold)."""
+        return self.props_hold(self.methods[m].kwhere, k)
+
+    @staticmethod
+    def shifted(props: List[Prop], d: Int) -> List[Prop]:
+        """These propositions with n + d for n."""
+        var out = List[Prop]()
+        for pr in props:
+            out.append(Prop(pr.c + d, pr.ge, pr.k, pr.form))
+        return out^
+
+    @staticmethod
+    def keys_of(props: List[Prop], p: Int) -> List[Int]:
+        """The keys of these propositions about PARAM p."""
+        var out = List[Int]()
+        for pr in props:
+            out.append(Self.prop_key(p, pr.c, pr.ge, pr.k))
+        return out^
+
+    def props_known(self, props: List[Prop], arg: Int, keys: List[Int]) -> Bool:
+        """Like props_hold, with these keys known (in a signature, only its
+        `where`)."""
+        var kind = self.tkind[arg]
+        if kind == VAL:
+            for pr in props:
+                if not Self.prop_holds(self.tid[arg], pr):
+                    return False
+            return True
+        var base = arg
+        var d = 0
+        if kind == OFF:
+            base = self.targ[arg]
+            d = self.tid[arg]
+        if self.tkind[base] != PARAM:
+            return False
+        for pr in props:
+            if not has(
+                keys, Self.prop_key(self.tid[base], d + pr.c, pr.ge, pr.k)
+            ):
+                return False
+        return True
+
+    def type_ok(self, ty: Int, keys: List[Int]) -> Bool:
+        """Whether every `V[x]` in ty meets V's own `where`, with these keys
+        known (a conditional type's proposition is known in its first
+        arm)."""
+        var kind = self.tkind[ty]
+        if kind == STRUCT and self.targ[ty] >= 0:
+            var st = self.tid[ty]
+            if self.structs[st].valued:
+                return self.props_known(
+                    self.structs[st].swhere, self.targ[ty], keys
+                )
+            return self.type_ok(self.targ[ty], keys)
+        if kind == ASSOC:
+            return self.type_ok(self.targ[ty], keys)
+        if kind == COND:
+            ref d = self.conds[self.tid[ty]]
+            var known = keys.copy()
+            if self.tkind[d.x] == PARAM:
+                known.append(Self.prop_key(self.tid[d.x], d.c, d.ge, d.k))
+            return self.type_ok(d.a, known) and self.type_ok(d.b, keys)
+        return True
+
+    def types_ok(self, tys: List[Int], keys: List[Int]) -> List[Int]:
+        """The types in tys that type_ok accepts."""
+        var out = List[Int]()
+        for t in tys:
+            if self.type_ok(t, keys):
+                out.append(t)
+        return out^
+
+    def ext_ok(self, t: Int) -> Bool:
+        """Whether a struct can conform to trait t in an `__extension`: no
+        trait t implies declares a constant or an associated type."""
+        for x in self.closure([t]):
+            if self.traits[x].has_k or self.traits[x].assoc >= 0:
+                return False
+        return True
+
+    def ext_only(self, s: Int) -> List[Int]:
+        """The traits struct s conforms to only through its extensions."""
+        var kept = List[Int]()
+        for t in self.structs[s].traits:
+            if not has(self.structs[s].ext, t):
+                kept.append(t)
+        if self.structs[s].cond >= 0:
+            kept.append(self.structs[s].cond)
+        var given = self.closure(kept)
+        var out = List[Int]()
+        for t in self.closure(self.structs[s].ext):
+            if not has(given, t):
+                out.append(t)
+        return out^
+
+    def ext_block(self, s: Int, m: Int) -> Int:
+        """The extension block of struct s holding its implementation of
+        trait method m (an index in ext), or -1 for the struct's body."""
+        var t = self.methods[m].trait_id
+        if t < 0 or not has(self.ext_only(s), t):
+            return -1
+        for i in range(len(self.structs[s].ext)):
+            if has(self.closure([self.structs[s].ext[i]]), t):
+                return i
+        return -1
+
+    def default_expr(
+        mut self, mut data: ConjectureData, t: Int, depth: Int
+    ) raises -> Int:
+        """A default value of type t, or -1: a literal, or a struct's
+        constructor over default values, of a struct that isn't counted
+        and holds no Res (Mojo evaluates a default at compile time and
+        materializes it at each call, without its constructor: a counted
+        value would be destroyed more often than made)."""
+        var kind = self.tkind[t]
+        if kind == INT:
+            var i = pick(data, len(self.literals))
+            return self.add(
+                E_LIT, self.literal_values[i], t, [], [], self.literals[i]
+            )
+        if kind != STRUCT or depth > 2:
+            return -1
+        var st = self.tid[t]
+        if self.structs[st].counted:
+            return -1
+        var kids = List[Int]()
+        for ft in self.fields_of(t):
+            var k = self.default_expr(data, ft, depth + 1)
+            if k < 0:
+                return -1
+            kids.append(k)
+        var text = String(
+            self.ty_str(t, [], -1), "(", self.args_text(kids, 0), ")"
+        )
+        return self.add(E_NEW, 0, t, kids^, [], text^)
+
+    def constrained(self, s: Int) -> Bool:
+        """Whether struct s has a `where` of its own."""
+        return len(self.structs[s].swhere) > 0
+
+    def draw_dset(
+        mut self, mut data: ConjectureData, s: Int, force: Int
+    ) raises -> List[Int]:
+        """The offsets d for which a signature over struct s's value
+        parameter n can use `V[n + d]`: 0, force (unless 0) and each of 1
+        and -1 half the time (both for the swhere kinds)."""
+        var out: List[Int] = [0]
+        var swhere_kind = self.mutant == MU_SWHERE or self.near == NR_SWHERE
+        for d in [1, -1]:
+            if d == force or swhere_kind or data.draw(booleans()):
+                out.append(d)
+        return out^
+
+    def dset_props(self, s: Int, dset: List[Int]) -> List[Prop]:
+        """Struct s's own `where`, shifted by each offset in dset."""
+        var out = List[Prop]()
+        for d in dset:
+            out += Self.shifted(self.structs[s].swhere, d)
+        return out^
+
+    # ---- type equalities in `where` (`T.E0 == S2`)
+
+    @staticmethod
+    def teq_key(lhs: Int, a: Int) -> Int:
+        return lhs * 1048576 + a
+
+    def teq_holds(mut self, f: Int, i: Int, t: Int) -> Bool:
+        """Whether t for function f's type parameter i meets its type
+        equality: a binding equal to A, or a symbolic one (`U.E0`) whose
+        equality is known (tfacts)."""
+        var x = self.fns[f].teq_x[i]
+        if x < 0:
+            return True
+        var lhs = self.assoc(x, t)
+        var a = self.fns[f].teq_a[i]
+        if not self.symbolic(lhs):
+            return lhs == a
+        return has(self.tfacts, Self.teq_key(lhs, a))
+
+    def teq_reversed(mut self, f: Int, i: Int, t: Int) -> Bool:
+        """Whether t meets function f's type equality only by one the
+        caller knows written the other way round (`S2 == U.E0`)."""
+        var x = self.fns[f].teq_x[i]
+        if x < 0 or t < 0:
+            return False
+        var lhs = self.assoc(x, t)
+        if not self.symbolic(lhs):
+            return False
+        var key = Self.teq_key(lhs, self.fns[f].teq_a[i])
+        for j in range(len(self.tfacts)):
+            if (
+                self.tfacts[j] == key
+                and self.tfacts_form[j] != self.fns[f].teq_form[i]
+            ):
+                return True
+        return False
 
     def reqs_on(self, s: Int, skip: Int) -> List[Prop]:
         """What a function with a value parameter of struct s (V[n]) would
@@ -2590,15 +2981,22 @@ struct Program(Movable):
                     assign[i], bounds[i], ctx.bounds
                 ):
                     return []
+                if bounds[i] < 0 and not self.kw_holds(m, assign[i]):
+                    return []
             elif len(self.own_choices(m, i, ctx)) == 0:
                 return []
         return assign^
 
     def own_choices(self, m: Int, i: Int, ctx: Ctx) -> List[Int]:
         """What generic method m's own parameter i can be where nothing
-        fixes it: a conforming type, or V's arguments in the pool."""
+        fixes it: a conforming type, or V's arguments in the pool that meet
+        its `where` on k."""
         if self.own_bounds(m)[i] < 0:
-            return self.value_args(ctx, self.methods[m].mvalue)
+            var out = List[Int]()
+            for v in self.value_args(ctx, self.methods[m].mvalue):
+                if self.kw_holds(m, v):
+                    out.append(v)
+            return out^
         return self.conforming(ctx, self.methods[m].mbound)
 
     def method_params(
@@ -2908,6 +3306,8 @@ struct Program(Movable):
         mut convs: List[Int],
         mut mbound: Int,
         mut mvalue: Int,
+        mut kwhere: List[Prop],
+        own_struct: Int = -1,
     ) raises -> Int:
         """A method's parameters (into params and convs) and result type,
         in a context with these bounds and extra types. A quarter of them
@@ -2920,10 +3320,16 @@ struct Program(Movable):
         their first parameter, `V[k]`), when some struct has one. A third
         of the generic ones (2/3 for the own2 kinds) have both, `[U: TrN,
         k: Int]` (PARAM 1 and 2; their first parameters are U and
-        `V[k]`)."""
+        `V[k]`). A struct's own method (of own_struct) with one has a
+        `where` on k a third of the time (2/3 for the vwhere kinds), into
+        kwhere, and, for a V with a `where` of its own, that one for each
+        `V[k + d]` it uses; a trait's can't (Mojo doesn't allow `where` on
+        trait methods), so its V has none."""
         var valued = List[Int]()
         for st in range(len(self.structs)):
-            if self.structs[st].valued:
+            if self.structs[st].valued and (
+                own_struct >= 0 or not self.constrained(st)
+            ):
                 valued.append(st)
         var own2_kind = self.mutant == MU_OWN2 or self.near == NR_OWN2
         var choice = data.draw(integers(0, 7))
@@ -2951,7 +3357,19 @@ struct Program(Movable):
         var pool = self.type_pool(bs, len(self.structs))
         pool += extra.copy()
         if mvalue >= 0:
-            pool += self.value_family(mvalue, kp)
+            if own_struct >= 0:
+                var vwhere_kind = (
+                    self.mutant == MU_VWHERE or self.near == NR_VWHERE
+                )
+                if data.draw(integers(0, 2)) < (2 if vwhere_kind else 1):
+                    kwhere.append(self.draw_prop(data, mvalue, -1))
+                if self.constrained(mvalue):
+                    kwhere += self.dset_props(
+                        mvalue, self.draw_dset(data, mvalue, 0)
+                    )
+            pool += self.types_ok(
+                self.value_family(mvalue, kp), Self.keys_of(kwhere, kp)
+            )
         if generic:
             var firsts = List[Int]()
             if mbound >= 0:
@@ -3013,6 +3431,10 @@ struct Program(Movable):
             s,
             self.offset(self.intern(PARAM, vi, -1), ds[pick(data, len(ds))]),
         )
+        # (for a V with a `where` of its own, an offset f's `where` gives
+        # evidence for)
+        if not self.type_ok(a, Self.keys_of(vwhere, vi)):
+            a = self.intern(STRUCT, s, self.intern(PARAM, vi, -1))
         var pool = self.type_pool([], n_structs)
         var b = pool[pick(data, len(pool))]
         return self.cond(
@@ -3064,7 +3486,10 @@ struct Program(Movable):
         var deinit_odds = 3 if (
             self.near == NR_DEINIT_DROP or self.near == NR_DEINIT_MOVE
         ) else 1
-        var assoc_kind = self.mutant == MU_ASSOC or self.near == NR_ASSOC
+        var teq_kind = self.mutant == MU_TEQ or self.near == NR_TEQ
+        var assoc_kind = (
+            self.mutant == MU_ASSOC or self.near == NR_ASSOC or teq_kind
+        )
         var exc_kind = self.exc_kind()
         self.exceptions = not (
             self.mutant == MU_MUT_UNINIT
@@ -3115,6 +3540,7 @@ struct Program(Movable):
                         -1,
                         -1,
                         [],
+                        [],
                         -1,
                     )
                 )
@@ -3133,11 +3559,13 @@ struct Program(Movable):
         var n_structs = data.draw(integers(1, 5))
         var vwhere_kind = self.mutant == MU_VWHERE or self.near == NR_VWHERE
         var cond_kind = self.cond_kind()
+        var swhere_kind = self.mutant == MU_SWHERE or self.near == NR_SWHERE
         var value_kind = (
             self.mutant == MU_VALUE
             or self.near == NR_VALUE_EXPR
             or vwhere_kind
             or cond_kind
+            or swhere_kind
         )
         var where_kind = (
             self.mutant == MU_WHERE
@@ -3163,6 +3591,26 @@ struct Program(Movable):
                         )
                     if not has(values, k):
                         values.append(k)
+            # a `where` of its own for a quarter of them (3/4 for the
+            # swhere kinds), true of every value it's used with
+            var swhere = List[Prop]()
+            if valued and data.draw(integers(0, 3)) < (3 if swhere_kind else 1):
+                var lo = values[0]
+                var hi = values[0]
+                for v in values:
+                    lo = min(lo, v)
+                    hi = max(hi, v)
+                var c = data.draw(integers(-1, 1))
+                var ge = data.draw(booleans())
+                var j = data.draw(integers(0, 1))
+                swhere.append(
+                    Prop(
+                        c,
+                        ge,
+                        lo + c - j if ge else hi + c + j,
+                        data.draw(integers(0, 3)),
+                    )
+                )
             var bound = pick(data, n_traits) if generic else -1
             var bounds = [bound] if generic else List[Int]()
             var cap_max = self.traits[bound].cap if generic else CAP_IC
@@ -3216,6 +3664,23 @@ struct Program(Movable):
                     else:
                         cond_req = pick(data, n_traits)
             var cond_where = where_kind or data.draw(booleans())
+            # half the structs declare some conformances in `__extension`
+            # blocks (3/4 of the traits that can be: an extension can't
+            # bind an associated type or a constant, nor give a trait's
+            # default implementations, modular/modular#5607)
+            var ext = List[Int]()
+            # (not for a struct with a `where` of its own: an extension's
+            # bodies and signatures don't know it, "lacking evidence" for
+            # `Self(...)`, V's methods, `V[Self.n]`, modular/modular#7832,
+            # unless DECL_FUZZ_NO_EXT_WHERE_WORKAROUND=1)
+            var ext_where_ok = (
+                len(swhere) == 0
+                or getenv("DECL_FUZZ_NO_EXT_WHERE_WORKAROUND") != ""
+            )
+            if data.draw(booleans()) and ext_where_ok:
+                for t in traits:
+                    if self.ext_ok(t) and data.draw(integers(0, 3)) > 0:
+                        ext.append(t)
             var all_traits = traits.copy()
             if cond >= 0:
                 all_traits.append(cond)
@@ -3267,6 +3732,9 @@ struct Program(Movable):
                     [],
                     [],
                     [],
+                    swhere^,
+                    ext^,
+                    data.draw(integers(0, 3)) == 0 and ext_where_ok,
                 )
             )
 
@@ -3309,6 +3777,7 @@ struct Program(Movable):
                 var convs = List[Int]()
                 var mbound = -1
                 var mvalue = -1
+                var kwhere = List[Prop]()
                 var ret = self.draw_signature(
                     data,
                     [t],
@@ -3319,6 +3788,7 @@ struct Program(Movable):
                     convs,
                     mbound,
                     mvalue,
+                    kwhere,
                 )
                 self.methods.append(
                     MethodDecl(
@@ -3338,6 +3808,7 @@ struct Program(Movable):
                         mbound,
                         mvalue,
                         [],
+                        [],
                         self.draw_method_raise(data, self_conv, exc_kind),
                     )
                 )
@@ -3349,9 +3820,6 @@ struct Program(Movable):
                 s
             ].generic else List[Int]()
             var own_ty = self.self_type(s)
-            var extra = List[Int]()
-            if self.structs[s].valued:
-                extra = self.value_family(s, 0)
             for _ in range(data.draw(integers(0, 2))):
                 var m = len(self.methods)
                 var self_conv = (
@@ -3367,6 +3835,26 @@ struct Program(Movable):
                 var convs = List[Int]()
                 var mbound = -1
                 var mvalue = -1
+                # a quarter of a valued struct's own methods (half for the
+                # vwhere kinds) need `where Self.n + c >= k` (or `<=`); for
+                # a V with a `where` of its own, the ones using `V[Self.n
+                # + d]` (d != 0) need it for Self.n + d (V's bodies know it
+                # for Self.n)
+                var mwhere = List[Prop]()
+                var extra = List[Int]()
+                if self.structs[s].valued:
+                    if data.draw(integers(0, 3)) < (2 if vwhere_kind else 1):
+                        mwhere.append(self.draw_prop(data, s, -1))
+                    if self.constrained(s):
+                        for d in self.draw_dset(data, s, 0):
+                            if d != 0:
+                                mwhere += Self.shifted(
+                                    self.structs[s].swhere, d
+                                )
+                    var keys = Self.keys_of(self.structs[s].swhere, 0)
+                    keys += Self.keys_of(mwhere, 0)
+                    extra = self.types_ok(self.value_family(s, 0), keys)
+                var kwhere = List[Prop]()
                 var ret = self.draw_signature(
                     data,
                     bounds,
@@ -3377,14 +3865,9 @@ struct Program(Movable):
                     convs,
                     mbound,
                     mvalue,
+                    kwhere,
+                    s,
                 )
-                # a quarter of a valued struct's own methods (half for the
-                # vwhere kinds) need `where Self.n + c >= k` (or `<=`)
-                var mwhere = List[Prop]()
-                if self.structs[s].valued and data.draw(integers(0, 3)) < (
-                    2 if vwhere_kind else 1
-                ):
-                    mwhere.append(self.draw_prop(data, s, -1))
                 self.methods.append(
                     MethodDecl(
                         String("m", m),
@@ -3401,6 +3884,7 @@ struct Program(Movable):
                         mbound,
                         mvalue,
                         mwhere^,
+                        kwhere^,
                         self.draw_method_raise(data, self_conv, exc_kind),
                     )
                 )
@@ -3413,9 +3897,11 @@ struct Program(Movable):
         for s in range(n_structs):
             if self.structs[s].valued:
                 valued_structs.append(s)
-        for f in range(data.draw(integers(2 if vwhere_kind else 0, 3))):
+        for f in range(
+            data.draw(integers(2 if vwhere_kind or teq_kind else 0, 3))
+        ):
             var bounds = List[Int]()
-            for _ in range(data.draw(integers(0, 2))):
+            for _ in range(data.draw(integers(1 if teq_kind else 0, 2))):
                 bounds.append(pick(data, n_traits))
             # a value parameter for half of them (3/4 for the value kinds)
             var vi = -1
@@ -3432,8 +3918,18 @@ struct Program(Movable):
                     bounds.insert(vi, -1)
             var pool = self.type_pool(bounds, n_structs)
             var own_ty = -1
+            # (over a V with a `where` of its own, `V[n + d]` for the
+            # offsets in dset, whose `where` it gets, shifted)
+            var dset: List[Int] = [0, 1, -1]
+            var fam = List[Int]()
             if vi >= 0:
-                pool += self.value_family(vs, vi)
+                if self.constrained(vs):
+                    dset = self.draw_dset(data, vs, 0)
+                fam = self.types_ok(
+                    self.value_family(vs, vi),
+                    Self.keys_of(self.dset_props(vs, dset), vi),
+                )
+                pool += fam.copy()
                 own_ty = self.intern(STRUCT, vs, self.intern(PARAM, vi, -1))
             elif len(bounds) > 0:
                 own_ty = self.p0_ty
@@ -3451,22 +3947,41 @@ struct Program(Movable):
             if vi >= 0 and data.draw(integers(0, 3)) < (
                 2 if self.mutant == MU_INFER else 1
             ):
+                var d = 1 if data.draw(booleans()) else -1
                 params[vi] = self.intern(
-                    STRUCT,
-                    vs,
-                    self.offset(
-                        self.intern(PARAM, vi, -1),
-                        1 if data.draw(booleans()) else -1,
-                    ),
+                    STRUCT, vs, self.offset(self.intern(PARAM, vi, -1), d)
                 )
+                if not has(dset, d):
+                    dset.append(d)
+                    fam.append(params[vi])
+                    pool.append(params[vi])
+            # NR_SWHERE: a parameter `V[n + d]` (d != 0), V with a `where`
+            # of its own
+            if vi >= 0 and self.constrained(vs) and self.wants_near(NR_SWHERE):
+                var ds = List[Int]()
+                for d in dset:
+                    if d != 0:
+                        ds.append(d)
+                if len(ds) > 0:
+                    var d = ds[pick(data, len(ds))]
+                    params.append(
+                        self.intern(
+                            STRUCT,
+                            vs,
+                            self.offset(self.intern(PARAM, vi, -1), d),
+                        )
+                    )
+                    convs.append(CONV_READ)
+                    self.sw_near_fn = f
+                    self.near_made = True
             for _ in range(data.draw(integers(0, 2))):
                 params.append(self.draw_sig_type(data, pool, own_ty))
                 convs.append(draw_conv(data, mut_often))
             # (rising for the vwhere kinds: a function's `where` is drawn for
             # calling the earlier ones)
-            var rank = min(f + 1, MAX_RANK) if vwhere_kind else data.draw(
-                integers(0, MAX_RANK)
-            )
+            var rank = min(f + 1, MAX_RANK) if (
+                vwhere_kind or teq_kind
+            ) else data.draw(integers(0, MAX_RANK))
             # a sixth (half for the infer mutant) take one more type
             # parameter, W, that no parameter mentions, so calls write it:
             # its bound has a make the body can build W values with
@@ -3485,8 +4000,7 @@ struct Program(Movable):
                     wparam = len(bounds)
                     bounds.append(ws[pick(data, len(ws))])
                     pool = self.type_pool(bounds, n_structs)
-                    if vi >= 0:
-                        pool += self.value_family(vs, vi)
+                    pool += fam.copy()
             # half raise (3/4 for the exception kinds): `raises` (Error) or
             # `raises Xk`
             var raise_ty = -1
@@ -3512,6 +4026,66 @@ struct Program(Movable):
                     if len(ws) > 0:
                         w = ws[pick(data, len(ws))]
                 wheres.append(w)
+            # a quarter of the type parameters whose bound has associated
+            # types (half for the teq kinds) also need `where T.E<x> == A`:
+            # A the binding of a concrete type that conforms, or half the
+            # time one another function needs (so that it can call that
+            # one with T)
+            var teq_x = List[Int]()
+            var teq_a = List[Int]()
+            var teq_form = List[Int]()
+            for i in range(len(bounds)):
+                var x = -1
+                var a = -1
+                var form = pick(data, 2)
+                if bounds[i] >= 0 and data.draw(integers(0, 3)) < (
+                    4 if teq_kind else 1
+                ):
+                    var cx = List[Int]()
+                    var ca = List[Int]()
+                    var closure = self.closure([bounds[i]])
+                    var cf = List[Int]()
+                    for g in range(len(self.fns)):
+                        for j in range(len(self.fns[g].teq_x)):
+                            var gx = self.fns[g].teq_x[j]
+                            if gx >= 0 and has(closure, gx):
+                                cx.append(gx)
+                                ca.append(self.fns[g].teq_a[j])
+                                cf.append(self.fns[g].teq_form[j])
+                    # (the teq near miss: copied, written the other way
+                    # round)
+                    var near = self.near == NR_TEQ and len(cx) > 0
+                    if near:
+                        var c = pick(data, len(cx))
+                        x = cx[c]
+                        a = ca[c]
+                        form = 1 - cf[c]
+                        cx = []
+                    elif len(cx) == 0 or data.draw(booleans()):
+                        cx = []
+                        ca = []
+                        for t in self.type_pool([], n_structs):
+                            if not self.conforms(t, bounds[i], []) or (
+                                wheres[i] >= 0
+                                and not self.conforms(t, wheres[i], [])
+                            ):
+                                continue
+                            for y in closure:
+                                if self.traits[y].assoc < 0:
+                                    continue
+                                var b = self.assoc(y, t)
+                                if self.tkind[b] != ASSOC and not self.symbolic(
+                                    b
+                                ):
+                                    cx.append(y)
+                                    ca.append(b)
+                    if len(cx) > 0:
+                        var c = pick(data, len(cx))
+                        x = cx[c]
+                        a = ca[c]
+                teq_x.append(x)
+                teq_a.append(a)
+                teq_form.append(form)
             # half of the value parameters need `where n + c >= k` (or
             # `<=`; 3/4 for the vwhere kinds), with perhaps a `comptime
             # assert` it implies in the body
@@ -3538,6 +4112,8 @@ struct Program(Movable):
                     asserts.append(r^)
                 elif data.draw(integers(0, 2)) < (2 if vwhere_kind else 1):
                     asserts.append(self.draw_assert(data, vwhere, vs, f))
+            if vi >= 0 and self.constrained(vs):
+                vwhere += self.dset_props(vs, dset)
             # a third of them (2/3 for the cond kinds) take a value of a
             # conditional type
             if vi >= 0 and data.draw(integers(0, 2)) < (2 if cond_kind else 1):
@@ -3554,6 +4130,26 @@ struct Program(Movable):
                 ):
                     conv = CONV_READ
                 convs.append(conv)
+            # a third of the functions (2/3 for the kwarg kinds) give the
+            # last of their other parameters defaults (not `mut` ones, nor
+            # ones of types with parameters), a third of those keyword-only
+            var defaults = List[Int](length=len(params), fill=-1)
+            var kwonly = -1
+            var kwarg_kind = self.mutant == MU_KWARG or self.near == NR_KWARG
+            if data.draw(integers(0, 2)) < (2 if kwarg_kind else 1):
+                var j = len(params) - 1
+                var want = data.draw(integers(1, 3))
+                while j >= len(bounds) and want > 0:
+                    if convs[j] == CONV_MUT or self.symbolic(params[j]):
+                        break
+                    var e = self.default_expr(data, params[j], 0)
+                    if e < 0:
+                        break
+                    defaults[j] = e
+                    want -= 1
+                    j -= 1
+                if j < len(params) - 1 and data.draw(integers(0, 2)) == 0:
+                    kwonly = j + 1
             self.fns.append(
                 FnDecl(
                     String("g", f),
@@ -3568,6 +4164,11 @@ struct Program(Movable):
                     vwhere^,
                     asserts^,
                     wparam,
+                    teq_x^,
+                    teq_a^,
+                    teq_form^,
+                    defaults^,
+                    kwonly,
                 )
             )
         # variadic pack functions, in 3/4 of the programs (all for
@@ -3813,6 +4414,16 @@ struct Program(Movable):
                 out.append(k)
         return out^
 
+    def temp_field(self, e: Int) -> Bool:
+        """Whether e is a field of a temporary (`Q(...).y`, `(a if c else
+        b).f1_ref()`), or a ternary with one."""
+        ref x = self.exprs[e]
+        if x.kind == E_FIELD:
+            return not self.is_place(x.kids[0])
+        if x.kind == E_TERN:
+            return self.temp_field(x.kids[2]) or self.temp_field(x.kids[3])
+        return False
+
     def is_place(self, e: Int) -> Bool:
         """Whether e is a place: a variable, a field of a place, or a
         ternary of places."""
@@ -4030,10 +4641,68 @@ struct Program(Movable):
                 self.mutated = False
         return self.gen(data, ctx, ty, size, pos, False, stmt_root)
 
+    def sw_needed(
+        self, tys: List[Int], keys: List[Int], j: Int, base: List[Int]
+    ) -> Bool:
+        """Whether proposition j of a `where` (keys) is the only evidence a
+        type in tys (not a conditional type) has, with base known too."""
+        var rest = base.copy()
+        for i in range(len(keys)):
+            if i != j:
+                rest.append(keys[i])
+        if has(rest, keys[j]):
+            return False
+        for t in tys:
+            if self.tkind[t] != COND and not self.type_ok(t, rest):
+                return True
+        return False
+
     def mutate_declarations(mut self, mut data: ConjectureData) raises:
         """The mutations of declarations, made after the bodies are drawn:
-        MU_REF_ORIGIN, MU_MISSING, MU_SIG and MU_CAP."""
+        MU_REF_ORIGIN, MU_MISSING, MU_SIG, MU_CAP and MU_SWHERE."""
         var kind = self.mutant
+        if kind == MU_SWHERE:
+            # a proposition of a `where` (a function's, or an own
+            # method's on Self.n or k) that a type written in the signature
+            # (`V[n + 1]`, not in a conditional type) needs and nothing
+            # else known gives: f * 64 + j, or -(m * 64 + j) - 1 for a
+            # method
+            var cands = List[Int]()
+            for f in range(len(self.fns)):
+                var vi = self.vw_fn_index(f)
+                if vi < 0:
+                    continue
+                var tys = self.fns[f].params.copy()
+                tys.append(self.fns[f].ret)
+                var keys = Self.keys_of(self.fns[f].vwhere, vi)
+                for j in range(len(keys)):
+                    if self.sw_needed(tys, keys, j, []):
+                        cands.append(f * 64 + j)
+            for m in range(len(self.methods)):
+                var st = self.methods[m].struct_id
+                if st < 0:
+                    continue
+                var tys = self.methods[m].params.copy()
+                tys.append(self.methods[m].ret)
+                var keys = Self.keys_of(self.methods[m].vwhere, 0)
+                keys += Self.keys_of(self.methods[m].kwhere, self.k_index(m))
+                var base = List[Int]()
+                if self.structs[st].valued:
+                    base = Self.keys_of(self.structs[st].swhere, 0)
+                for j in range(len(keys)):
+                    if self.sw_needed(tys, keys, j, base):
+                        cands.append(-(m * 64 + j) - 1)
+            if len(cands) == 0:
+                return
+            var c = cands[pick(data, len(cands))]
+            if c >= 0:
+                self.sw_fn = c // 64
+                self.sw_prop = c % 64
+            else:
+                self.sw_meth = (-c - 1) // 64
+                self.sw_prop = (-c - 1) % 64
+            self.mutated = True
+            return
         if kind == MU_REF_ORIGIN:
             # (struct * 64 + field) of an accessor; its origin becomes
             # `self` or another field
@@ -4274,6 +4943,18 @@ struct Program(Movable):
         )
         return ctx^
 
+    def body_keys(self, s: Int, m: Int) -> List[Int]:
+        """What struct s's body of method m knows about the value
+        parameters: s's own `where` (Self.n, PARAM 0), and an own method's
+        `where` on Self.n and k."""
+        var keys = List[Int]()
+        if self.structs[s].valued:
+            keys = Self.keys_of(self.structs[s].swhere, 0)
+        if self.methods[m].struct_id == s:
+            keys += Self.keys_of(self.methods[m].vwhere, 0)
+            keys += Self.keys_of(self.methods[m].kwhere, self.k_index(m))
+        return keys^
+
     def self_type(mut self, s: Int) -> Int:
         if self.structs[s].generic or self.structs[s].valued:
             return self.intern(STRUCT, s, self.p0_ty)
@@ -4309,10 +4990,14 @@ struct Program(Movable):
             if rename:
                 self.near_made = True
         var pool = self.type_pool(bounds, len(self.structs))
+        var keys = self.body_keys(s, m)
         if valued:
-            pool += self.value_family(s, 0)
+            pool += self.types_ok(self.value_family(s, 0), keys)
         if self.methods[m].mvalue >= 0:
-            pool += self.value_family(self.methods[m].mvalue, self.k_index(m))
+            pool += self.types_ok(
+                self.value_family(self.methods[m].mvalue, self.k_index(m)),
+                keys,
+            )
         var ctx = Ctx(
             bounds^,
             names^,
@@ -4555,10 +5240,15 @@ struct Program(Movable):
             var all_traits = self.structs[s].traits.copy()
             if self.structs[s].cond >= 0:
                 all_traits.append(self.structs[s].cond)
+            # (an extension doesn't get a trait's defaults, #5607: its
+            # struct implements them all)
+            var ext_only = self.ext_only(s)
             for t in self.closure(all_traits):
                 for m in self.traits[t].methods.copy():
-                    if self.methods[m].has_default and not data.draw(
-                        booleans()
+                    if (
+                        self.methods[m].has_default
+                        and not has(ext_only, t)
+                        and not data.draw(booleans())
                     ):
                         continue
                     var r = self.methods[m].raise_ty
@@ -4626,7 +5316,10 @@ struct Program(Movable):
                 var ctx = self.struct_ctx(data, s, m)
                 var ret = self.body_ret(s, m)
                 self.start_body(s, m)
+                # (V's `where` is known in its bodies)
+                self.vfacts = self.body_keys(s, m)
                 var b = self.gen_body(data, ctx^, ret)
+                self.vfacts = []
                 self.facts = []
                 self.structs[s].impl_methods.append(m)
                 self.structs[s].impl_bodies.append(b)
@@ -4639,9 +5332,8 @@ struct Program(Movable):
                 var ctx = self.struct_ctx(data, s, m)
                 var ret = self.methods[m].ret
                 self.start_body(s, m)
-                # (its `where` is known in its body)
-                for pr in self.methods[m].vwhere:
-                    self.vfacts.append(Self.prop_key(0, pr.c, pr.ge, pr.k))
+                # (its `where` is known in its body, and V's)
+                self.vfacts = self.body_keys(s, m)
                 self.methods[m].body = self.gen_body(data, ctx^, ret)
                 self.vfacts = []
             self.alias_ty = -1
@@ -4702,6 +5394,14 @@ struct Program(Movable):
             var vi = self.vw_fn_index(f)
             for pr in self.fns[f].vwhere:
                 self.vfacts.append(Self.prop_key(vi, pr.c, pr.ge, pr.k))
+            self.tfacts = []
+            self.tfacts_form = []
+            for i in range(len(self.fns[f].teq_x)):
+                var x = self.fns[f].teq_x[i]
+                if x >= 0:
+                    var lhs = self.assoc(x, self.intern(PARAM, i, -1))
+                    self.tfacts.append(Self.teq_key(lhs, self.fns[f].teq_a[i]))
+                    self.tfacts_form.append(self.fns[f].teq_form[i])
             for pr in self.fns[f].asserts:
                 var key = Self.prop_key(vi, pr.c, pr.ge, pr.k)
                 if not has(self.vfacts, key):
@@ -4720,6 +5420,8 @@ struct Program(Movable):
             self.facts = []
             self.vfacts = []
             self.vfacts_assert = []
+            self.tfacts = []
+            self.tfacts_form = []
             self.vnot = []
             self.refined = []
             self.cif_fn = -1
@@ -7752,6 +8454,20 @@ struct Program(Movable):
         elif form == 1:
             var ty = structs[pick(data, len(structs))]
             var e = self.rvalue_subject(data, ctx, ty)
+            # (a guard's later clause on a field of a temporary, binding by
+            # reference, fails to build at -O0, "operand #0 does not
+            # dominate this use", modular/modular#7690: there it's copied,
+            # unless DECL_FUZZ_NO_GUARD_FIELD_WORKAROUND=1)
+            if (
+                in_guard
+                and not first
+                and self.temp_field(e)
+                and getenv("DECL_FUZZ_NO_GUARD_FIELD_WORKAROUND") == ""
+            ):
+                if self.cap_of(ty, ctx.bounds) < CAP_C:
+                    raise Error("STUCK")
+                var text = String(self.exprs[e].text, ".copy()")
+                e = self.add(E_COPY, 0, ty, [e], [], text^)
             var p = self.subject_pattern(data, ctx, ty, False, binds)
             cl = Clause(CL_CASE, 0, p, -1, -1, [e], "")
         else:
@@ -8469,7 +9185,7 @@ struct Program(Movable):
             if self.structs[st].cond < 0 or not self.structs[st].cond_where:
                 continue
             var req = self.structs[st].cond_req
-            var holds = self.conforms(self.targ[r], req, ctx.bounds)
+            var holds = self.cond_conforms(self.targ[r], req, ctx.bounds)
             if holds == bad:
                 continue
             for m in self.structs[st].impl_methods.copy():
@@ -8754,6 +9470,28 @@ struct Program(Movable):
                     if us[i] < 0:
                         var ok = self.own_choices(m, i, ctx)
                         us[i] = ok[pick(data, len(ok))]
+            # MU_VWHERE: a k that breaks an own method's `where` on it (not
+            # when the result's type would change); NR_VWHERE: one only a
+            # `comptime assert` gives evidence for
+            if ki >= 0 and len(self.methods[m].kwhere) > 0:
+                if (
+                    self.wants(MU_VWHERE)
+                    and not self.in_branch(ctx)
+                    and not self.mentions(self.methods[m].ret, ki + 1)
+                ):
+                    var cands = List[Int]()
+                    for v in self.value_args(ctx, self.methods[m].mvalue):
+                        if not self.kw_holds(m, v):
+                            cands.append(v)
+                    if len(cands) > 0 and self.chance(data, MU_VWHERE):
+                        us[ki] = cands[pick(data, len(cands))]
+                        self.mutated = True
+                        wrong = True
+                elif self.props_by_assert(
+                    self.methods[m].kwhere, us[ki]
+                ) and self.near_chance(data, NR_VWHERE):
+                    name = String(MARK_NEAR, name)
+                    self.near_made = True
             if ki >= 0 and self.wants(MU_VALUE):
                 # another value explicitly: `x.m[k + d](...)`
                 if self.chance(data, MU_VALUE):
@@ -8905,9 +9643,20 @@ struct Program(Movable):
                     pick(data, len(tys) + 1), unfit[pick(data, len(unfit))]
                 )
                 bad = True
+            # (no mutant that changes an argument's type: a pack takes
+            # any type conforming to its bound, so `V0[6](...)` for a
+            # `V0[4]` would be accepted)
+            var mutant = self.mutant
+            if mutant == MU_VALUE or mutant == MU_TYPE:
+                self.mutant = -1
             var kids = List[Int]()
-            for t in tys:
-                kids.append(self.gen_typed(data, ctx, t, half, P_READ))
+            try:
+                for t in tys:
+                    kids.append(self.gen_typed(data, ctx, t, half, P_READ))
+            except err:
+                self.mutant = mutant
+                raise err^
+            self.mutant = mutant
             var text = String("pk", j, "(", self.args_text(kids, 0), ")")
             var e = self.add(E_PACK, j, ty, kids^, [], text^)
             return self.mark(e) if bad else e
@@ -8934,10 +9683,51 @@ struct Program(Movable):
                                 by_assert.append(v)
                         if len(by_assert) > 0:
                             ok = by_assert^
+                    # (the teq near miss, one whose evidence is written
+                    # the other way round)
+                    if self.wants_near(NR_TEQ):
+                        var rev = List[Int]()
+                        for t in ok:
+                            if self.teq_reversed(f, i, t):
+                                rev.append(t)
+                        if len(rev) > 0:
+                            ok = rev^
                     targs[i] = ok[pick(data, len(ok))]
-        # MU_BOUND: a type argument that doesn't conform, (i, type)
+        var tnear = False
+        if self.wants_near(NR_TEQ):
+            for i in range(n_tp):
+                if self.teq_reversed(f, i, targs[i]):
+                    tnear = self.near_chance(data, NR_TEQ)
+                    break
+        # MU_TEQ: a type argument that fails the function's type equality
+        # (one with another binding, or a type parameter without evidence)
         var bad_i = -1
         var bad_t = -1
+        if (
+            n_tp > 0
+            and self.wants(MU_TEQ)
+            and not self.in_branch(ctx)
+            and not self.in_const_if(ctx)
+        ):
+            var cands = List[Int]()
+            for i in range(n_tp):
+                var b = self.fns[f].bounds[i]
+                if b < 0 or self.fns[f].teq_x[i] < 0:
+                    continue
+                var w = self.fns[f].wheres[i]
+                for t in ctx.pool:
+                    if (
+                        self.conforms(t, b, ctx.bounds)
+                        and (w < 0 or self.cond_conforms(t, w, ctx.bounds))
+                        and not self.teq_holds(f, i, t)
+                    ):
+                        cands.append(i * 1024 + t)
+            if len(cands) > 0 and self.chance(data, MU_TEQ):
+                var x = cands[pick(data, len(cands))]
+                bad_i = x // 1024
+                bad_t = x % 1024
+                self.mutated = True
+        # MU_BOUND: a type argument that doesn't conform, (i, type)
         if n_tp > 0 and self.wants(MU_BOUND):
             var cands = List[Int]()
             for i in range(n_tp):
@@ -8970,7 +9760,7 @@ struct Program(Movable):
                     if self.cond_only(t, b, ctx.bounds) or (
                         w >= 0
                         and self.conforms(t, b, ctx.bounds)
-                        and not self.conforms(t, w, ctx.bounds)
+                        and not self.cond_conforms(t, w, ctx.bounds)
                     ):
                         cands.append(i * 1024 + t)
             if len(cands) > 0 and self.chance(data, MU_WHERE):
@@ -9085,7 +9875,27 @@ struct Program(Movable):
                 self.mutated = True
         var mut_call = has(convs, CONV_MUT)
         var mutated_before = self.mutated
-        var kids = self.gen_args(data, ctx, params, convs, half, mut_call)
+        # half the calls leave out half the parameters with defaults (not
+        # the cond_use mutant's)
+        var given = List[Bool](length=len(params), fill=True)
+        var dflt = self.fns[f].defaults.copy()
+        if data.draw(booleans()):
+            for j in range(len(params)):
+                if dflt[j] >= 0 and j != use_j and data.draw(booleans()):
+                    given[j] = False
+        var gparams = List[Int]()
+        var gconvs = List[Int]()
+        for j in range(len(params)):
+            if given[j]:
+                gparams.append(params[j])
+                gconvs.append(convs[j])
+        var gkids = self.gen_args(data, ctx, gparams, gconvs, half, mut_call)
+        var kids = List[Int](length=len(params), fill=-1)
+        var gi = 0
+        for j in range(len(params)):
+            if given[j]:
+                kids[j] = gkids[gi]
+                gi += 1
         if use_j >= 0:
             var e = self.spell(data, ctx, use_v, -1)
             var vt = ctx.types[use_v]
@@ -9141,13 +9951,141 @@ struct Program(Movable):
                         f, i, bad_t if i == bad_i else targs[i], ctx
                     )
                 text += "]"
-        text += String("(", self.args_text(kids, 0), ")")
-        var e = self.add(E_CALL, f, ty, kids^, targs^, text^)
-        if vnear:
+        # the arguments as written: a positional prefix, then keywords
+        var order = List[Int]()
+        var q = self.call_order(data, f, given, order)
+        var kw_bad = False
+        var args = self.call_args_text(data, ctx, f, kids, order, q, kw_bad)
+        text += String("(", args, ")")
+        var ekids = List[Int]()
+        for j in order:
+            ekids.append(kids[j])
+        var e = self.add(E_CALL, f, ty, ekids^, targs^, text^)
+        var identity = len(order) == len(params)
+        for i in range(len(order)):
+            if order[i] != i:
+                identity = False
+        if not identity:
+            self.kw_order[e] = order.copy()
+        var knear = False
+        if not identity and self.wants_near(NR_KWARG):
+            var out_of_order = False
+            for i in range(q + 1, len(order)):
+                if order[i] < order[i - 1]:
+                    out_of_order = True
+            var gap = False
+            for j in range(len(params)):
+                if not given[j] and has_later(order, j):
+                    gap = True
+            if out_of_order or gap:
+                knear = True
+        if vnear or tnear or knear:
             return self.mark_near(e)
         return self.mark(e) if (
-            bad_i >= 0 or vbad or no_infer or cond_bad or use_j >= 0
+            bad_i >= 0 or vbad or no_infer or cond_bad or use_j >= 0 or kw_bad
         ) else e
+
+    def call_order(
+        self,
+        mut data: ConjectureData,
+        f: Int,
+        given: List[Bool],
+        mut order: List[Int],
+    ) raises -> Int:
+        """The order a call of function f writes the parameters given in
+        (into order), and how many of them are positional: a prefix up to
+        the first left out or keyword-only one; in a quarter of the calls
+        (half for the kwarg kinds, all when a later one is given) the
+        others by keyword, half the time shuffled."""
+        var n = len(given)
+        var kwonly = self.fns[f].kwonly
+        if kwonly < 0:
+            kwonly = n
+        var gs = List[Int]()
+        for j in range(n):
+            if given[j]:
+                gs.append(j)
+        var maxq = 0
+        while maxq < n and given[maxq] and maxq < kwonly:
+            maxq += 1
+        var kwarg_kind = self.mutant == MU_KWARG or self.near == NR_KWARG
+        var q = maxq
+        if maxq < len(gs) or data.draw(integers(0, 3)) < (
+            2 if kwarg_kind else 1
+        ):
+            q = data.draw(integers(0, maxq))
+        for i in range(q):
+            order.append(gs[i])
+        var rest = List[Int]()
+        for i in range(q, len(gs)):
+            rest.append(gs[i])
+        if len(rest) > 1 and data.draw(booleans()):
+            for i in range(len(rest) - 1, 0, -1):
+                var k = data.draw(integers(0, i))
+                var t = rest[i]
+                rest[i] = rest[k]
+                rest[k] = t
+        order += rest^
+        return q
+
+    def call_args_text(
+        mut self,
+        mut data: ConjectureData,
+        ctx: Ctx,
+        f: Int,
+        kids: List[Int],
+        mut order: List[Int],
+        mut q: Int,
+        mut bad: Bool,
+    ) raises -> String:
+        """A call's arguments, kids (by parameter) written in order, the
+        first q positionally. MU_KWARG: an unknown keyword, one given
+        positionally too, a required one left out, or a positional one
+        after a keyword one."""
+        var n = len(kids)
+        var extra = String()
+        var bare_last = False
+        if self.wants(MU_KWARG) and not self.in_branch(ctx):
+            var forms = List[Int]()
+            forms.append(0)
+            if q > 0:
+                forms.append(1)
+            for j in order:
+                if self.fns[f].defaults[j] < 0:
+                    forms.append(2)
+                    break
+            if len(order) - q >= 2:
+                forms.append(3)
+            if self.chance(data, MU_KWARG):
+                var form = forms[pick(data, len(forms))]
+                bad = True
+                self.mutated = True
+                if form == 0:
+                    extra = String("p", n, "=1")
+                elif form == 1:
+                    var j = order[pick(data, q)]
+                    extra = String("p", j, "=", self.exprs[kids[j]].text)
+                elif form == 2:
+                    var req = List[Int]()
+                    for i in range(len(order)):
+                        if self.fns[f].defaults[order[i]] < 0:
+                            req.append(i)
+                    _ = order.pop(req[pick(data, len(req))])
+                    q = 0
+                else:
+                    # (the last keyword one without its name)
+                    bare_last = True
+        var parts = List[String]()
+        for i in range(len(order)):
+            var j = order[i]
+            var t = self.exprs[kids[j]].text
+            if i < q or (bare_last and i == len(order) - 1):
+                parts.append(t)
+            else:
+                parts.append(String("p", j, "=", t))
+        if extra.byte_length() > 0:
+            parts.append(extra)
+        return ", ".join(parts)
 
     def targ_str(self, f: Int, i: Int, t: Int, ctx: Ctx) -> String:
         """Type argument i of a call of function f: a type, or a value."""
@@ -9222,7 +10160,9 @@ struct Program(Movable):
                 if b < 0 and not self.vw_holds(f, assign[i]):
                     return []
                 var w = self.fns[f].wheres[i]
-                if w >= 0 and not self.conforms(assign[i], w, ctx.bounds):
+                if w >= 0 and not self.cond_conforms(assign[i], w, ctx.bounds):
+                    return []
+                if b >= 0 and not self.teq_holds(f, i, assign[i]):
                     return []
             elif len(self.targ_choices(ctx, f, i)) == 0:
                 return []
@@ -9243,6 +10183,14 @@ struct Program(Movable):
 
     def read_place(self, e: Int, frame: List[Int]) raises -> Int:
         if self.exprs[e].kind == E_VAR:
+            if self.exprs[e].a >= len(frame):
+                raise Error(
+                    String(
+                        "evaluator: variable out of the frame (",
+                        self.exprs[e].text,
+                        ")",
+                    )
+                )
             var v = frame[self.exprs[e].a]
             if v < 0:
                 raise Error(
@@ -9387,9 +10335,23 @@ struct Program(Movable):
                 break
         if len(self.fns[a].vwhere) > 0:
             self.stats[STAT_VWHERE] += 1
+        for x in self.fns[a].teq_x:
+            if x >= 0:
+                self.stats[STAT_TEQ] += 1
+                break
+        var vi = self.vw_fn_index(a)
+        if vi >= 0 and self.constrained(self.tid[self.fns[a].params[vi]]):
+            self.stats[STAT_SWHERE] += 1
         var f_targs = self.subst_all(self.exprs[e].tys.copy(), targs)
         var convs = self.fns[a].convs.copy()
-        return self.call(-1, a, -1, kids, convs, frame, targs, f_targs)
+        var pidx = List[Int]()
+        var keyed = e in self.kw_order
+        if keyed:
+            pidx = self.kw_order[e].copy()
+            self.stats[STAT_KWARG] += 1
+        return self.call(
+            -1, a, -1, kids, convs, frame, targs, f_targs, pidx, keyed
+        )
 
     def eval_arg(
         mut self,
@@ -9501,21 +10463,39 @@ struct Program(Movable):
         mut frame: List[Int],
         targs: List[Int],
         f_targs: List[Int],
+        pidx: List[Int] = [],
+        keyed: Bool = False,
     ) raises -> Int:
         """Calls method m (receiver type recv_ty) or function f, with type
         arguments f_targs (a generic method's U): evaluates the arguments
-        in order (in the caller's targs), runs the body, then writes the
-        `mut` ones back."""
-        var callee = List[Int]()
+        in order (in the caller's targs; with pidx, the parameter of each,
+        as written, and defaults for the others), runs the body, then
+        writes the `mut` ones back."""
+        var n = len(convs) if keyed else len(args)
+        var callee = List[Int](length=n, fill=-1)
         var has_mut = False
         var moved = List[Int]()
         for i in range(len(args)):
-            if convs[i] == CONV_MUT:
+            var j = pidx[i] if keyed else i
+            if convs[j] == CONV_MUT:
                 self.stats[STAT_REF] += len(self.exprs[args[i]].tys)
-                callee.append(self.read_place(args[i], frame))
+                callee[j] = self.read_place(args[i], frame)
                 has_mut = True
             else:
-                callee.append(self.eval_arg(args[i], frame, targs, moved))
+                callee[j] = self.eval_arg(args[i], frame, targs, moved)
+        for j in range(n):
+            if callee[j] < 0:
+                if f < 0 or self.fns[f].defaults[j] < 0:
+                    raise Error(
+                        String(
+                            "evaluator: no argument for parameter ",
+                            j,
+                            " of ",
+                            f,
+                        )
+                    )
+                var none = List[Int]()
+                callee[j] = self.eval(self.fns[f].defaults[j], none, [])
         for v in moved:
             frame[v] = -1
         if f >= 0:
@@ -9534,8 +10514,9 @@ struct Program(Movable):
             # before it raised stays)
             if String(err) == "RAISE" and has_mut:
                 for i in range(len(args)):
-                    if convs[i] == CONV_MUT:
-                        self.write_place(args[i], callee[i], frame)
+                    var j = pidx[i] if keyed else i
+                    if convs[j] == CONV_MUT:
+                        self.write_place(args[i], callee[j], frame)
             if String(err) == "RAISE" and f >= 0 and self.fns[f].raise_ty == -2:
                 # (out of a function that `raises`, the error is an Error:
                 # only `except:` catches it)
@@ -9544,8 +10525,9 @@ struct Program(Movable):
         if has_mut:
             self.stats[STAT_MUT_CALL] += 1
             for i in range(len(args)):
-                if convs[i] == CONV_MUT:
-                    self.write_place(args[i], callee[i], frame)
+                var j = pidx[i] if keyed else i
+                if convs[j] == CONV_MUT:
+                    self.write_place(args[i], callee[j], frame)
         return result
 
     def run_body(
@@ -9895,6 +10877,10 @@ struct Program(Movable):
             targs += m_targs.copy()
         if self.methods[m].struct_id >= 0:
             self.stats[STAT_OWN] += 1
+            if len(self.methods[m].kwhere) > 0:
+                self.stats[STAT_KWHERE] += 1
+            if self.structs[self.methods[m].struct_id].own_ext:
+                self.stats[STAT_EXT] += 1
             return self.run_raising(
                 self.methods[m].body, frame, targs, self.methods[m].raise_ty
             )
@@ -9903,6 +10889,8 @@ struct Program(Movable):
         var i = index_of(self.structs[s].impl_methods, m)
         if i >= 0 and self.is_gated(s, m):
             self.stats[STAT_WHERE] += 1
+        if i >= 0 and self.ext_block(s, m) >= 0:
+            self.stats[STAT_EXT] += 1
         if i >= 0:
             self.stats[
                 STAT_OVERRIDE if self.methods[m].has_default else STAT_REQUIRED
@@ -10382,7 +11370,8 @@ struct Program(Movable):
                 s += "[n: Int]"
             s += String("(", cap_names[self.structs[st].cap])
             for t in self.structs[st].traits:
-                s += String(", Tr", t)
+                if not has(self.structs[st].ext, t):
+                    s += String(", Tr", t)
             if self.structs[st].cond >= 0:
                 s += String(
                     ", Tr",
@@ -10391,7 +11380,13 @@ struct Program(Movable):
                     self.structs[st].cond_req,
                     ")",
                 )
-            s += String("):", MARK if marked else "", "\n")
+            s += ")"
+            var sconds = List[String]()
+            for pr in self.structs[st].swhere.copy():
+                sconds.append(self.prop_text(pr, 0, ["n"]))
+            if len(sconds) > 0:
+                s += " where " + " and ".join(sconds)
+            s += String(":", MARK if marked else "", "\n")
             for f in range(len(self.structs[st].fields)):
                 s += String(
                     "    var f",
@@ -10437,12 +11432,19 @@ struct Program(Movable):
                     mark,
                     "\n",
                 )
+            # (the implementations an extension gives go in its block)
+            var ext_texts = List[String]()
+            for _ in range(len(self.structs[st].ext)):
+                ext_texts.append(String())
+            var body_text = s^
             for i in range(len(self.structs[st].impl_methods)):
                 var m = self.structs[st].impl_methods[i]
                 var b = self.structs[st].impl_bodies[i]
                 var args = self.impl_args(st, m)
                 var params = self.subst_all(self.methods[m].params.copy(), args)
                 var ret = self.subst(self.methods[m].ret, args)
+                var block = self.ext_block(st, m)
+                s = String()
                 s += "\n"
                 var where_clause = self.where_text(st, m)
                 if self.bad_where == st * 64 + i:
@@ -10462,17 +11464,30 @@ struct Program(Movable):
                     sig = sig.replace("\n", String(MARK, "\n"))
                 s += sig
                 s += self.body_text(b, "        ")
+                if block >= 0:
+                    ext_texts[block] += s
+                else:
+                    body_text += s
+            var own_text = String()
             for m in self.structs[st].own.copy():
                 var b = self.methods[m].body
+                s = String()
                 s += "\n"
                 var conds = List[String]()
                 var names = self.bodies[b].names.copy()
+                var j = 0
                 for pr in self.methods[m].vwhere.copy():
-                    conds.append(self.prop_text(pr, 0, names))
+                    if m != self.sw_meth or j != self.sw_prop:
+                        conds.append(self.prop_text(pr, 0, names))
+                    j += 1
+                for pr in self.methods[m].kwhere.copy():
+                    if m != self.sw_meth or j != self.sw_prop:
+                        conds.append(self.prop_text(pr, self.k_index(m), names))
+                    j += 1
                 var where_clause = String()
                 if len(conds) > 0:
                     where_clause = " where " + " and ".join(conds)
-                s += self.sig_text(
+                var sig = self.sig_text(
                     m,
                     self.methods[m].params,
                     self.methods[m].ret,
@@ -10480,8 +11495,36 @@ struct Program(Movable):
                     self.bodies[b].self_print,
                     where_clause,
                 )
+                if m == self.sw_meth:
+                    sig = sig.replace("\n", String(MARK, "\n"))
+                s += sig
                 s += self.body_text(b, "        ")
+                own_text += s
+            s = body_text^
+            if not self.structs[st].own_ext:
+                s += own_text
             s += "\n\n"
+            # extension blocks, one per conformance (`pass` if the struct's
+            # body or another block has the implementations)
+            for i in range(len(self.structs[st].ext)):
+                s += String(
+                    "__extension ",
+                    self.structs[st].name,
+                    "(Tr",
+                    self.structs[st].ext[i],
+                    "):",
+                    MARK if marked else "",
+                    "\n",
+                )
+                if ext_texts[i].byte_length() == 0:
+                    s += "    pass\n"
+                else:
+                    s += ext_texts[i]
+                s += "\n\n"
+            if self.structs[st].own_ext and own_text.byte_length() > 0:
+                s += String("__extension ", self.structs[st].name, ":\n")
+                s += own_text
+                s += "\n\n"
             self.alias_ty = -1
         var prefixes = materialize[CONV_PREFIX]()
         for f in range(len(self.fns)):
@@ -10502,6 +11545,8 @@ struct Program(Movable):
             for i in range(len(fd.params)):
                 if i > 0:
                     s += ", "
+                if i == fd.kwonly:
+                    s += "*, "
                 s += String(
                     prefixes[fd.convs[i]],
                     "p",
@@ -10509,6 +11554,8 @@ struct Program(Movable):
                     ": ",
                     self.ty_str(fd.params[i], fn_names, -1),
                 )
+                if fd.defaults[i] >= 0:
+                    s += String(" = ", self.exprs[fd.defaults[i]].text)
             s += String(
                 ")",
                 raises_text(fd.raise_ty),
@@ -10527,15 +11574,31 @@ struct Program(Movable):
                             ")",
                         )
                     )
+            for i in range(len(fd.teq_x)):
+                if fd.teq_x[i] >= 0:
+                    var lhs = String(fn_names[i], ".E", fd.teq_x[i])
+                    var rhs = self.ty_str(fd.teq_a[i], fn_names, -1)
+                    if fd.teq_form[i] == 0:
+                        conds.append(String(lhs, " == ", rhs))
+                    else:
+                        conds.append(String(rhs, " == ", lhs))
             var vi = index_of(fd.bounds, -1)
             var vwhere = fd.vwhere.copy()
             var asserts = fd.asserts.copy()
             var body = fd.body
-            for pr in vwhere:
-                conds.append(self.prop_text(pr, vi, fn_names))
+            for j in range(len(vwhere)):
+                # (MU_SWHERE: one a type in the signature needs left out)
+                if f == self.sw_fn and j == self.sw_prop:
+                    continue
+                conds.append(self.prop_text(vwhere[j], vi, fn_names))
             if len(conds) > 0:
                 s += " where " + " and ".join(conds)
-            s += ":\n"
+            s += ":"
+            if f == self.sw_fn:
+                s += MARK
+            if f == self.sw_near_fn:
+                s += MARK_NEAR
+            s += "\n"
             for pr in asserts:
                 s += String(
                     "    comptime assert ",

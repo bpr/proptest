@@ -2740,6 +2740,225 @@ generator bugs above; the packs alone found nothing (2,100 programs,
 seeds 3301-3304).
 
 
+## More constraints: struct `where`, `where` on `k`, type equalities
+
+Probes on 2026112705:
+- **`where` on a method's own value parameter** works as on a
+  function's: `s.m(V[0](3))` for `def m[k: Int](self, p: V[k]) -> Int
+  where k > 0` is "violated constraint"; with a symbolic k, the caller
+  needs evidence (its `where`, an assert or a `comptime if`). Trait
+  methods can't have one ("'where' clauses on trait methods are not
+  supported"), and an implementation can't add one the trait lacks
+  ("lacking evidence" at the trait's declaration). A `where` can relate
+  k to `Self.n` (`where k > Self.n`).
+- **A struct's own `where`** (`struct W[n: Int] where n > 0`) is checked
+  on every `W[x]`: `W[0](3)` and `var y: W[0]` are "violated
+  constraint", and a signature mentioning `W[n]`, `W[n - 1]` or `B[W[n]]`
+  needs evidence for each ("invalid bindings in signature: lacking
+  evidence"), from the function's `where` only (a body's assert or
+  `comptime if` gives evidence for the types in the body, not the
+  signature). Inside W, `n > 0` is known for `Self.n` but not for
+  `Self.n + 1` (`-> W2[Self.n + 1]` needs `where Self.n + 1 > 0`). A
+  conditional type's condition is evidence for its first arm (`p: W[n] if
+  n > 0 else B` is valid), but `n > 2` isn't for `W[n + 1]`. A trait
+  method can't take a `W[k]` at all, having no `where`.
+- **Type equality**, `where T.E0 == C` (or `C == T.E0`, the same
+  proposition), is a gate, not a refinement: in the body `T.E0` stays
+  `T.E0` ("'T.E0' value has no attribute 'c'", "cannot implicitly
+  convert 'T.E0' value to 'C'"), and `where T == S` doesn't make a T an
+  S. A call with a struct for T compares its binding, normalized through
+  generic bindings (`B[T].E0 = Self.T.E0` gives T's, and `B[T].E0 = C`
+  is C even for a symbolic T): "violated constraint ... expected
+  'Bool(identical(T.E0, C))'". A symbolic T needs the identical
+  proposition known: from a `where`, a `comptime assert` or a `comptime
+  if`; `T == S` doesn't give `T.E0 == C`, and nothing is deduced.
+
+In FM:
+- **A quarter of the valued structs** (3/4 for the swhere kinds) get a
+  `where` of their own, a Prop true of each value they're used with
+  (`StructDecl.swhere`). A type `V[x]` is valid (`type_ok`) if x is a
+  value meeting it or the known propositions (keys) include it, with x
+  for n. A function over a constrained V draws the offsets d it may use
+  (`draw_dset`: 0, and each of 1 and -1 half the time), its pool keeps
+  only `V[n + d]` for those, and its `where` gets the struct's
+  proposition shifted by each (`n + 1 + 1 <= 3` for `V[n + 1]`, with
+  `where n + 1 <= 3`). V's bodies know the proposition for Self.n
+  (`body_keys`); an own method of V that uses `V[Self.n + d]` (d != 0)
+  gets it in its `where`. Trait methods don't take a constrained V's
+  `V[k]`, and a conditional type's first arm is `V[n]` unless the
+  `where` gives `V[n + d]`.
+- **A third of a struct's own methods with a value parameter k** (2/3
+  for the vwhere kinds) get a proposition on k too (`kwhere`), and, for
+  a constrained V, the struct's for each `V[k + d]`. Calls choose k
+  among the values meeting it (`own_choices`, `kw_holds`), as for a
+  function's `where`; the vwhere mutant and near miss cover them too.
+- **A quarter of the type parameters** whose bound implies an
+  associated type (all of them for the teq kinds) get `where T.E<x> ==
+  A` (`FnDecl.teq_*`), A the binding of a concrete type that conforms
+  (or half the time one another function's equality has, so that it can
+  call that one with T), written either way round. `teq_holds` checks a
+  call's type argument: its binding (`assoc`) must be A, or, if it's
+  symbolic (`U.E0`), the caller must know the equality (`tfacts`, from
+  its own `where`).
+
+| Kind | What | Mojo's error, or why it's valid |
+|---|---|---|
+| swhere | a function's (or own method's) `where` leaves out a proposition a type written in its signature needs (`p: V[n + 1]` without `n + 1 > 0`) | invalid bindings in signature: lacking evidence |
+| near swhere | a parameter `V[n + d]` (d != 0) with the shifted proposition in the `where` | evidence |
+| teq | a call whose type argument's binding isn't A, or a type parameter without the equality known | violated constraint, lacking evidence |
+| near teq | a call whose evidence is the caller's equality written the other way round (`S0 == T.E0` for `T.E0 == S0`) | the same proposition |
+
+## Extensions: `__extension`
+
+Probes on 2026112705: `__extension S(Tr0):` makes S conform to Tr0 with
+the methods it defines (a generic or valued struct's too, using `Self.T`
+and `Self.n`); a bare `__extension S:` adds methods; static methods,
+`raises`, generic methods and `deinit self` work there, and calls of
+them fold at compile time. What doesn't:
+- `Int` can't be extended: "can't find a struct named 'Int'" (it's an
+  alias of `SIMD` now; #5607's reporter extended it in 2025).
+- A conformance in an extension doesn't get the trait's defaults, nor
+  can the extension give a `comptime` member (a constant or an
+  associated type binding, with or without a default): "'S' does not
+  implement all requirements for 'Td' ... required function 'get' is not
+  implemented", or "required member 'K' is not specified". Known:
+  [#5607](https://github.com/modular/modular/issues/5607) (open since
+  2025-11; extensions are deprioritized, a maintainer wrote).
+- `where` in an extension's conformance list: "only supported on
+  structs".
+- Errors in a conformance an extension gives (a missing method, another
+  signature) are reported at the struct, not the extension.
+- Two definitions of a method, in the struct and an extension, make
+  calls ambiguous.
+
+In FM, half the structs move each of their declared conformances to an
+eligible trait (no trait it implies has a constant or an associated
+type) into an `__extension` block 3/4 of the time (`StructDecl.ext`);
+the implementations of the methods only those traits give go in the
+block (`ext_block`), and the struct overrides every default of such a
+trait (`plan_impls`). A quarter of the structs put their own methods in
+a bare `__extension` block (`own_ext`). Nothing else changes, so the
+existing kinds cover them; the header of each block is marked when the
+struct is, since a conformance error is reported at the struct.
+
+**Found: an extension of a struct with a `where` doesn't know it**
+([#7832](https://github.com/modular/modular/issues/7832)). In 11 of the first 300 stage 2 programs (seed 8401, three
+programs) and 8 of 300 near misses (one), a method in `__extension V0:`
+failed with "lacking
+evidence" for V0's own `where`: calling one of V0's methods on `self`,
+`Self(...)` and `V0[Self.n]` in a signature all need it, while V0's own
+bodies know it. Repeating the proposition on the method works around
+it. The generator's workaround: no extensions of a constrained struct
+(DECL_FUZZ_NO_EXT_WHERE_WORKAROUND=1 lifts it).
+
+**Found: `conforms_to` ignores a conformance an extension gives**
+([#7833](https://github.com/modular/modular/issues/7833)). Four kwarg near misses (seed 8603, one program) failed with
+"violated constraint ... expected 'conforms_to(T, Tr1)'" for a call
+whose T was S0, which conforms to Tr1 through `__extension S0(Tr1):`.
+S0 meets a bound `T: Tr1`, and inside a generic function
+`conforms_to(T, Tr1)` is True for it, but `conforms_to(S0, Tr1)` is
+False, a `where conforms_to(T, Tr1)` rejects it, and so does a
+conditional conformance on that condition (`B[S0]` doesn't get `Tr1
+where conforms_to(T, Tr1)`). The workaround (`cond_conforms`): the
+generator checks a `where` or a conditional conformance's condition
+without a struct's extensions (DECL_FUZZ_NO_EXT_CONFORMS_WORKAROUND=1
+lifts it).
+
+## Keyword and default arguments
+
+Probes on 2026112705, with `def f(a: Int, b: Int = 3, c: Int = 4)`:
+- `f(1)`, `f(1, c=5)`, `f(c=5, a=1)` and `f(1, c=6, b=7)` work; `f(1,
+  a=2)` and `f(1, d=2)` are "unexpected keyword argument", `f(b=2)`
+  "missing required argument: 'a'", `f(1, 2, 3, 4)` "unexpected
+  argument", and `f(a=1, 2)` "positional argument must not follow a
+  keyword argument" (a syntax error). After `*,` parameters are
+  keyword-only (`g(1, 2)` for `g(a, *, b)` is "missing required argument:
+  'b'"); before `/`, positional-only.
+- **Arguments are evaluated as written**, not in the parameters' order:
+  `f(c=t(1), a=t(2), b=t(3))` evaluates t(1) first. Moves happen at the
+  call (`g(a=x^, b=x.y)` is valid), as for positional arguments.
+- **A default is evaluated once, at compile time** ("cannot use a dynamic
+  value in default argument"; a raising call is "cannot call raising
+  function in default argument"): `b: Int = h(5)` runs h at compile time
+  (its `print` shows during the build), and a struct default is
+  materialized at each call without its constructor running, while its
+  destructor does run: with `b: D = D(9)`, two calls print "init 9" once
+  (at build time) and "deinit 9" twice, as `materialize[K]()` of a
+  `comptime K = D(9)` does. Defaults can use a function's parameters (`x:
+  Int = n * 2`), not its arguments; `mut` arguments can't have one;
+  `List` defaults are fresh at each call.
+- Through a trait, a method's defaults are the trait's: with `m(self, x:
+  Int = 5)` in the trait and `= 6` in an implementation, a generic call
+  `t.m()` passes 5 and `S(1).m()` 6; keyword names are the declaration's
+  called (an implementation may rename `x` to `y`).
+
+In FM, a third of the functions (2/3 for the kwarg kinds) give one to
+three of their last parameters defaults, stopping at a `mut` one, one
+whose type mentions a parameter, or one of a type a default can't be
+made of (`default_expr`: an Int literal, or a constructor of a struct
+that isn't counted, over defaults of its fields: a counted struct's
+ledger would see the destructor at each call but the constructor only
+at build time); a third of those make them keyword-only. Half the calls
+leave out half the defaulted parameters; the arguments are written as a
+positional prefix (up to the first left out or keyword-only parameter)
+and the rest by keyword, in a quarter of the calls (half for the kwarg
+kinds, and whenever a later parameter is given) at a random split, half
+the time shuffled (`call_order`). The call's arguments are kept in the
+order written, with each one's parameter (`Program.kw_order`); the
+evaluator evaluates them in that order and the defaults of the others
+(`call`).
+
+| Kind | What | Mojo's error, or why it's valid |
+|---|---|---|
+| kwarg | an unknown keyword (`p4=1`), a positional argument given by keyword too, a required one left out, or a keyword argument written last without its name | unexpected keyword argument, missing required argument, positional argument must not follow a keyword argument |
+| near kwarg | keyword arguments out of the parameters' order, or after a left-out default | evaluated as written |
+
+**Found: a `guard`'s later clause on a field of a temporary fails to
+build at -O0** (commented on
+[#7690](https://github.com/modular/modular/issues/7690)). In 5 of the
+first 300 stage 2 programs (seed 8401, one program), "operand #0 does
+not dominate this use" ("failed to run the pass manager") for a method
+whose `guard` had a Boolean clause, then `case Self(f0=b1, f1=var b2) =
+(B2[Self](...) if ... else B2[Self](...)).f1_ref()`, with b1 used after
+the `guard`. Reduced: `guard c == 0; case P(a=b1) = Q(P(c, 1), P(2,
+3)).y else: return -1` then `return b1`, at -O0 only; also after a
+`case` clause, or followed by another clause. The first clause, a
+temporary itself, a variable's field, `var b1` and register-passable
+structs all build. #7690's own repro (a later clause on a temporary,
+`maybe(x)`) was fixed in a later nightly and passes on 2026112705. The
+workaround: such a subject is copied (`.copy()`) in a `guard`'s later
+clause (DECL_FUZZ_NO_GUARD_FIELD_WORKAROUND=1 lifts it).
+
+Generator bugs on the way: a value mutant inside a pack call's argument
+(`V0[6](...)` for a `V0[4]`) was accepted, 6 of 150 value mutants: a pack
+takes any type conforming to its bound, so pack arguments have no
+value or type mutants now. A call leaving out every argument (`g2()`
+with only defaults) was taken for one without keyword order (an empty
+list), and the evaluator read its parameter from an empty frame.
+
+In 1,000 stage 2 programs (seed 8801), 55 declare a struct with a
+`where` of its own, 46 an own method with a `where` on k, and 7 a
+function with a type equality (the teq kinds have them in every
+function they can); 77 have an extension giving a conformance and 277 a
+bare one (4,243 calls of methods in extensions, in 86 programs); 126
+declare a function with defaults (66 keyword-only ones) and 108 write a
+call with keywords. Few of these calls run (calls of functions over a
+value are rare at run time: 6 programs call a constrained V's function,
+9 a method with a `where` on k, 1 a function with a type equality), but
+each call site is checked when the program builds.
+
+**Validation**, on nightly 1.3.0.dev2026112705, with the workarounds:
+everything OK. With the final generator: 600 stage 2 programs, 200
+kwarg mutants and 200 kwarg near misses (seeds 8901-8903). With the
+generator before the last fix (the empty keyword order, which only
+crashes the evaluator): 600 stage 2 programs (one -O3 run failed to map
+the ledger, LEDGER_MAP_FAILED, and passed when rerun), 600 mutants and
+528 near misses of all kinds, 200 swhere, 171 teq, 200 kwarg, 200
+vwhere and 200 guard_fall mutants, and 200 swhere, 100 teq and 173
+kwarg near misses (seeds 8701-8711). The rounds before (about 5,000
+programs, seeds 8101-8606) found the bugs and generator bugs above; the
+constraints alone found nothing (1,500 programs, seeds 8101-8110).
+
 ## Beyond the paths
 
 Mojo features FM leaves out for now:
@@ -2749,11 +2968,10 @@ Mojo features FM leaves out for now:
 - **Overloading and `@implicit` conversions:** Mojo's resolution rules
   aren't fully specified, so the evaluator would have to restrict itself
   to unambiguous overload sets.
-- **More of the type system:** retroactive conformance with
-  `__extension` (e.g. `Int` to a trait), constraints on associated types
-  (`where T.E0 == A`), `where` on value methods' `k` and on structs
-  (`struct V[n: Int] where n > 0`, which every `V[n - 1]` would need
-  evidence for, in signatures too), and keyword and default arguments.
+- **More of the type system:** defaults and keywords on methods (a
+  trait's defaults apply through it, an implementation's directly),
+  positional-only parameters, `where` relating two value parameters
+  (`where k > Self.n`), and extensions of library types (`SIMD`, `List`).
 - **`Variant` and `isa`:** the counterpart of FJ's downcasts.
 - **More conditional types and packs:** conditional result types
   (`-> V[n] if n > 2 else W`, whose body must return each arm under a
